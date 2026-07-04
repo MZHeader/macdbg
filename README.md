@@ -15,7 +15,7 @@ Requires macOS with Xcode Command Line Tools installed.
 
 ## Syscall and Network Tracer
 
-Feeling lazy? Ctrl+T arms pending breakpoints on file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
+Feeling lazy? Ctrl+T arms breakpoints on file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
 
 ![Trace tab](docs/img/trace.png)
 
