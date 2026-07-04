@@ -186,20 +186,67 @@ class Debugger:
         bp = self.target.BreakpointCreateByAddress(addr)
         return ("added", bp.GetID())
 
-    def breakpoints(self) -> List[Tuple[int, int, str]]:
-        out: List[Tuple[int, int, str]] = []
+    def breakpoints(self, exclude_ids: Optional[set] = None) -> List[Tuple[int, int, str, int, bool, str]]:
+        out: List[Tuple[int, int, str, int, bool, str]] = []
         if not self.target:
             return out
+        skip = exclude_ids or set()
         for i in range(self.target.GetNumBreakpoints()):
             bp = self.target.GetBreakpointAtIndex(i)
+            bp_id = bp.GetID()
+            if bp_id in skip:
+                continue
             addr = 0
             desc = ""
             if bp.GetNumLocations() > 0:
                 loc = bp.GetLocationAtIndex(0)
                 addr = loc.GetLoadAddress()
                 desc = str(loc.GetAddress().GetSymbol().GetName() or "")
-            out.append((bp.GetID(), addr, desc))
+            cmd_list = lldb.SBStringList()
+            bp.GetCommandLineCommands(cmd_list)
+            out.append((bp_id, addr, desc, cmd_list.GetSize(), bp.IsEnabled(), bp.GetCondition() or ""))
         return out
+
+    def bp_commands(self, bp_id: int) -> List[str]:
+        if not self.target:
+            return []
+        bp = self.target.FindBreakpointByID(bp_id)
+        if not bp.IsValid():
+            return []
+        sl = lldb.SBStringList()
+        bp.GetCommandLineCommands(sl)
+        return [sl.GetStringAtIndex(i) for i in range(sl.GetSize())]
+
+    def set_bp_commands(self, bp_id: int, commands: List[str]) -> bool:
+        if not self.target:
+            return False
+        bp = self.target.FindBreakpointByID(bp_id)
+        if not bp.IsValid():
+            return False
+        sl = lldb.SBStringList()
+        for line in commands:
+            if line.strip():
+                sl.AppendString(line)
+        bp.SetCommandLineCommands(sl)
+        return True
+
+    def set_bp_condition(self, bp_id: int, cond: str) -> bool:
+        if not self.target:
+            return False
+        bp = self.target.FindBreakpointByID(bp_id)
+        if not bp.IsValid():
+            return False
+        bp.SetCondition(cond or None)
+        return True
+
+    def set_bp_enabled(self, bp_id: int, enabled: bool) -> bool:
+        if not self.target:
+            return False
+        bp = self.target.FindBreakpointByID(bp_id)
+        if not bp.IsValid():
+            return False
+        bp.SetEnabled(enabled)
+        return True
 
     def threads(self) -> List[Tuple[int, int, str, int, str]]:
         out: List[Tuple[int, int, str, int, str]] = []

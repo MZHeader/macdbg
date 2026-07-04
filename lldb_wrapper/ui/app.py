@@ -9,7 +9,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import DataTable, Footer, Header, Input, TabbedContent, TabPane
 
-from .context import ContextMenu, PromptScreen
+from .context import ContextMenu, MultilineEditor, PromptScreen
 
 from ..core.debugger import Debugger
 from ..core.disasm import disasm_around, extract_addr
@@ -238,7 +238,7 @@ class WrapperApp(App):
             data = self.dbg.read_memory(follow, 16 * 64)
             self.mem.render_bytes(follow, data)
 
-        self.bps.render_rows(self.dbg.breakpoints())
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
         self.threads_pane.render_rows(self.dbg.threads())
         self.modules_pane.render_rows(self.dbg.modules())
 
@@ -263,7 +263,7 @@ class WrapperApp(App):
             return
         op, bp_id = self.dbg.toggle_breakpoint_at(pc)
         self.console_pane.write("breakpoint {} #{} @ {:#x}".format(op, bp_id, pc))
-        self.bps.render_rows(self.dbg.breakpoints())
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
 
     def action_focus_cmd(self) -> None:
         self.console_pane.cmd.focus()
@@ -294,7 +294,7 @@ class WrapperApp(App):
                 self.trace_pane.table.focus()
             except Exception:
                 pass
-        self.bps.render_rows(self.dbg.breakpoints())
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
 
     def action_mem_scroll(self, direction: int) -> None:
         base = self._mem_follow if self._mem_follow is not None else (self.dbg.pc() or 0)
@@ -338,6 +338,7 @@ class WrapperApp(App):
         for pane_name, pane in (
             ("regs", self.regs), ("disasm", self.disasm),
             ("mem", self.mem), ("stack", self.stack),
+            ("bps", self.bps),
         ):
             if event.table is pane.table:
                 self._open_menu_for(pane_name, event.row, event.screen_x, event.screen_y)
@@ -372,6 +373,16 @@ class WrapperApp(App):
                 ("Toggle breakpoint here",          lambda: self._toggle_bp(drow.addr)),
                 ("Run to cursor",                   lambda: self._run_to(drow.addr)),
                 ("Copy address",                    lambda: self._copy("{:#x}".format(drow.addr))),
+            ]
+        elif pane == "bps":
+            bp_id = self.bps.bp_id_at(row)
+            if bp_id is None:
+                return
+            items = [
+                ("Edit commands…",    lambda: self._prompt_edit_bp_commands(bp_id)),
+                ("Set condition…",    lambda: self._prompt_edit_bp_condition(bp_id)),
+                ("Toggle enabled",    lambda: self._toggle_bp_enabled(bp_id)),
+                ("Delete",            lambda: self._delete_bp(bp_id)),
             ]
         elif pane in ("mem", "stack"):
             base = self._hex_row_addr(pane, row)
@@ -418,7 +429,7 @@ class WrapperApp(App):
     def _toggle_bp(self, addr: int) -> None:
         op, bp_id = self.dbg.toggle_breakpoint_at(addr)
         self.console_pane.write("breakpoint {} #{} @ {:#x}".format(op, bp_id, addr))
-        self.bps.render_rows(self.dbg.breakpoints())
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
 
     def _run_to(self, addr: int) -> None:
         self._run_palette_command("breakpoint set -o true -a {:#x}".format(addr))
@@ -450,6 +461,54 @@ class WrapperApp(App):
             self.console_pane.write("[copied via OSC 52] {}".format(text))
         except Exception as e:
             self.console_pane.write("clipboard failed: {} (value: {})".format(e, text), error=True)
+
+    def _prompt_edit_bp_commands(self, bp_id: int) -> None:
+        current = "\n".join(self.dbg.bp_commands(bp_id))
+        async def _run() -> None:
+            val = await self.push_screen_wait(MultilineEditor(
+                "Breakpoint #{} commands  (Ctrl+S saves, Esc cancels — one lldb command per line)".format(bp_id),
+                initial=current,
+            ))
+            if val is None or val == current:
+                return
+            lines = [ln for ln in val.splitlines() if ln.strip()]
+            if self.dbg.set_bp_commands(bp_id, lines):
+                self.console_pane.write("bp #{}: set {} command(s)".format(bp_id, len(lines)))
+            else:
+                self.console_pane.write("bp #{}: could not set commands".format(bp_id), error=True)
+            self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.run_worker(_run(), exclusive=True)
+
+    def _prompt_edit_bp_condition(self, bp_id: int) -> None:
+        current = ""
+        for row in self.dbg.breakpoints():
+            if row[0] == bp_id:
+                current = row[5]
+                break
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Breakpoint #{} condition  (empty = always fire)".format(bp_id),
+                initial=current,
+            ))
+            if val is None:
+                return
+            self.dbg.set_bp_condition(bp_id, val.strip())
+            self.console_pane.write("bp #{}: condition = {!r}".format(bp_id, val.strip()))
+            self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.run_worker(_run(), exclusive=True)
+
+    def _toggle_bp_enabled(self, bp_id: int) -> None:
+        rows = self.dbg.breakpoints()
+        enabled = next((r[4] for r in rows if r[0] == bp_id), True)
+        self.dbg.set_bp_enabled(bp_id, not enabled)
+        self.console_pane.write("bp #{}: {}".format(bp_id, "disabled" if enabled else "enabled"))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+
+    def _delete_bp(self, bp_id: int) -> None:
+        if self.dbg.target:
+            self.dbg.target.BreakpointDelete(bp_id)
+        self.console_pane.write("bp #{} deleted".format(bp_id))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
 
     def _prompt_edit_reg(self, name: str, current: str) -> None:
         async def _run() -> None:

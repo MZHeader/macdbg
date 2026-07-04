@@ -6,7 +6,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, OptionList
+from textual.widgets import Input, Label, OptionList, TextArea
 from textual.widgets.option_list import Option
 
 
@@ -95,3 +95,35 @@ class PromptScreen(ModalScreen[Optional[str]]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value)
+
+
+class MultilineEditor(ModalScreen[Optional[str]]):
+    BINDINGS = [
+        Binding("escape", "dismiss('')", "cancel"),
+        Binding("ctrl+s", "save", "save"),
+    ]
+
+    DEFAULT_CSS = """
+    MultilineEditor { align: center middle; }
+    MultilineEditor > Vertical {
+        width: 90%; height: 70%; background: $panel;
+        border: solid $accent; padding: 1 2;
+    }
+    MultilineEditor TextArea { height: 1fr; }
+    """
+
+    def __init__(self, title: str, initial: str = "") -> None:
+        super().__init__()
+        self._title = title
+        self._initial = initial
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self._title)
+            yield TextArea.code_editor(self._initial, id="editor")
+
+    def on_mount(self) -> None:
+        self.query_one(TextArea).focus()
+
+    def action_save(self) -> None:
+        self.dismiss(self.query_one(TextArea).text)

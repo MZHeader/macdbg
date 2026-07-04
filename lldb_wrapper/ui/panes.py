@@ -136,20 +136,35 @@ class BreakpointsPane(Vertical):
     """
 
     def compose(self):
-        yield Static("Breakpoints", classes="title")
+        yield Static("Breakpoints  (right-click to edit commands / condition)", classes="title")
         self.table = RightClickTable(cursor_type="row", zebra_stripes=False)
         yield self.table
+        self._ids: List[int] = []
 
     def on_mount(self) -> None:
-        self.table.add_columns("id", "addr", "symbol")
+        self.table.add_columns("id", "addr", "symbol", "cmds", "cond", "en")
 
-    def render_rows(self, rows: List[Tuple[int, int, str]]) -> None:
+    def bp_id_at(self, idx: int) -> Optional[int]:
+        if 0 <= idx < len(self._ids):
+            return self._ids[idx]
+        return None
+
+    def render_rows(self, rows) -> None:
         self.table.clear()
-        for bp_id, addr, desc in rows:
+        self._ids = []
+        for bp_id, addr, desc, ncmds, enabled, cond in rows:
+            self._ids.append(bp_id)
+            en_txt = Text("✓" if enabled else "×", style="green" if enabled else "red")
+            cmd_txt = Text(str(ncmds) if ncmds else "-",
+                           style="yellow bold" if ncmds else "dim")
+            cond_short = (cond[:24] + "…") if len(cond) > 24 else cond
             self.table.add_row(
                 Text(str(bp_id)),
                 Text("{:016x}".format(addr), style="cyan"),
                 Text(desc),
+                cmd_txt,
+                Text(cond_short, style="magenta"),
+                en_txt,
             )
 
 
