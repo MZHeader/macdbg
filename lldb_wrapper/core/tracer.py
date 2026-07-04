@@ -161,78 +161,209 @@ def _f_getaddrinfo(frame, p):
     return 'getaddrinfo("{}", "{}")'.format(host, service)
 
 
-def _f_printf(frame, p):
-    return 'printf("{}", …)'.format(_read_cstr(p, _reg(frame, "x0")).rstrip("\n"))
+def _f_gethostbyname(frame, p):
+    return 'gethostbyname("{}")'.format(_read_cstr(p, _reg(frame, "x0")))
 
 
-def _f_fprintf(frame, p):
-    return 'fprintf(fd={}, "{}", …)'.format(
-        _reg(frame, "x0"), _read_cstr(p, _reg(frame, "x1")).rstrip("\n"))
+def _f_accept(frame, p):
+    return "accept(fd={})".format(_reg(frame, "x0"))
 
 
-def _f_snprintf(frame, p):
-    return 'snprintf(buf={:#x}, n={}, "{}", …)'.format(
+def _f_listen(frame, p):
+    return "listen(fd={}, backlog={})".format(_reg(frame, "x0"), _reg(frame, "x1"))
+
+
+def _f_shutdown(frame, p):
+    return "shutdown(fd={}, how={})".format(_reg(frame, "x0"), _reg(frame, "x1"))
+
+
+def _f_setsockopt(frame, p):
+    return "setsockopt(fd={}, level={}, name={})".format(
+        _reg(frame, "x0"), _reg(frame, "x1"), _reg(frame, "x2"))
+
+
+def _f_recvfrom(frame, p):
+    return "recvfrom(fd={}, buf={:#x}, n={})".format(
+        _reg(frame, "x0"), _reg(frame, "x1"), _reg(frame, "x2"))
+
+
+def _f_stat(frame, p):
+    return 'stat("{}")'.format(_read_cstr(p, _reg(frame, "x0")))
+
+
+def _f_access(frame, p):
+    return 'access("{}", mode={:#x})'.format(
+        _read_cstr(p, _reg(frame, "x0")), _reg(frame, "x1"))
+
+
+def _f_unlink(frame, p):
+    return 'unlink("{}")'.format(_read_cstr(p, _reg(frame, "x0")))
+
+
+def _f_rename(frame, p):
+    return 'rename("{}", "{}")'.format(
+        _read_cstr(p, _reg(frame, "x0")),
+        _read_cstr(p, _reg(frame, "x1")))
+
+
+def _f_chmod(frame, p):
+    return 'chmod("{}", {:#o})'.format(
+        _read_cstr(p, _reg(frame, "x0")), _reg(frame, "x1"))
+
+
+def _f_mkdir(frame, p):
+    return 'mkdir("{}", {:#o})'.format(
+        _read_cstr(p, _reg(frame, "x0")), _reg(frame, "x1"))
+
+
+def _f_pread(frame, p):
+    return "pread(fd={}, buf={:#x}, n={}, off={})".format(
+        _reg(frame, "x0"), _reg(frame, "x1"), _reg(frame, "x2"), _reg(frame, "x3"))
+
+
+def _f_pwrite(frame, p):
+    fd = _reg(frame, "x0")
+    buf = _reg(frame, "x1")
+    n = _reg(frame, "x2")
+    off = _reg(frame, "x3")
+    return "pwrite({}, {}, n={}, off={})".format(fd, _fmt_bytes(_read_bytes(p, buf, n)), n, off)
+
+
+def _f_dup(frame, p):
+    return "dup(fd={})".format(_reg(frame, "x0"))
+
+
+def _f_dup2(frame, p):
+    return "dup2(from={}, to={})".format(_reg(frame, "x0"), _reg(frame, "x1"))
+
+
+def _f_mmap(frame, p):
+    return "mmap(addr={:#x}, len={}, prot={:#x}, flags={:#x}, fd={})".format(
         _reg(frame, "x0"), _reg(frame, "x1"),
-        _read_cstr(p, _reg(frame, "x2")).rstrip("\n"))
+        _reg(frame, "x2"), _reg(frame, "x3"), _reg(frame, "x4"))
 
 
-def _f_puts(frame, p):
-    return 'puts("{}")'.format(_read_cstr(p, _reg(frame, "x0")))
+def _f_dlopen(frame, p):
+    return 'dlopen("{}", flags={:#x})'.format(
+        _read_cstr(p, _reg(frame, "x0")), _reg(frame, "x1"))
 
 
-def _f_fputs(frame, p):
-    return 'fputs("{}", fd={})'.format(_read_cstr(p, _reg(frame, "x0")), _reg(frame, "x1"))
+def _f_dlsym(frame, p):
+    return 'dlsym(handle={:#x}, "{}")'.format(
+        _reg(frame, "x0"), _read_cstr(p, _reg(frame, "x1")))
+
+
+def _f_posix_spawn(frame, p):
+    return 'posix_spawn("{}", …)'.format(_read_cstr(p, _reg(frame, "x1")))
+
+
+def _f_fork(frame, p):
+    return "fork()"
+
+
+def _f_kill(frame, p):
+    return "kill(pid={}, sig={})".format(_reg(frame, "x0"), _reg(frame, "x1"))
+
+
+def _f_fread(frame, p):
+    return "fread(buf={:#x}, size={}, n={}, fp={:#x})".format(
+        _reg(frame, "x0"), _reg(frame, "x1"), _reg(frame, "x2"), _reg(frame, "x3"))
+
+
+def _f_fwrite(frame, p):
+    buf = _reg(frame, "x0")
+    size = _reg(frame, "x1")
+    n = _reg(frame, "x2")
+    total = size * n if size and n and size * n < 4096 else 0
+    return "fwrite({}, size={}, n={}, fp={:#x})".format(
+        _fmt_bytes(_read_bytes(p, buf, total)) if total else "{:#x}".format(buf),
+        size, n, _reg(frame, "x3"))
+
+
+def _f_fclose(frame, p):
+    return "fclose(fp={:#x})".format(_reg(frame, "x0"))
+
+
+def _f_pclose(frame, p):
+    return "pclose(fp={:#x})".format(_reg(frame, "x0"))
 
 
 SIGS: Dict[str, Tuple[str, Callable]] = {
-    "open":             (FILE, _f_open),
-    "open$NOCANCEL":    (FILE, _f_open),
-    "openat":           (FILE, _f_openat),
-    "close":            (FILE, _f_close),
-    "close$NOCANCEL":   (FILE, _f_close),
-    "read":             (FILE, _f_read),
-    "read$NOCANCEL":    (FILE, _f_read),
-    "write":            (FILE, _f_write),
-    "write$NOCANCEL":   (FILE, _f_write),
-    "fopen":            (FILE, _f_fopen),
-    "printf":           (FILE, _f_printf),
-    "fprintf":          (FILE, _f_fprintf),
-    "snprintf":         (FILE, _f_snprintf),
-    "sprintf":          (FILE, _f_snprintf),
-    "puts":             (FILE, _f_puts),
-    "fputs":            (FILE, _f_fputs),
-    "popen":            (PROC, _f_popen),
-    "system":           (PROC, _f_system),
-    "execve":           (PROC, _f_execve),
-    "execvp":           (PROC, _f_execve),
-    "socket":           (NET,  _f_socket),
-    "connect":          (NET,  _f_connect),
-    "connect$NOCANCEL": (NET,  _f_connect),
-    "bind":             (NET,  _f_bind),
-    "send":             (NET,  _f_send),
-    "send$NOCANCEL":    (NET,  _f_send),
-    "recv":             (NET,  _f_recv),
-    "recv$NOCANCEL":    (NET,  _f_recv),
-    "sendto":           (NET,  _f_sendto),
-    "sendto$NOCANCEL":  (NET,  _f_sendto),
-    "getaddrinfo":      (NET,  _f_getaddrinfo),
+    "open":               (FILE, _f_open),
+    "open$NOCANCEL":      (FILE, _f_open),
+    "openat":             (FILE, _f_openat),
+    "close":              (FILE, _f_close),
+    "close$NOCANCEL":     (FILE, _f_close),
+    "read":               (FILE, _f_read),
+    "read$NOCANCEL":      (FILE, _f_read),
+    "write":              (FILE, _f_write),
+    "write$NOCANCEL":     (FILE, _f_write),
+    "pread":              (FILE, _f_pread),
+    "pwrite":             (FILE, _f_pwrite),
+    "fopen":              (FILE, _f_fopen),
+    "fread":              (FILE, _f_fread),
+    "fwrite":             (FILE, _f_fwrite),
+    "fclose":             (FILE, _f_fclose),
+    "stat":               (FILE, _f_stat),
+    "stat$INODE64":       (FILE, _f_stat),
+    "lstat":              (FILE, _f_stat),
+    "lstat$INODE64":      (FILE, _f_stat),
+    "fstat":              (FILE, _f_stat),
+    "access":             (FILE, _f_access),
+    "unlink":             (FILE, _f_unlink),
+    "rename":             (FILE, _f_rename),
+    "chmod":              (FILE, _f_chmod),
+    "mkdir":              (FILE, _f_mkdir),
+    "rmdir":              (FILE, _f_unlink),
+    "dup":                (FILE, _f_dup),
+    "dup2":               (FILE, _f_dup2),
+    "mmap":               (FILE, _f_mmap),
+    "popen":              (PROC, _f_popen),
+    "pclose":             (PROC, _f_pclose),
+    "system":             (PROC, _f_system),
+    "execve":             (PROC, _f_execve),
+    "execvp":             (PROC, _f_execve),
+    "posix_spawn":        (PROC, _f_posix_spawn),
+    "posix_spawnp":       (PROC, _f_posix_spawn),
+    "fork":               (PROC, _f_fork),
+    "vfork":              (PROC, _f_fork),
+    "kill":               (PROC, _f_kill),
+    "dlopen":             (PROC, _f_dlopen),
+    "dlsym":              (PROC, _f_dlsym),
+    "socket":             (NET,  _f_socket),
+    "connect":            (NET,  _f_connect),
+    "connect$NOCANCEL":   (NET,  _f_connect),
+    "bind":               (NET,  _f_bind),
+    "listen":             (NET,  _f_listen),
+    "accept":             (NET,  _f_accept),
+    "accept$NOCANCEL":    (NET,  _f_accept),
+    "send":               (NET,  _f_send),
+    "send$NOCANCEL":      (NET,  _f_send),
+    "recv":               (NET,  _f_recv),
+    "recv$NOCANCEL":      (NET,  _f_recv),
+    "sendto":             (NET,  _f_sendto),
+    "sendto$NOCANCEL":    (NET,  _f_sendto),
+    "recvfrom":           (NET,  _f_recvfrom),
+    "recvfrom$NOCANCEL":  (NET,  _f_recvfrom),
+    "shutdown":           (NET,  _f_shutdown),
+    "setsockopt":         (NET,  _f_setsockopt),
+    "getaddrinfo":        (NET,  _f_getaddrinfo),
+    "gethostbyname":      (NET,  _f_gethostbyname),
+    "gethostbyname2":     (NET,  _f_gethostbyname),
 }
 
 
 class Tracer:
-    _NOISY_MODULES = (
-        "dyld", "libsystem_", "libobjc", "libc++",
-        "CoreFoundation", "Foundation",
-    )
-
     def __init__(self) -> None:
         self._bp_ids: List[int] = []
         self._bp_to_name: Dict[int, str] = {}
         self.enabled = False
+        self._exec_name: str = ""
 
     def enable(self, target: lldb.SBTarget) -> Tuple[int, int]:
         if self.enabled or not target or not target.IsValid():
             return (0, 0)
+        self._exec_name = target.GetExecutable().GetFilename() or ""
         resolved_now = 0
         for name in SIGS:
             bp = target.BreakpointCreateByName(name)
@@ -282,16 +413,14 @@ class Tracer:
         return None
 
     def _caller_is_noise(self, frame: lldb.SBFrame) -> bool:
-        thread = frame.GetThread()
-        for i in range(1, min(thread.GetNumFrames(), 8)):
-            f = thread.GetFrameAtIndex(i)
-            if not f.IsValid():
-                break
-            module = f.GetModule()
-            if not module.IsValid():
-                continue
-            modname = module.GetFileSpec().GetFilename() or ""
-            if any(modname.startswith(pfx) for pfx in self._NOISY_MODULES):
-                continue
+        if not self._exec_name:
             return False
-        return True
+        thread = frame.GetThread()
+        f = thread.GetFrameAtIndex(1)
+        if not f.IsValid():
+            return True
+        module = f.GetModule()
+        if not module.IsValid():
+            return True
+        modname = module.GetFileSpec().GetFilename() or ""
+        return modname != self._exec_name
