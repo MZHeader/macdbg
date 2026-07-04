@@ -172,6 +172,13 @@ class Debugger:
         if t:
             t.StepInstruction(False)
 
+    def step_out(self) -> None:
+        """Run until the current frame returns. Equivalent to x64dbg's
+        'Execute till return' / gdb's 'finish'."""
+        t = self._thread()
+        if t:
+            t.StepOut()
+
     _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
 
     def step_over(self) -> None:

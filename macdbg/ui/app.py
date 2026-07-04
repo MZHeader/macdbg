@@ -93,6 +93,7 @@ class WrapperApp(App):
     """
 
     BINDINGS = [
+        Binding("f6", "step_out", "Step Out"),
         Binding("f7", "step_in", "Step In"),
         Binding("f8", "step_over", "Step Over"),
         Binding("f9", "cont", "Continue"),
@@ -105,8 +106,6 @@ class WrapperApp(App):
         Binding("ctrl+d", "defenses", "Defenses", priority=True),
         Binding("ctrl+b", "interrupt", "Break", priority=True),
         Binding("ctrl+f", "mem_search", "Find in Mem", priority=True),
-        Binding("ctrl+backslash", "toggle_scroll_lock", "Scroll Lock", priority=True),
-        Binding("alt+left", "mem_back", "Mem Back", priority=True),
         Binding("f5", "disasm_snap_pc", "Disasm→pc", priority=True),
         Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
     ]
@@ -414,6 +413,9 @@ class WrapperApp(App):
     def action_step_over(self) -> None:
         self.dbg.step_over()
 
+    def action_step_out(self) -> None:
+        self.dbg.step_out()
+
     def action_cont(self) -> None:
         self.dbg.cont()
 
@@ -458,23 +460,6 @@ class WrapperApp(App):
             self.console_pane.write(
                 "[wrapper] process is {} — nothing to interrupt".format(
                     lldb.SBDebugger.StateAsCString(state)))
-
-    def action_toggle_scroll_lock(self) -> None:
-        v = self.console_pane.log_view
-        v.auto_scroll = not v.auto_scroll
-        self.console_pane.write(
-            "[wrapper] console auto-scroll: {}".format("ON" if v.auto_scroll else "PAUSED"))
-
-    def action_mem_back(self) -> None:
-        if len(self._mem_history) < 2:
-            self.console_pane.write("[wrapper] no earlier memory follow", error=True)
-            return
-        self._mem_history.pop()
-        prev = self._mem_history[-1]
-        prior = self._mem_history[:]
-        self._follow_memory(prev)
-        self._mem_history = prior
-        self.console_pane.write("mem back -> {:#x}".format(prev))
 
     def action_mem_search(self) -> None:
         if not self.dbg.process or not self.dbg.process.IsValid():

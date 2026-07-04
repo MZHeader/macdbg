@@ -115,6 +115,7 @@ Lots of themes to choose from :)
 |-----|--------|
 | F2 | Toggle breakpoint at pc |
 | F5 | Disassembly back to pc (after browsing) |
+| F6 | Execute till return (step out of current frame) |
 | F7 | Step in (instruction) |
 | F8 | Step over (instruction) |
 | F9 | Continue |
@@ -128,8 +129,6 @@ Lots of themes to choose from :)
 | Ctrl+P | Command palette |
 | Ctrl+T | Toggle the tracer |
 | Ctrl+Y | Cycle trace scope (strict / balanced / wide / off) |
-| Ctrl+\\ | Toggle console auto-scroll |
-| Alt+Left | Memory follow — back one address in history |
 | Ctrl+C | Quit |
 | Right click on a row | Pane-specific context menu |
 
