@@ -75,6 +75,32 @@ class WrapperApp(App):
     #tabs           { width: 3fr; border: solid $accent; }
     ConsolePane     { width: 2fr; }
     TracePane RightClickTable { height: 1fr; }
+
+    /* Loud focus indicator so it's obvious which pane Tab lands on. */
+    DisasmPane:focus-within,
+    RegistersPane:focus-within,
+    HexPane:focus-within,
+    MemoryPane:focus-within,
+    BreakpointsPane:focus-within,
+    ThreadsPane:focus-within,
+    ModulesPane:focus-within,
+    TracePane:focus-within,
+    ConsolePane:focus-within,
+    #tabs:focus-within {
+        border: thick $warning;
+    }
+    DisasmPane:focus-within > .title,
+    RegistersPane:focus-within > .title,
+    HexPane:focus-within > .title,
+    MemoryPane:focus-within > .title,
+    BreakpointsPane:focus-within > .title,
+    ThreadsPane:focus-within > .title,
+    ModulesPane:focus-within > .title,
+    TracePane:focus-within > .title,
+    ConsolePane:focus-within > .title {
+        background: $warning;
+        color: black;
+    }
     """
 
     BINDINGS = [
