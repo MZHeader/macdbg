@@ -1,17 +1,14 @@
-# lldb-wrapper
+# macdbg
 
-x64dbg-style Textual TUI on top of Apple's system LLDB.
+A Textual TUI for Apple's system LLDB. You get a multi-pane view of the running process instead of typing `register read`, `disassemble`, and `memory read` on every stop.
 
-Live panes for disassembly, registers, stack, memory, plus tabs for
-breakpoints / threads / modules, and a console that accepts raw lldb
-commands. Select any row in the disassembly and the memory pane follows
-the operand address (x64dbg-style "follow in dump").
+The disasm pane keeps the current instruction centered on every step. The registers pane annotates each value with its symbol, string, or a one-hop pointer chase where it can. The stack and memory panes are hex dumps you can scroll (F5/F6) and edit (right-click, Edit bytes). Bottom tabs cover breakpoints, threads, modules, and a syscall/network trace that filters out dyld and libSystem noise so you only see calls that came from your binary. The console at the bottom right accepts any raw lldb command, and Ctrl+P opens a fuzzy palette over every lldb command with lldb's own help text attached.
 
 ## Requirements
 
-- macOS with Xcode Command Line Tools (`/usr/bin/lldb` present).
-- System Python 3.9 (`/usr/bin/python3`).
-- `pip install --user textual` (into the system Python — see below).
+macOS with Xcode Command Line Tools installed, so `/usr/bin/lldb` is present. The Python bindings ship with the CLT at `$(lldb -P)`. The wrapper uses the system Python (`/usr/bin/python3`, 3.9) because that's what Apple's `lldb` module was built against.
+
+Install Textual once into the system Python:
 
 ```sh
 /usr/bin/python3 -m pip install --user textual
@@ -20,33 +17,32 @@ the operand address (x64dbg-style "follow in dump").
 ## Run
 
 ```sh
-./run.sh /bin/ls          # system binaries are usually blocked by macOS
 ./run.sh test/hello       # tiny sample
-./run.sh test/fakemal     # XOR-decrypt strings, fake C2 beacon, worker thread
+./run.sh test/fakemal     # XOR-decrypted strings, fake C2 beacon, worker thread
+./run.sh test/talker      # real file I/O and an HTTP fetch (good for the tracer)
 ```
 
-Rebuild the test binaries with `make -C test`.
+System binaries like `/bin/ls` are usually blocked by macOS SIP and will fail to launch. Rebuild the test binaries with `make -C test`.
 
-`run.sh` sets `PYTHONPATH` to `$(lldb -P)` so `import lldb` resolves
-against the framework build shipped with the CLT.
+`run.sh` sets `PYTHONPATH=$(lldb -P)` so `import lldb` resolves to the framework build. ASLR is disabled on every launch, so addresses stay stable across runs.
 
 ## Keys
 
-| Key    | Action                                     |
-|--------|--------------------------------------------|
-| F7     | Step in                                    |
-| F8     | Step over                                  |
-| F9     | Continue                                   |
-| F2     | Toggle breakpoint at current pc            |
-| Enter  | (in disasm) Follow operand address in Memory pane |
-| `:`    | Focus the raw lldb command bar             |
-| Ctrl+G | Focus the memory "follow address" input    |
-| F5 / F6 | Scroll memory pane up / down by 512 B     |
-| Ctrl+T | Toggle **Trace** — auto-BP libc I/O + net calls, log to Trace tab |
-| Ctrl+K | Clear the Trace tab                        |
-| Ctrl+C | Quit                                       |
-| Ctrl+P | Command palette — fuzzy search all lldb commands (subcommands too, e.g. `thread s`) |
-| Right-click on a row | Context menu (goto / breakpoint / edit / copy) — pane-specific |
+| Key | Action |
+|-----|--------|
+| F7 | Step in (instruction) |
+| F8 | Step over (instruction) |
+| Shift+F7 / Shift+F8 | Step in / over at source line granularity |
+| F9 | Continue |
+| F2 | Toggle breakpoint at pc |
+| F5 / F6 | Scroll memory pane up / down by 512 bytes |
+| Enter (in disasm) | Follow operand address in the memory pane |
+| `:` | Focus the console command bar |
+| Ctrl+G | Focus the memory "follow address" input |
+| Ctrl+P | Command palette (fuzzy over lldb commands, subcommands too) |
+| Ctrl+T | Toggle the tracer (auto BPs on libc I/O and network calls) |
+| Ctrl+K | Clear the trace tab |
+| Ctrl+C | Quit |
+| Right click on a row | Context menu (goto, breakpoint, edit, copy) |
 
-Anything typed in the command bar is passed straight to
-`SBCommandInterpreter.HandleCommand`, so all lldb commands still work.
+Whatever you type in the console goes straight into `SBCommandInterpreter.HandleCommand`, so every lldb command is available. If a command would trigger an interactive Y/N prompt (`run`, `br del`), the wrapper handles the prompt for you before the command reaches lldb.
