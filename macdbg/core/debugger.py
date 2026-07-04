@@ -51,6 +51,20 @@ class Debugger:
         self._hook_listener(self.process)
         return self.process
 
+    def attach_pid(self, pid: int) -> lldb.SBProcess:
+        self.target = self.dbg.CreateTarget("")
+        if not self.target.IsValid():
+            raise RuntimeError("failed to create empty target for attach")
+        err = lldb.SBError()
+        info = lldb.SBAttachInfo(pid)
+        info.SetWaitForLaunch(False)
+        self.process = self.target.Attach(info, err)
+        if not err.Success() or not self.process or not self.process.IsValid():
+            raise RuntimeError(
+                "attach failed: {}".format(err.GetCString() or "unknown"))
+        self._hook_listener(self.process)
+        return self.process
+
     def _hook_listener(self, process: lldb.SBProcess) -> None:
         mask = (
             lldb.SBProcess.eBroadcastBitStateChanged
@@ -178,6 +192,7 @@ class Debugger:
     anti_mach_bp_id: int = 0
     direct_syscall_bp_ids: Optional[List[int]] = None
     fork_bp_ids: Optional[List[int]] = None
+    fork_mode: str = "off"
     exec_bp_ids: Optional[Dict[int, str]] = None
 
     def toggle_breakpoint_at(self, addr: int) -> Tuple[str, int]:
@@ -336,39 +351,46 @@ class Debugger:
     _EXEC_SYMBOLS = ("system", "popen", "execve", "execvp",
                      "posix_spawn", "posix_spawnp")
 
-    def enable_fork_suppression(self) -> Tuple[bool, str]:
+    def set_fork_mode(self, mode: str) -> Tuple[bool, str]:
+        if mode not in ("off", "suppress", "identity"):
+            return False, "invalid fork mode {!r}".format(mode)
         if not self.target or not self.target.IsValid():
             return False, "no target"
         if self.fork_bp_ids is None:
             self.fork_bp_ids = []
-        if self.fork_bp_ids:
-            return True, "already enabled"
-        for name in self._FORK_SYMBOLS:
-            bp = self.target.BreakpointCreateByName(name)
-            if bp.IsValid():
-                self.fork_bp_ids.append(bp.GetID())
-        return True, "fork suppression armed ({} symbol(s))".format(len(self.fork_bp_ids))
-
-    def disable_fork_suppression(self) -> Tuple[bool, str]:
-        if not self.target or not self.fork_bp_ids:
-            return True, "already disabled"
-        for bp_id in self.fork_bp_ids:
-            self.target.BreakpointDelete(bp_id)
-        self.fork_bp_ids = []
-        return True, "fork suppression disabled"
+        if mode == "off":
+            for bp_id in self.fork_bp_ids:
+                self.target.BreakpointDelete(bp_id)
+            self.fork_bp_ids = []
+            self.fork_mode = "off"
+            return True, "fork mode: off"
+        if not self.fork_bp_ids:
+            for name in self._FORK_SYMBOLS:
+                bp = self.target.BreakpointCreateByName(name)
+                if bp.IsValid():
+                    self.fork_bp_ids.append(bp.GetID())
+        self.fork_mode = mode
+        label = ("suppress (fork returns -1, no child spawns)" if mode == "suppress"
+                 else "identity (fork returns 0, parent takes child code path)")
+        return True, "fork mode: " + label
 
     def handle_fork_hit(self, bp_id: int) -> Optional[str]:
         if not self.fork_bp_ids or bp_id not in self.fork_bp_ids or not self.process:
+            return None
+        if self.fork_mode == "off":
             return None
         thread = self.process.GetSelectedThread()
         if not thread or not thread.IsValid():
             return None
         frame = thread.GetFrameAtIndex(0)
         fname = frame.GetFunctionName() or "fork"
+        ret_val = 0 if self.fork_mode == "identity" else -1
         ret = lldb.SBCommandReturnObject()
-        self.ci.HandleCommand("thread return -1", ret, False)
+        self.ci.HandleCommand("thread return {}".format(ret_val), ret, False)
         self.process.Continue()
-        return "blocked {}() — returned -1, no child spawned".format(fname)
+        if self.fork_mode == "identity":
+            return "identity: {}() returned 0, parent will take child code path".format(fname)
+        return "suppress: {}() returned -1, no child spawned".format(fname)
 
     def enable_exec_sandbox(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():

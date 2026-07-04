@@ -91,10 +91,16 @@ class WrapperApp(App):
         Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
     ]
 
-    def __init__(self, program: Optional[str], program_args: List[str]) -> None:
+    def __init__(
+        self,
+        program: Optional[str],
+        program_args: List[str],
+        attach_pid: Optional[int] = None,
+    ) -> None:
         super().__init__()
         self.program = program
         self.program_args = program_args
+        self.attach_pid = attach_pid
         self.dbg = Debugger()
         self.pump: Optional[EventPump] = None
         self._prev_regs: Dict[str, str] = {}
@@ -137,7 +143,10 @@ class WrapperApp(App):
 
     def on_mount(self) -> None:
         self.title = "macdbg"
-        self.sub_title = self.program or "(no target)"
+        self.sub_title = (
+            "attached to pid {}".format(self.attach_pid) if self.attach_pid
+            else (self.program or "(no target)")
+        )
         self.pump = EventPump(
             self.dbg.listener,
             on_stop=lambda e: self.call_from_thread(self._on_stop_event, e),
@@ -148,7 +157,13 @@ class WrapperApp(App):
             target=self._pump_lldb_output, name="lldb-output", daemon=True,
         )
         self._output_thread.start()
-        if self.program:
+        if self.attach_pid:
+            try:
+                self.dbg.attach_pid(self.attach_pid)
+                self.console_pane.write("attached to pid {}".format(self.attach_pid))
+            except Exception as e:
+                self.console_pane.write("attach failed: {}".format(e), error=True)
+        elif self.program:
             try:
                 self.dbg.create_target(self.program)
                 self.dbg.launch([self.program] + list(self.program_args))
@@ -334,8 +349,8 @@ class WrapperApp(App):
              self._toggle_hw_bps),
             ("{}  Hardware BPs for tracer breakpoints".format(tag(self.tracer.hardware)),
              self._toggle_tracer_hw),
-            ("{}  Fork suppression (fork/vfork return -1)".format(tag(bool(self.dbg.fork_bp_ids))),
-             self._toggle_fork_suppression),
+            ("Fork mode: {} (click to cycle off/suppress/identity)".format(self.dbg.fork_mode),
+             self._cycle_fork_mode),
             ("{}  Outbound exec sandbox (system/popen/execve/posix_spawn)".format(tag(bool(self.dbg.exec_bp_ids))),
              self._toggle_exec_sandbox),
         ]
@@ -382,11 +397,9 @@ class WrapperApp(App):
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
-    def _toggle_fork_suppression(self) -> None:
-        if self.dbg.fork_bp_ids:
-            _, msg = self.dbg.disable_fork_suppression()
-        else:
-            _, msg = self.dbg.enable_fork_suppression()
+    def _cycle_fork_mode(self) -> None:
+        nxt = {"off": "suppress", "suppress": "identity", "identity": "off"}[self.dbg.fork_mode]
+        _, msg = self.dbg.set_fork_mode(nxt)
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
