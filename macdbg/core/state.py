@@ -20,12 +20,20 @@ class StoredBP:
 
 
 @dataclass
+class Patch:
+    addr: int
+    orig: bytes
+    new: bytes
+
+
+@dataclass
 class BinaryState:
     sha256: str
     binary_path: str
     comments: Dict[int, str] = field(default_factory=dict)
     bookmarks: Dict[int, str] = field(default_factory=dict)
     breakpoints: List[StoredBP] = field(default_factory=list)
+    patches: List[Patch] = field(default_factory=list)
 
     def file_path(self) -> str:
         return os.path.join(STATE_DIR, "{}.json".format(self.sha256))
@@ -47,6 +55,12 @@ class BinaryState:
                         "enabled": bp.enabled,
                     }
                     for bp in self.breakpoints
+                ],
+                "patches": [
+                    {"addr": "{:#x}".format(p.addr),
+                     "orig": p.orig.hex(),
+                     "new": p.new.hex()}
+                    for p in self.patches
                 ],
             }
             tmp = self.file_path() + ".tmp"
@@ -95,6 +109,15 @@ def load_for(binary_path: str) -> BinaryState:
                 condition=bp.get("condition", "") or "",
                 commands=list(bp.get("commands") or []),
                 enabled=bool(bp.get("enabled", True)),
+            ))
+        except (KeyError, ValueError):
+            continue
+    for p in d.get("patches") or []:
+        try:
+            state.patches.append(Patch(
+                addr=int(p["addr"], 16),
+                orig=bytes.fromhex(p.get("orig", "")),
+                new=bytes.fromhex(p.get("new", "")),
             ))
         except (KeyError, ValueError):
             continue

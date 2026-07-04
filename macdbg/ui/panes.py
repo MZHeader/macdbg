@@ -319,6 +319,82 @@ class ModulesPane(Vertical):
             )
 
 
+class StringsPane(Vertical):
+    DEFAULT_CSS = """
+    StringsPane { border: solid $accent; }
+    StringsPane > .title { background: $accent; color: $text; padding: 0 1; }
+    """
+
+    def compose(self):
+        self.title_widget = Static("Strings", classes="title")
+        yield self.title_widget
+        self.table = RightClickTable(cursor_type="row", zebra_stripes=False)
+        yield self.table
+
+    def on_mount(self) -> None:
+        self.table.add_columns("src", "addr", "len", "string")
+        self._rows = []
+
+    def row_at(self, idx: int):
+        if 0 <= idx < len(self._rows):
+            return self._rows[idx]
+        return None
+
+    def render_rows(self, rows) -> None:
+        self._rows = list(rows)
+        self.table.clear()
+        counts = {"bin": 0, "live": 0}
+        for origin, addr, s in rows:
+            counts[origin] = counts.get(origin, 0) + 1
+            src_style = "#5fafff" if origin == "bin" else "#ffaf5f"
+            self.table.add_row(
+                Text(origin, style=src_style),
+                Text("{:016x}".format(addr), style="cyan"),
+                Text(str(len(s)), style="dim"),
+                Text(s[:200], style="green"),
+            )
+        self.title_widget.update(
+            "Strings  ({} bin, {} live)".format(counts.get("bin", 0), counts.get("live", 0)))
+
+
+class PatchesPane(Vertical):
+    DEFAULT_CSS = """
+    PatchesPane { border: solid $accent; }
+    PatchesPane > .title { background: $accent; color: $text; padding: 0 1; }
+    """
+
+    def compose(self):
+        self.title_widget = Static("Patches", classes="title")
+        yield self.title_widget
+        self.table = RightClickTable(cursor_type="row", zebra_stripes=False)
+        yield self.table
+
+    def on_mount(self) -> None:
+        self.table.add_columns("#", "addr", "orig", "new", "size")
+        self._patches = []
+
+    def patch_at(self, idx: int):
+        if 0 <= idx < len(self._patches):
+            return self._patches[idx]
+        return None
+
+    def render_rows(self, patches) -> None:
+        self._patches = list(patches)
+        self.table.clear()
+        for i, p in enumerate(patches):
+            def _hex(b: bytes) -> str:
+                s = b[:16].hex(" ")
+                return s + (" …" if len(b) > 16 else "")
+            self.table.add_row(
+                Text(str(i), style="dim"),
+                Text("{:016x}".format(p.addr), style="cyan"),
+                Text(_hex(p.orig), style="#ff8787"),
+                Text(_hex(p.new), style="#87d75f"),
+                Text(str(len(p.new)), style="dim"),
+            )
+        self.title_widget.update("Patches  ({} tracked)".format(len(patches)))
+
+
 class BacktracePane(Vertical):
     DEFAULT_CSS = """
     BacktracePane { border: solid $accent; }

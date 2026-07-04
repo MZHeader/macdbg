@@ -25,8 +25,10 @@ from .panes import (
     HexPane,
     MemoryPane,
     ModulesPane,
+    PatchesPane,
     RegistersPane,
     RightClickTable,
+    StringsPane,
     ThreadsPane,
     TracePane,
 )
@@ -136,6 +138,8 @@ class WrapperApp(App):
         self._mem_follow_len: int = 1
         self._last_rendered_follow: Optional[int] = None
         self._disasm_follow: Optional[int] = None
+        self._strings_bin: List = []
+        self._strings_live: List = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -148,6 +152,8 @@ class WrapperApp(App):
         self.modules_pane = ModulesPane()
         self.trace_pane = TracePane()
         self.backtrace_pane = BacktracePane()
+        self.strings_pane = StringsPane()
+        self.patches_pane = PatchesPane()
         self.console_pane = ConsolePane()
 
         with Horizontal(id="top"):
@@ -165,6 +171,10 @@ class WrapperApp(App):
                     yield self.bps
                 with TabPane("Call Stack", id="tab_backtrace"):
                     yield self.backtrace_pane
+                with TabPane("Strings", id="tab_strings"):
+                    yield self.strings_pane
+                with TabPane("Patches", id="tab_patches"):
+                    yield self.patches_pane
                 with TabPane("Threads", id="tab_threads"):
                     yield self.threads_pane
                 with TabPane("Modules", id="tab_modules"):
@@ -204,12 +214,18 @@ class WrapperApp(App):
                 self.console_pane.write("launched {}".format(self.program))
                 if self.dbg.state:
                     self.console_pane.write(
-                        "[state] loaded sha={}… ({} bp(s), {} comment(s), {} bookmark(s))".format(
+                        "[state] loaded sha={}… ({} bp(s), {} comment(s), {} bookmark(s), {} patch(es))".format(
                             self.dbg.state.sha256[:12], restored,
                             len(self.dbg.state.comments),
                             len(self.dbg.state.bookmarks),
+                            len(self.dbg.state.patches),
                         )
                     )
+                try:
+                    self._strings_bin = self.dbg.extract_strings(min_len=5)
+                    self._render_strings()
+                except Exception as e:
+                    self.console_pane.write("[strings] extract failed: {}".format(e), error=True)
             except Exception as e:
                 self.console_pane.write("launch failed: {}".format(e), error=True)
         else:
@@ -406,6 +422,8 @@ class WrapperApp(App):
         self.threads_pane.render_rows(self.dbg.threads())
         self.modules_pane.render_rows(self.dbg.modules())
         self.backtrace_pane.render_rows(self.dbg.backtrace())
+        if self.dbg.state:
+            self.patches_pane.render_rows(self.dbg.state.patches)
 
     def action_step_in(self) -> None:
         self.dbg.step_in()
@@ -772,6 +790,7 @@ class WrapperApp(App):
             ("regs", self.regs), ("disasm", self.disasm),
             ("mem", self.mem), ("stack", self.stack),
             ("bps", self.bps), ("trace", self.trace_pane),
+            ("strings", self.strings_pane), ("patches", self.patches_pane),
         ):
             if event.table is pane.table:
                 self._open_menu_for(pane_name, event.row, event.screen_x, event.screen_y)
@@ -832,6 +851,30 @@ class WrapperApp(App):
                 ("Toggle enabled",    lambda: self._toggle_bp_enabled(bp_id)),
                 ("Delete",            lambda: self._delete_bp(bp_id)),
             ]
+        elif pane == "strings":
+            entry = self.strings_pane.row_at(row)
+            if entry is None:
+                items = [
+                    ("Rescan heap/stack for strings", self._rescan_strings),
+                ]
+            else:
+                origin, addr, s = entry
+                items = [
+                    ("Follow in Memory",              lambda: self._follow_memory(addr, focus_len=min(len(s), 128))),
+                    ("Follow in disassembly",         lambda: self._follow_disasm(addr)),
+                    ("Copy address",                  lambda: self._copy("{:#x}".format(addr))),
+                    ("Copy string",                   lambda: self._copy(s)),
+                    ("Rescan heap/stack for strings", self._rescan_strings),
+                ]
+        elif pane == "patches":
+            p = self.patches_pane.patch_at(row)
+            if p is None:
+                return
+            items = [
+                ("Follow in Memory",  lambda: self._follow_memory(p.addr, focus_len=len(p.new))),
+                ("Revert patch",      lambda: self._revert_patch(row)),
+                ("Copy address",      lambda: self._copy("{:#x}".format(p.addr))),
+            ]
         elif pane in ("mem", "stack"):
             base = self._hex_row_addr(pane, row)
             if base is None:
@@ -840,6 +883,7 @@ class WrapperApp(App):
                 ("Goto qword here (follow ptr)",  lambda: self._follow_qword(base)),
                 ("Set watchpoint on this addr",   lambda: self._set_watchpoint(base)),
                 ("Edit bytes at this row…",       lambda: self._prompt_edit_mem(base)),
+                ("Edit ASCII at this row…",       lambda: self._prompt_edit_ascii(base)),
                 ("Copy address",                  lambda: self._copy("{:#x}".format(base))),
             ]
         if items:
@@ -1008,6 +1052,47 @@ class WrapperApp(App):
         self.console_pane.write("bp #{} deleted".format(bp_id))
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
+    def _render_strings(self) -> None:
+        seen = set()
+        merged = []
+        for addr, s in self._strings_live:
+            key = (addr, s)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(("live", addr, s))
+        for addr, s in self._strings_bin:
+            key = (addr, s)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(("bin", addr, s))
+        self.strings_pane.render_rows(merged)
+
+    def _rescan_strings(self) -> None:
+        if not self.dbg.process or self.dbg.process.GetState() != lldb.eStateStopped:
+            self.console_pane.write("[strings] process not stopped, cannot rescan", error=True)
+            return
+        self.console_pane.write("[strings] scanning heap and stack for printable runs…")
+        async def _run() -> None:
+            hits = await self._run_string_scan()
+            self._strings_live = hits
+            self._render_strings()
+            self.console_pane.write(
+                "[strings] rescan: {} live string(s) found".format(len(hits)))
+        self.run_worker(_run(), exclusive=True)
+
+    async def _run_string_scan(self):
+        # non-blocking wrapper; the scan is bounded and synchronous under the hood.
+        return self.dbg.scan_live_strings(min_len=5, budget_bytes=512 * 1024 * 1024)
+
+    def _revert_patch(self, index: int) -> None:
+        ok, msg = self.dbg.revert_patch(index)
+        self.console_pane.write("[patches] " + msg, error=not ok)
+        if self.dbg.state:
+            self.patches_pane.render_rows(self.dbg.state.patches)
+        self._refresh_all()
+
     def _prompt_clear_state(self) -> None:
         if not self.dbg.state:
             self.console_pane.write(
@@ -1088,6 +1173,28 @@ class WrapperApp(App):
                 self.console_pane.write("bad register value: {!r}".format(val), error=True)
                 return
             ok, msg = self.dbg.write_register(name, new_val)
+            self.console_pane.write(msg, error=not ok)
+            self._refresh_all()
+        self.run_worker(_run(), exclusive=True)
+
+    def _prompt_edit_ascii(self, addr: int) -> None:
+        current_bytes = self.dbg.read_memory(addr, 64)
+        end = current_bytes.find(b"\x00")
+        if end < 0:
+            end = len(current_bytes)
+        try:
+            initial = current_bytes[:end].decode("ascii")
+        except UnicodeDecodeError:
+            initial = ""
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Write ASCII at {:#x}  —  Enter writes (nul-terminated); Ctrl+U clears; Esc cancels".format(addr),
+                initial=initial,
+            ))
+            if val is None:
+                return
+            data = val.encode("utf-8") + b"\x00"
+            ok, msg = self.dbg.write_memory(addr, data)
             self.console_pane.write(msg, error=not ok)
             self._refresh_all()
         self.run_worker(_run(), exclusive=True)

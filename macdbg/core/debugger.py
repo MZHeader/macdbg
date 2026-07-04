@@ -5,7 +5,20 @@ from typing import Dict, List, Optional, Tuple
 
 import lldb
 
-from .state import BinaryState, StoredBP, load_for
+from .state import BinaryState, StoredBP, Patch, load_for
+
+
+def _looks_like_string(span: bytes, wanted: set) -> bool:
+    if not span:
+        return False
+    if len(set(span)) == 1:
+        return False
+    letters = sum(1 for b in span if b in wanted)
+    if letters == 0:
+        return False
+    if letters < max(2, len(span) // 4):
+        return False
+    return True
 
 
 class Debugger:
@@ -240,13 +253,14 @@ class Debugger:
         f = self.frame()
         return f.GetSP() if f else None
 
-    def write_memory(self, addr: int, data: bytes) -> Tuple[bool, str]:
+    def write_memory(self, addr: int, data: bytes, track: bool = True) -> Tuple[bool, str]:
         if not self.process:
             return False, "no process"
         state = self.process.GetState()
         if state != lldb.eStateStopped:
             return False, "process not stopped (state={})".format(
                 lldb.SBDebugger.StateAsCString(state))
+        orig = self.read_memory(addr, len(data))
         err = lldb.SBError()
         n = self.process.WriteMemory(addr, data, err)
         if not err.Success():
@@ -257,7 +271,28 @@ class Debugger:
         if check[:len(data)] != data:
             return False, "verify failed: wrote {} but read back {}".format(
                 data.hex(), check[:len(data)].hex())
+        if track and self.state and orig and len(orig) >= len(data):
+            self._record_patch(addr, orig[:len(data)], data)
         return True, "wrote {} byte(s) at {:#x}".format(n, addr)
+
+    def _record_patch(self, addr: int, orig: bytes, new: bytes) -> None:
+        if not self.state:
+            return
+        for i, p in enumerate(self.state.patches):
+            if p.addr == addr and len(p.new) == len(new):
+                self.state.patches[i] = Patch(addr=addr, orig=p.orig, new=new)
+                return
+        self.state.patches.append(Patch(addr=addr, orig=orig, new=new))
+
+    def revert_patch(self, index: int) -> Tuple[bool, str]:
+        if not self.state or not (0 <= index < len(self.state.patches)):
+            return False, "no such patch"
+        p = self.state.patches[index]
+        ok, msg = self.write_memory(p.addr, p.orig, track=False)
+        if ok:
+            del self.state.patches[index]
+            return True, "reverted {} byte(s) at {:#x}".format(len(p.orig), p.addr)
+        return False, "revert failed: {}".format(msg)
 
     def write_register(self, name: str, value: int) -> Tuple[bool, str]:
         f = self.frame()
@@ -740,6 +775,141 @@ class Debugger:
             out.append((base, name, base, size, triple))
         out.sort()
         return [(name, base, size, triple) for _, name, base, size, triple in out]
+
+    _STRING_SECTIONS = (
+        "__cstring", "__oslogstring", "__ustring",
+        "__objc_methname", "__objc_classname", "__objc_methtype",
+        "__const",
+    )
+
+    def scan_live_strings(self, min_len: int = 8,
+                          budget_bytes: int = 512 * 1024 * 1024) -> List[Tuple[int, str]]:
+        """Scan heap, stack, and private mmap regions for null-terminated
+        printable ASCII runs likely to be real strings (letters or path
+        separators required, single-char runs filtered). Excludes libraries
+        and the target binary's own static sections (dedup with the bin list).
+        Bounded by `budget_bytes`."""
+        if not self.process or not self.process.IsValid():
+            return []
+        exec_name = ""
+        if self.target and self.target.IsValid():
+            exec_name = self.target.GetExecutable().GetFilename() or ""
+        target_ranges, _ = self._scope_metadata(exec_name)
+        out: List[Tuple[int, str]] = []
+        scanned = 0
+        addr = 0
+        seen_end = -1
+        for _ in range(8192):
+            info = lldb.SBMemoryRegionInfo()
+            err = self.process.GetMemoryRegionInfo(addr, info)
+            if not err.Success():
+                break
+            base = info.GetRegionBase()
+            end = info.GetRegionEnd()
+            if end <= seen_end or end == base:
+                break
+            seen_end = end
+            size = end - base
+            addr = end
+            if not info.IsReadable() or size <= 0:
+                continue
+            if not self._region_in_target_scope(base, exec_name):
+                continue
+            if self._range_overlaps_any(base, end, target_ranges):
+                continue
+            chunk_size = 4 * 1024 * 1024
+            off = 0
+            while off < size:
+                if scanned >= budget_bytes:
+                    return out
+                take = min(chunk_size, size - off)
+                rerr = lldb.SBError()
+                data = self.process.ReadMemory(base + off, take, rerr)
+                if not rerr.Success() or not data:
+                    break
+                scanned += len(data)
+                self._collect_printable_runs(bytes(data), base + off, min_len, out)
+                off += take
+        return out
+
+    @staticmethod
+    def _range_overlaps_any(base: int, end: int, ranges) -> bool:
+        for lo, hi in ranges:
+            if lo < end and hi > base:
+                return True
+        return False
+
+    @staticmethod
+    def _collect_printable_runs(data: bytes, base: int, min_len: int,
+                                out: List[Tuple[int, str]]) -> None:
+        run_start = None
+        letters_or_paths = set(b"abcdefghijklmnopqrstuvwxyz"
+                               b"ABCDEFGHIJKLMNOPQRSTUVWXYZ/.-_")
+        for i, b in enumerate(data):
+            if 32 <= b < 127 or b in (9, 10, 13):
+                if run_start is None:
+                    run_start = i
+                continue
+            if run_start is not None:
+                if b == 0 and (i - run_start) >= min_len:
+                    span = data[run_start:i]
+                    if _looks_like_string(span, letters_or_paths):
+                        try:
+                            out.append((base + run_start, span.decode("ascii")))
+                        except UnicodeDecodeError:
+                            pass
+                run_start = None
+
+    def extract_strings(self, min_len: int = 5) -> List[Tuple[int, str]]:
+        """Extract null-terminated printable strings from the target executable's
+        string-bearing sections. Returns (load_address, string). Called once
+        after target load; results are stable while the process runs."""
+        if not self.target or not self.target.IsValid():
+            return []
+        exec_name = self.target.GetExecutable().GetFilename() or ""
+        exec_mod = None
+        for i in range(self.target.GetNumModules()):
+            m = self.target.GetModuleAtIndex(i)
+            if m.GetFileSpec().GetFilename() == exec_name:
+                exec_mod = m
+                break
+        if exec_mod is None:
+            return []
+        out: List[Tuple[int, str]] = []
+        for s in range(exec_mod.GetNumSections()):
+            sec = exec_mod.GetSectionAtIndex(s)
+            self._collect_strings_in(sec, min_len, out)
+        return out
+
+    def _collect_strings_in(self, sec, min_len: int, out) -> None:
+        if sec.GetNumSubSections() > 0:
+            for i in range(sec.GetNumSubSections()):
+                self._collect_strings_in(sec.GetSubSectionAtIndex(i), min_len, out)
+            return
+        name = sec.GetName() or ""
+        if name not in self._STRING_SECTIONS:
+            return
+        load = sec.GetLoadAddress(self.target)
+        if load == lldb.LLDB_INVALID_ADDRESS or load == 0:
+            return
+        err = lldb.SBError()
+        data = sec.GetSectionData().ReadRawData(err, 0, sec.GetByteSize())
+        if not err.Success() or not data:
+            return
+        raw = bytes(data)
+        start = 0
+        for i, b in enumerate(raw):
+            if b == 0:
+                span = raw[start:i]
+                if len(span) >= min_len:
+                    try:
+                        s = span.decode("ascii")
+                    except UnicodeDecodeError:
+                        start = i + 1
+                        continue
+                    if all(32 <= ord(c) < 127 or c in "\t\n\r" for c in s):
+                        out.append((load + start, s))
+                start = i + 1
 
     def handle_command(self, cmd: str) -> Tuple[bool, str, str]:
         ret = lldb.SBCommandReturnObject()
