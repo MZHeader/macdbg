@@ -80,14 +80,10 @@ class WrapperApp(App):
     BINDINGS = [
         Binding("f7", "step_in", "Step In"),
         Binding("f8", "step_over", "Step Over"),
-        Binding("shift+f7", "step_in_src", "Step In (src)"),
-        Binding("shift+f8", "step_over_src", "Step Over (src)"),
         Binding("f9", "cont", "Continue"),
         Binding("f2", "toggle_bp", "Toggle BP"),
         Binding("colon", "focus_cmd", "Command", key_display=":"),
         Binding("ctrl+g", "focus_mem", "Goto Addr"),
-        Binding("f5", "mem_scroll(-1)", "Mem ↑"),
-        Binding("f6", "mem_scroll(1)", "Mem ↓"),
         Binding("ctrl+t", "toggle_trace", "Trace"),
         Binding("ctrl+k", "clear_trace", "Clear Trace"),
         Binding("ctrl+y", "cycle_trace_depth", "Trace Scope"),
@@ -194,8 +190,6 @@ class WrapperApp(App):
         process = self.dbg.process
         if not process or not process.IsValid():
             return False
-        if not self.dbg.anti_ptrace_bp_id:
-            return False
         thread = process.GetSelectedThread()
         if not thread or not thread.IsValid():
             return False
@@ -204,11 +198,14 @@ class WrapperApp(App):
         if thread.GetStopReasonDataCount() < 1:
             return False
         bp_id = thread.GetStopReasonDataAtIndex(0)
-        msg = self.dbg.handle_anti_ptrace_hit(bp_id)
-        if msg is None:
-            return False
-        self.console_pane.write("[anti-debug] " + msg)
-        return True
+        for handler in (self.dbg.handle_anti_ptrace_hit,
+                        self.dbg.handle_anti_mach_hit,
+                        self.dbg.handle_direct_syscall_hit):
+            msg = handler(bp_id)
+            if msg is not None:
+                self.console_pane.write("[anti-debug] " + msg)
+                return True
+        return False
 
     def _handle_possible_trace_hit(self) -> bool:
         process = self.dbg.process
@@ -272,12 +269,6 @@ class WrapperApp(App):
     def action_step_over(self) -> None:
         self.dbg.step_over()
 
-    def action_step_in_src(self) -> None:
-        self.dbg.step_in_source()
-
-    def action_step_over_src(self) -> None:
-        self.dbg.step_over_source()
-
     def action_cont(self) -> None:
         self.dbg.cont()
 
@@ -316,19 +307,32 @@ class WrapperApp(App):
         ids = set(self.tracer._bp_to_name)
         if self.dbg.anti_ptrace_bp_id:
             ids.add(self.dbg.anti_ptrace_bp_id)
+        if self.dbg.anti_mach_bp_id:
+            ids.add(self.dbg.anti_mach_bp_id)
+        if self.dbg.direct_syscall_bp_ids:
+            ids.update(self.dbg.direct_syscall_bp_ids)
         return ids
 
     def action_defenses(self) -> None:
-        deny_on = bool(self.dbg.anti_ptrace_bp_id)
-        hw_on = self.dbg.hw_breakpoints
+        def tag(on: bool) -> str:
+            return "[on] " if on else "[off]"
+
         items = [
-            ("{} PT_DENY_ATTACH bypass".format("[on]  disable" if deny_on else "[off] enable"),
+            ("{}  PT_DENY_ATTACH bypass (symbol hook)".format(tag(bool(self.dbg.anti_ptrace_bp_id))),
              self._toggle_deny_attach_bypass),
-            ("{} Hardware breakpoints for new BPs".format("[on]  disable" if hw_on else "[off] enable"),
+            ("{}  Direct-syscall ptrace scan (mov x16,#26 / svc)".format(tag(bool(self.dbg.direct_syscall_bp_ids))),
+             self._toggle_direct_syscall_scan),
+            ("{}  Mach exception port cloak".format(tag(bool(self.dbg.anti_mach_bp_id))),
+             self._toggle_mach_ports_cloak),
+            ("{}  Hardware BPs for user breakpoints".format(tag(self.dbg.hw_breakpoints)),
              self._toggle_hw_bps),
+            ("{}  Hardware BPs for tracer breakpoints".format(tag(self.tracer.hardware)),
+             self._toggle_tracer_hw),
+            ("[n/a] _dyld_debugger_notification hide (not implemented)",
+             lambda: self.console_pane.write("[anti-debug] dyld notification hiding is out of scope for now")),
         ]
         w, h = self.size
-        self.push_screen(ContextMenu(items, x=max(0, w // 2 - 20), y=max(0, h // 3)))
+        self.push_screen(ContextMenu(items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
 
     def _toggle_deny_attach_bypass(self) -> None:
         if self.dbg.anti_ptrace_bp_id:
@@ -340,8 +344,35 @@ class WrapperApp(App):
 
     def _toggle_hw_bps(self) -> None:
         self.dbg.hw_breakpoints = not self.dbg.hw_breakpoints
-        self.console_pane.write("[anti-debug] hardware breakpoints for new BPs: {}".format(
+        self.console_pane.write("[anti-debug] hardware breakpoints for user BPs: {}".format(
             "ON" if self.dbg.hw_breakpoints else "OFF"))
+
+    def _toggle_tracer_hw(self) -> None:
+        if self.tracer.enabled:
+            self.console_pane.write(
+                "[anti-debug] disable tracer first (Ctrl+T), then flip HW mode",
+                error=True,
+            )
+            return
+        self.tracer.hardware = not self.tracer.hardware
+        self.console_pane.write("[anti-debug] hardware breakpoints for tracer: {}".format(
+            "ON" if self.tracer.hardware else "OFF"))
+
+    def _toggle_mach_ports_cloak(self) -> None:
+        if self.dbg.anti_mach_bp_id:
+            _, msg = self.dbg.disable_anti_mach_ports()
+        else:
+            _, msg = self.dbg.enable_anti_mach_ports()
+        self.console_pane.write("[anti-debug] " + msg)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_direct_syscall_scan(self) -> None:
+        if self.dbg.direct_syscall_bp_ids:
+            _, msg = self.dbg.disable_direct_syscall_scan()
+        else:
+            _, msg = self.dbg.enable_direct_syscall_scan()
+        self.console_pane.write("[anti-debug] " + msg)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     def action_clear_trace(self) -> None:
         self.trace_pane.clear()
@@ -353,7 +384,7 @@ class WrapperApp(App):
             self.tracer.disable(self.dbg.target)
             self.console_pane.write("[trace] disabled")
         else:
-            total, resolved = self.tracer.enable(self.dbg.target)
+            total, resolved = self.tracer.enable(self.dbg.target, ci=self.dbg.ci)
             if total == 0:
                 self.console_pane.write("[trace] could not create breakpoints", error=True)
                 return
@@ -371,14 +402,6 @@ class WrapperApp(App):
             except Exception:
                 pass
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
-
-    def action_mem_scroll(self, direction: int) -> None:
-        base = self._mem_follow if self._mem_follow is not None else (self.dbg.pc() or 0)
-        if not base:
-            return
-        step = 16 * 32
-        new_base = max(0, base + direction * step)
-        self._follow_memory(new_base)
 
     _RELAUNCH_ALIASES = ("run", "r", "process launch")
     _DELETE_ALL_ALIASES = ("br del", "breakpoint delete")

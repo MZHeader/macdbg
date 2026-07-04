@@ -175,6 +175,8 @@ class Debugger:
 
     hw_breakpoints: bool = False
     anti_ptrace_bp_id: int = 0
+    anti_mach_bp_id: int = 0
+    direct_syscall_bp_ids: Optional[List[int]] = None
 
     def toggle_breakpoint_at(self, addr: int) -> Tuple[str, int]:
         assert self.target is not None
@@ -215,6 +217,118 @@ class Debugger:
         self.target.BreakpointDelete(self.anti_ptrace_bp_id)
         self.anti_ptrace_bp_id = 0
         return True, "PT_DENY_ATTACH bypass disabled"
+
+    def enable_anti_mach_ports(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.anti_mach_bp_id:
+            return True, "already enabled"
+        bp = self.target.BreakpointCreateByName("task_get_exception_ports")
+        if not bp.IsValid():
+            return False, "task_get_exception_ports symbol not found"
+        self.anti_mach_bp_id = bp.GetID()
+        return True, "Mach exception port cloak armed (bp #{})".format(bp.GetID())
+
+    def disable_anti_mach_ports(self) -> Tuple[bool, str]:
+        if not self.target or not self.anti_mach_bp_id:
+            return True, "already disabled"
+        self.target.BreakpointDelete(self.anti_mach_bp_id)
+        self.anti_mach_bp_id = 0
+        return True, "Mach exception port cloak disabled"
+
+    def handle_anti_mach_hit(self, bp_id: int) -> Optional[str]:
+        if bp_id != self.anti_mach_bp_id or not self.process:
+            return None
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return None
+        masks_cnt_ptr = frame.FindRegister("x3").GetValueAsUnsigned()
+        if masks_cnt_ptr:
+            err = lldb.SBError()
+            self.process.WriteMemory(masks_cnt_ptr, b"\x00\x00\x00\x00", err)
+        ret = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("thread return 0", ret, False)
+        self.process.Continue()
+        return "cloaked task_get_exception_ports (returned 0 masks)"
+
+    def enable_direct_syscall_scan(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.direct_syscall_bp_ids is None:
+            self.direct_syscall_bp_ids = []
+        if self.direct_syscall_bp_ids:
+            return True, "already armed"
+        exec_name = self.target.GetExecutable().GetFilename() or ""
+        exec_mod = None
+        for i in range(self.target.GetNumModules()):
+            m = self.target.GetModuleAtIndex(i)
+            if m.GetFileSpec().GetFilename() == exec_name:
+                exec_mod = m
+                break
+        if exec_mod is None:
+            return False, "target executable module not found"
+        text_bytes = b""
+        text_load = 0
+        for i in range(exec_mod.GetNumSections()):
+            sec = exec_mod.GetSectionAtIndex(i)
+            if sec.GetName() != "__TEXT":
+                continue
+            for j in range(sec.GetNumSubSections()):
+                sub = sec.GetSubSectionAtIndex(j)
+                if sub.GetName() == "__text":
+                    text_load = sub.GetLoadAddress(self.target)
+                    err = lldb.SBError()
+                    raw = sub.GetSectionData().ReadRawData(err, 0, sub.GetByteSize())
+                    if err.Success() and raw:
+                        text_bytes = bytes(raw)
+                    break
+            break
+        if not text_bytes:
+            return False, "could not read __text"
+        svc_pattern = b"\x01\x10\x00\xd4"
+        found = []
+        for off in range(0, len(text_bytes) - 3, 4):
+            if text_bytes[off:off + 4] == svc_pattern:
+                svc_addr = text_load + off
+                bp = self.target.BreakpointCreateByAddress(svc_addr)
+                if bp.IsValid():
+                    self.direct_syscall_bp_ids.append(bp.GetID())
+                    found.append(svc_addr)
+        return True, "direct-syscall scan: {} svc #0x80 site(s) armed in target __text".format(len(found))
+
+    def disable_direct_syscall_scan(self) -> Tuple[bool, str]:
+        if not self.target or not self.direct_syscall_bp_ids:
+            return True, "already disabled"
+        for bp_id in self.direct_syscall_bp_ids:
+            self.target.BreakpointDelete(bp_id)
+        self.direct_syscall_bp_ids = []
+        return True, "direct-syscall scan disabled"
+
+    def handle_direct_syscall_hit(self, bp_id: int) -> Optional[str]:
+        if not self.direct_syscall_bp_ids or bp_id not in self.direct_syscall_bp_ids:
+            return None
+        if not self.process:
+            return None
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return None
+        x16 = frame.FindRegister("x16").GetValueAsUnsigned()
+        x0 = frame.FindRegister("x0").GetValueAsUnsigned()
+        pc = frame.GetPC()
+        ret = lldb.SBCommandReturnObject()
+        if x16 == 26 and x0 == 31:
+            self.ci.HandleCommand("register write x0 0", ret, False)
+            self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
+            self.process.Continue()
+            return "blocked direct ptrace(PT_DENY_ATTACH) svc at {:#x}".format(pc)
+        self.process.Continue()
+        return "direct svc #{} passed (op={:#x})".format(x16, x0)
 
     def handle_anti_ptrace_hit(self, bp_id: int) -> Optional[str]:
         if bp_id != self.anti_ptrace_bp_id or not self.process:

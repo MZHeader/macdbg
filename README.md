@@ -26,10 +26,8 @@ Point it at a binary you compiled yourself, or any non-signed Homebrew binary. S
 |-----|--------|
 | F7 | Step in (instruction) |
 | F8 | Step over (instruction) |
-| Shift+F7 / Shift+F8 | Step in / over at source line granularity |
 | F9 | Continue |
 | F2 | Toggle breakpoint at pc |
-| F5 / F6 | Scroll memory pane up / down by 512 bytes |
 | Enter (in disasm) | Follow operand address in the memory pane |
 | `:` | Focus the console command bar |
 | Ctrl+G | Focus the memory "follow address" input |

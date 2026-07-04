@@ -360,14 +360,23 @@ class Tracer:
         self.enabled = False
         self._exec_name: str = ""
         self.caller_depth: int = 5
+        self.hardware: bool = False
 
-    def enable(self, target: lldb.SBTarget) -> Tuple[int, int]:
+    def enable(self, target: lldb.SBTarget, ci: Optional[lldb.SBCommandInterpreter] = None) -> Tuple[int, int]:
         if self.enabled or not target or not target.IsValid():
             return (0, 0)
         self._exec_name = target.GetExecutable().GetFilename() or ""
         resolved_now = 0
         for name in SIGS:
-            bp = target.BreakpointCreateByName(name)
+            if self.hardware and ci is not None:
+                n_before = target.GetNumBreakpoints()
+                ret = lldb.SBCommandReturnObject()
+                ci.HandleCommand("breakpoint set -H -n {}".format(name), ret, False)
+                if target.GetNumBreakpoints() <= n_before:
+                    continue
+                bp = target.GetBreakpointAtIndex(n_before)
+            else:
+                bp = target.BreakpointCreateByName(name)
             if not bp.IsValid():
                 continue
             self._bp_ids.append(bp.GetID())
