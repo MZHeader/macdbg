@@ -35,7 +35,6 @@ A menu of independent toggles, all off by default:
 - **Mach exception port cloak.** Hooks `task_get_exception_ports`, writes 0 to the caller's `*masksCnt` buffer, and thread-returns 0. The sample sees a successful call reporting zero installed exception ports.
 - **Hardware breakpoints for user BPs.** Future `toggle_bp` calls use `-H`, so `__TEXT` bytes aren't patched with `brk`. Defeats integrity checks that hash a function's prologue.
 - **Hardware breakpoints for tracer BPs.** Same idea applied to the tracer's set of libSystem breakpoints. Toggle this before enabling the tracer, not after.
-- `_dyld_debugger_notification` cloaking is listed but not implemented. The struct layout changes per macOS release, and clobbering the wrong field breaks lldb's own view of loaded images. Easier to watchpoint the specific field the sample reads and patch inline.
 
 Verified end-to-end against a canary (`test/denyfour.c`) that runs all four checks in sequence.
 

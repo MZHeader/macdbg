@@ -328,8 +328,6 @@ class WrapperApp(App):
              self._toggle_hw_bps),
             ("{}  Hardware BPs for tracer breakpoints".format(tag(self.tracer.hardware)),
              self._toggle_tracer_hw),
-            ("[n/a] _dyld_debugger_notification hide (not implemented)",
-             lambda: self.console_pane.write("[anti-debug] dyld notification hiding is out of scope for now")),
         ]
         w, h = self.size
         self.push_screen(ContextMenu(items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
