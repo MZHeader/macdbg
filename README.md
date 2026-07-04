@@ -17,12 +17,10 @@ Install Textual once into the system Python:
 ## Run
 
 ```sh
-./run.sh test/hello       # tiny sample
-./run.sh test/fakemal     # XOR-decrypted strings, fake C2 beacon, worker thread
-./run.sh test/talker      # real file I/O and an HTTP fetch (good for the tracer)
+./run.sh /path/to/your/binary
 ```
 
-System binaries like `/bin/ls` are usually blocked by macOS SIP and will fail to launch. Rebuild the test binaries with `make -C test`.
+Point it at a binary you compiled yourself, or any non-signed Homebrew binary. System binaries under `/bin`, `/usr/bin`, and other SIP-protected paths are blocked from being debugged and will fail to launch.
 
 `run.sh` sets `PYTHONPATH=$(lldb -P)` so `import lldb` resolves to the framework build. ASLR is disabled on every launch, so addresses stay stable across runs.
 

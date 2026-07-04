@@ -4,8 +4,3 @@ __pycache__/
 *.egg-info/
 .venv/
 .DS_Store
-test/hello
-test/fakemal
-test/fakemal_stripped
-test/talker
-test/*.dSYM/
