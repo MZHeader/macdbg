@@ -172,10 +172,31 @@ class Debugger:
         if t:
             t.StepInstruction(False)
 
+    _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
+
     def step_over(self) -> None:
+        """Step over the current instruction. lldb's SBThread.StepInstruction(True)
+        can silently degrade to step-in when it cannot identify a call site in
+        stripped code, so for arm64 call instructions we set a one-shot BP at
+        pc+4 and continue — the reliable classical implementation."""
         t = self._thread()
-        if t:
-            t.StepInstruction(True)
+        if not t or not self.target or not self.target.IsValid():
+            return
+        frame = t.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return
+        pc = frame.GetPC()
+        insns = self.target.ReadInstructions(lldb.SBAddress(pc, self.target), 1)
+        if insns.GetSize() >= 1:
+            mn = (insns.GetInstructionAtIndex(0).GetMnemonic(self.target) or "").lower()
+            if mn in self._CALL_MNEMONICS:
+                bp = self.target.BreakpointCreateByAddress(pc + 4)
+                bp.SetOneShot(True)
+                bp.SetThreadID(t.GetThreadID())
+                if self.process:
+                    self.process.Continue()
+                return
+        t.StepInstruction(True)
 
     def step_in_source(self) -> None:
         t = self._thread()

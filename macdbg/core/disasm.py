@@ -17,6 +17,9 @@ class DisasmRow:
     is_pc: bool
     user_comment: str = ""
     inline_hint: str = ""
+    gutter: str = "    "
+    gutter_styles: List = None  # populated on demand: [(start, end, style_str)]
+    function_head: str = ""    # non-empty on the first row of each function
 
 
 _INT_RE = re.compile(r"#-?(?:0x[0-9a-fA-F]+|\d+)")
@@ -161,10 +164,18 @@ def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> N
 
 
 def disasm_around(target: lldb.SBTarget, pc: int, count: int = 512,
-                  read_mem: Optional[Callable[[int, int], bytes]] = None) -> List[DisasmRow]:
+                  read_mem: Optional[Callable[[int, int], bytes]] = None,
+                  center: Optional[int] = None,
+                  frame: Optional["lldb.SBFrame"] = None) -> List[DisasmRow]:
+    """Disassemble `count` instructions around `center` (or `pc` if not set).
+    `pc` is still used to mark the pc row. When `center != pc`, the caller is
+    browsing another address; the pc row will only appear if it falls in the
+    fetched range. If `frame` is provided and the row at pc is a conditional
+    branch, its arrow is colored green (taken) or red (not taken)."""
     if not target or not target.IsValid() or pc == 0:
         return []
-    start = max(0, pc - count * 2)
+    anchor = center if center is not None else pc
+    start = max(0, anchor - count * 2)
     addr = lldb.SBAddress(start, target)
     insns = target.ReadInstructions(addr, count)
     out: List[DisasmRow] = []
@@ -185,7 +196,220 @@ def disasm_around(target: lldb.SBTarget, pc: int, count: int = 512,
         )
     if read_mem is not None:
         _annotate_pairs(out, read_mem, target)
+    _mark_function_heads(out, target)
+    _draw_branch_gutter(out, frame=frame)
     return out
+
+
+def _mark_function_heads(rows: List[DisasmRow], target: lldb.SBTarget) -> None:
+    """Tag rows where the containing function/symbol changes. On the first row
+    of each function, populate `function_head` with either the function name
+    ('main', 'main+0x0') or the symbol name for unnamed / stripped code."""
+    if not rows:
+        return
+    prev_name = None
+    for r in rows:
+        sb = target.ResolveLoadAddress(r.addr)
+        if not sb.IsValid():
+            continue
+        fn = sb.GetFunction()
+        name = ""
+        start = lldb.LLDB_INVALID_ADDRESS
+        if fn.IsValid() and fn.GetName():
+            name = fn.GetName()
+            start = fn.GetStartAddress().GetLoadAddress(target)
+        else:
+            sym = sb.GetSymbol()
+            if sym.IsValid() and sym.GetName():
+                name = sym.GetName()
+                start = sym.GetStartAddress().GetLoadAddress(target)
+        if not name:
+            prev_name = None
+            continue
+        is_new_function = (name != prev_name)
+        prev_name = name
+        if is_new_function or r.addr == start:
+            r.function_head = name
+
+
+_BRANCH_MNEMONICS = {
+    "b", "bl", "b.eq", "b.ne", "b.cs", "b.hs", "b.cc", "b.lo", "b.mi", "b.pl",
+    "b.vs", "b.vc", "b.hi", "b.ls", "b.ge", "b.lt", "b.gt", "b.le", "b.al", "b.nv",
+    "cbz", "cbnz", "tbz", "tbnz",
+}
+
+
+def _draw_branch_gutter(rows: List[DisasmRow], width: int = 4,
+                         frame: Optional["lldb.SBFrame"] = None) -> None:
+    """Draw a fixed-width arrow gutter to the left of each row indicating
+    branches whose source AND target are both in view. Columns are assigned
+    greedily so overlapping arrows sit in different lanes. If `frame` is
+    provided, evaluates the pc row's condition to color that one branch
+    green (taken) or red (not taken)."""
+    if not rows:
+        return
+    addr_to_idx = {r.addr: i for i, r in enumerate(rows)}
+    branches = []
+    for i, r in enumerate(rows):
+        mn = r.mnemonic.lower()
+        base = mn.split(".")[0]
+        if mn not in _BRANCH_MNEMONICS and base != "b" and mn not in ("cbz", "cbnz", "tbz", "tbnz"):
+            continue
+        if mn == "bl":
+            continue
+        target = _branch_target(r.operands)
+        if target is None:
+            continue
+        j = addr_to_idx.get(target)
+        if j is None:
+            continue
+        if j == i:
+            continue
+        top, bot = (i, j) if i < j else (j, i)
+        branches.append({"src": i, "dst": j, "top": top, "bot": bot,
+                         "cond": mn != "b", "row": r})
+    lanes: List[List[dict]] = []
+    for br in sorted(branches, key=lambda b: (b["bot"] - b["top"], b["top"])):
+        for lane in lanes:
+            if all(b["bot"] < br["top"] or b["top"] > br["bot"] for b in lane):
+                lane.append(br)
+                br["lane"] = lanes.index(lane)
+                break
+        else:
+            lanes.append([br])
+            br["lane"] = len(lanes) - 1
+    if not branches:
+        return
+    n_lanes = min(len(lanes), width - 1)
+    grid = [[" "] * width for _ in rows]
+    styles_per_row: List[List[Optional[str]]] = [[None] * width for _ in rows]
+    default_style = "#767676"
+    for br in branches:
+        lane = br["lane"]
+        if lane >= n_lanes:
+            continue
+        col = width - 2 - lane
+        going_down = br["src"] < br["dst"]
+        src, dst = br["src"], br["dst"]
+        row_style: Optional[str] = None
+        if frame is not None and br["row"].is_pc and br["cond"]:
+            taken = _evaluate_condition(br["row"], frame)
+            if taken is True:
+                row_style = "bold #5fd75f"
+            elif taken is False:
+                row_style = "bold #ff5f5f"
+        for k in range(min(src, dst), max(src, dst) + 1):
+            if k == src:
+                grid[k][col] = "┐" if going_down else "┘"
+            elif k == dst:
+                grid[k][col] = "└" if going_down else "┌"
+            else:
+                if grid[k][col] == " ":
+                    grid[k][col] = "│"
+            if row_style is not None:
+                styles_per_row[k][col] = row_style
+            if k == dst:
+                for c in range(col + 1, width):
+                    if grid[k][c] == " ":
+                        grid[k][c] = "─"
+                        if row_style is not None:
+                            styles_per_row[k][c] = row_style
+                grid[k][width - 1] = "▶"
+                if row_style is not None:
+                    styles_per_row[k][width - 1] = row_style
+    for i, r in enumerate(rows):
+        r.gutter = "".join(grid[i])
+        spans = []
+        current_style = None
+        run_start = 0
+        for c, s in enumerate(styles_per_row[i]):
+            style = s or default_style
+            if current_style is None:
+                current_style = style
+                run_start = c
+            elif style != current_style:
+                spans.append((run_start, c, current_style))
+                current_style = style
+                run_start = c
+        if current_style is not None:
+            spans.append((run_start, width, current_style))
+        r.gutter_styles = spans
+
+
+def _evaluate_condition(row: DisasmRow, frame: "lldb.SBFrame") -> Optional[bool]:
+    """Return True (will be taken), False (will not), or None (unknown)."""
+    mn = row.mnemonic.lower()
+    ops = row.operands
+    if mn in ("cbz", "cbnz"):
+        rn = _first_reg(ops)
+        if rn is None:
+            return None
+        v = frame.FindRegister(rn)
+        if not v.IsValid():
+            return None
+        val = v.GetValueAsUnsigned()
+        return (val == 0) if mn == "cbz" else (val != 0)
+    if mn in ("tbz", "tbnz"):
+        rn = _first_reg(ops)
+        if rn is None:
+            return None
+        v = frame.FindRegister(rn)
+        if not v.IsValid():
+            return None
+        imms = _INT_RE.findall(ops)
+        if not imms:
+            return None
+        bit_tok = imms[0][1:]
+        try:
+            bit = int(bit_tok, 16) if bit_tok.lower().startswith("0x") else int(bit_tok)
+        except ValueError:
+            return None
+        val = v.GetValueAsUnsigned()
+        bit_set = ((val >> bit) & 1) == 1
+        return (not bit_set) if mn == "tbz" else bit_set
+    if not mn.startswith("b."):
+        return None
+    cond = mn[2:]
+    cpsr = frame.FindRegister("cpsr")
+    if not cpsr.IsValid():
+        return None
+    v = cpsr.GetValueAsUnsigned()
+    n = (v >> 31) & 1
+    z = (v >> 30) & 1
+    c = (v >> 29) & 1
+    ov = (v >> 28) & 1
+    table = {
+        "eq": z == 1,
+        "ne": z == 0,
+        "cs": c == 1, "hs": c == 1,
+        "cc": c == 0, "lo": c == 0,
+        "mi": n == 1,
+        "pl": n == 0,
+        "vs": ov == 1,
+        "vc": ov == 0,
+        "hi": c == 1 and z == 0,
+        "ls": c == 0 or z == 1,
+        "ge": n == ov,
+        "lt": n != ov,
+        "gt": z == 0 and n == ov,
+        "le": z == 1 or n != ov,
+        "al": True,
+        "nv": False,
+    }
+    return table.get(cond)
+
+
+def _branch_target(operands: str) -> Optional[int]:
+    """Best-effort extraction of a branch target address from an arm64
+    conditional/unconditional branch operand. For tbz/tbnz the last operand
+    is the target; for cbz/cbnz and b.cond the second; for b the first."""
+    hex_addrs = _HEX_ADDR_RE.findall(operands)
+    if not hex_addrs:
+        return None
+    try:
+        return int(hex_addrs[-1], 16)
+    except ValueError:
+        return None
 
 
 def extract_addr(operands: str) -> Optional[int]:

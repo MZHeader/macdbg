@@ -67,28 +67,59 @@ class DisasmPane(Vertical):
     DEFAULT_CSS = """
     DisasmPane { border: solid $accent; }
     DisasmPane > .title { background: $accent; color: $text; padding: 0 1; }
+    DisasmPane RightClickTable > .datatable--cursor {
+        background: #ffd75f;
+        color: black;
+        text-style: bold;
+    }
     """
 
     def compose(self):
-        yield Static("Disassembly", classes="title")
+        self.title_widget = Static("Disassembly", classes="title")
+        yield self.title_widget
         self.table = RightClickTable(cursor_type="row", zebra_stripes=False)
         yield self.table
 
+    def set_status(self, browsing_addr: Optional[int] = None) -> None:
+        if browsing_addr is None:
+            self.title_widget.update("Disassembly")
+        else:
+            self.title_widget.update(
+                "Disassembly  (browsing {:#x} — F5 to return to pc)".format(browsing_addr))
+
     def on_mount(self) -> None:
-        self.table.add_columns("addr", "bytes", "insn")
+        self.table.add_columns("flow", "addr", "bytes", "insn")
         self._rows: List[DisasmRow] = []
 
     def row_at(self, index: int) -> Optional[DisasmRow]:
-        if 0 <= index < len(self._rows):
-            return self._rows[index]
+        i = self._display_to_row.get(index) if hasattr(self, "_display_to_row") else index
+        if i is None:
+            return None
+        if 0 <= i < len(self._rows):
+            return self._rows[i]
         return None
 
     def render_rows(self, rows: List[DisasmRow]) -> None:
         self._rows = list(rows)
+        self._display_to_row = {}
         self.table.clear()
         pc_row_key = None
         new_keys = []
-        for r in rows:
+        display_idx = 0
+        for row_idx, r in enumerate(rows):
+            if r.function_head:
+                head = Text.assemble(
+                    ("▼ ", "bold #5fd7ff"),
+                    (r.function_head + ":", "bold #5fd7ff"),
+                )
+                banner_key = self.table.add_row(Text(""), Text(""), Text(""), head)
+                new_keys.append(banner_key)
+                display_idx += 1
+            gutter = Text(r.gutter, style="#767676")
+            if r.gutter_styles:
+                for start, end, style in r.gutter_styles:
+                    if end > start:
+                        gutter.stylize(style, start, end)
             addr = Text("{:016x}".format(r.addr))
             bytez = Text(format_bytes(r.raw))
             mn, op = style_disasm_line(r.mnemonic, r.operands)
@@ -99,20 +130,10 @@ class DisasmPane(Vertical):
                 insn.append("  ; " + r.inline_hint, style="#5fafff")
             if r.user_comment:
                 insn.append("  ← " + r.user_comment, style="bold #ffd75f")
-            if r.is_pc:
-                addr.stylize("bold black on yellow")
-                bytez.stylize("black on yellow")
-                plain = "{:<8} {}".format(r.mnemonic, r.operands)
-                if r.comment:
-                    plain += "  ; " + r.comment
-                if r.inline_hint:
-                    plain += "  ; " + r.inline_hint
-                if r.user_comment:
-                    plain += "  ← " + r.user_comment
-                insn = Text(plain)
-                insn.stylize("bold black on yellow")
-            key = self.table.add_row(addr, bytez, insn)
+            key = self.table.add_row(gutter, addr, bytez, insn)
             new_keys.append(key)
+            self._display_to_row[display_idx] = row_idx
+            display_idx += 1
             if r.is_pc:
                 pc_row_key = key
         _settle_and_center(self.table, pc_row_key, new_keys)

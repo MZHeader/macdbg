@@ -107,6 +107,7 @@ class WrapperApp(App):
         Binding("ctrl+f", "mem_search", "Find in Mem", priority=True),
         Binding("ctrl+backslash", "toggle_scroll_lock", "Scroll Lock", priority=True),
         Binding("alt+left", "mem_back", "Mem Back", priority=True),
+        Binding("f5", "disasm_snap_pc", "Disasm→pc", priority=True),
         Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
     ]
 
@@ -135,6 +136,7 @@ class WrapperApp(App):
         self._search_pos: int = 0
         self._mem_follow_len: int = 1
         self._last_rendered_follow: Optional[int] = None
+        self._disasm_follow: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -361,7 +363,9 @@ class WrapperApp(App):
 
         if self.dbg.target:
             rows = disasm_around(self.dbg.target, pc, count=512,
-                                 read_mem=self.dbg.read_memory)
+                                 read_mem=self.dbg.read_memory,
+                                 center=self._disasm_follow,
+                                 frame=frame)
             comments = self.dbg.state.comments if self.dbg.state else {}
             if comments:
                 for r in rows:
@@ -426,6 +430,21 @@ class WrapperApp(App):
 
     def action_focus_mem(self) -> None:
         self.mem.addr_input.focus()
+
+    def action_disasm_snap_pc(self) -> None:
+        if self._disasm_follow is None:
+            self.console_pane.write("[disasm] already at pc")
+            return
+        self._disasm_follow = None
+        self.disasm.set_status(None)
+        self._refresh_all()
+        self.console_pane.write("[disasm] snapped back to pc")
+
+    def _follow_disasm(self, addr: int) -> None:
+        self._disasm_follow = addr
+        self.disasm.set_status(addr)
+        self._refresh_all()
+        self.console_pane.write("[disasm] browsing {:#x}  (F5 returns to pc)".format(addr))
 
     def action_interrupt(self) -> None:
         if not self.dbg.process or not self.dbg.process.IsValid():
@@ -781,10 +800,11 @@ class WrapperApp(App):
                 return
             addr = self._parse_hex(reg_row.value)
             items = [
-                ("Goto (follow in Memory)", lambda: self._follow_memory(addr) if addr else None),
-                ("Set breakpoint at value",  lambda: self._toggle_bp(addr) if addr else None),
-                ("Edit value…",              lambda: self._prompt_edit_reg(reg_row.name, reg_row.value)),
-                ("Copy value",               lambda: self._copy(reg_row.value)),
+                ("Follow in disassembly",   lambda: self._follow_disasm(addr) if addr else None),
+                ("Follow in Memory",        lambda: self._follow_memory(addr) if addr else None),
+                ("Set breakpoint at value", lambda: self._toggle_bp(addr) if addr else None),
+                ("Edit value…",             lambda: self._prompt_edit_reg(reg_row.name, reg_row.value)),
+                ("Copy value",              lambda: self._copy(reg_row.value)),
             ]
             if reg_row.annotation:
                 ann = reg_row.annotation
@@ -799,12 +819,13 @@ class WrapperApp(App):
             target = extract_addr(drow.operands) or drow.addr
             has_comment = bool(self.dbg.state and self.dbg.state.comments.get(drow.addr))
             items = [
-                ("Goto (follow operand in Memory)", lambda: self._follow_memory(target)),
-                ("Toggle breakpoint here",          lambda: self._toggle_bp(drow.addr)),
-                ("Run to cursor",                   lambda: self._run_to(drow.addr)),
+                ("Follow operand in disassembly",  lambda: self._follow_disasm(target)),
+                ("Follow operand in Memory",       lambda: self._follow_memory(target)),
+                ("Toggle breakpoint here",         lambda: self._toggle_bp(drow.addr)),
+                ("Run to cursor",                  lambda: self._run_to(drow.addr)),
                 ("Edit comment…" if has_comment else "Add comment…",
                  lambda: self._prompt_edit_comment(drow.addr)),
-                ("Copy address",                    lambda: self._copy("{:#x}".format(drow.addr))),
+                ("Copy address",                   lambda: self._copy("{:#x}".format(drow.addr))),
             ]
         elif pane == "trace":
             items = [
