@@ -4,6 +4,10 @@ A Textual TUI for Apple's system LLDB. Gives you a multi-pane view of the runnin
 
 ![Main view](docs/img/main.png)
 
+## Who Is This For
+
+For reverse engineers debugging macOS binaries who aren't very good at remembering CLI commands and want an experience closer to x64dbg.
+
 ## How To Use It
 
 As simple as:
