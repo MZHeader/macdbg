@@ -260,6 +260,48 @@ class Debugger:
             size //= 2
         return b""
 
+    def read_around(self, addr: int, before: int, total: int) -> Tuple[int, bytes]:
+        """Read `total` bytes containing `addr`, with roughly `before` bytes of
+        context before it. Walks across adjacent readable regions if the desired
+        range crosses a boundary."""
+        if not self.process or not self.process.IsValid():
+            return addr, b""
+        info = lldb.SBMemoryRegionInfo()
+        err = self.process.GetMemoryRegionInfo(addr, info)
+        if not err.Success() or not info.IsReadable():
+            return addr, b""
+        aligned = addr & ~0xF
+        desired_base = aligned - before
+        base = max(info.GetRegionBase(), desired_base) & ~0xF
+        return base, self._read_stitched(base, total)
+
+    def _read_stitched(self, base: int, total: int) -> bytes:
+        out = bytearray()
+        addr = base
+        while len(out) < total:
+            want = total - len(out)
+            info = lldb.SBMemoryRegionInfo()
+            err = self.process.GetMemoryRegionInfo(addr, info)
+            if not err.Success():
+                break
+            if not info.IsReadable():
+                if len(out) == 0:
+                    addr = info.GetRegionEnd()
+                    continue
+                break
+            region_end = info.GetRegionEnd()
+            chunk_size = min(want, region_end - addr)
+            if chunk_size <= 0:
+                break
+            data = self.read_memory(addr, chunk_size)
+            if not data:
+                break
+            out.extend(data)
+            addr += len(data)
+            if len(data) < chunk_size:
+                break
+        return bytes(out)
+
     hw_breakpoints: bool = False
     anti_ptrace_bp_id: int = 0
     anti_mach_bp_id: int = 0
@@ -694,13 +736,26 @@ class Debugger:
             out.append((i, pc, fn, mod))
         return out
 
-    def memory_search(self, needle: bytes, max_hits: int = 32) -> List[int]:
+    def memory_search(self, needle: bytes, max_hits: int = 32,
+                      total_budget_bytes: int = 4 * 1024 * 1024 * 1024,
+                      scope: str = "target") -> Tuple[List[int], int]:
+        """Search process memory for `needle`.
+        scope:
+          "target"  — target binary's own sections + anonymous regions
+                      (heap, stack, private mmaps). Skips other modules.
+          "all"     — every readable region including dyld/libSystem/frameworks.
+        Returns (hits, bytes_scanned).
+        """
         if not self.process or not self.process.IsValid() or not needle:
-            return []
+            return [], 0
+        exec_name = ""
+        if self.target and self.target.IsValid():
+            exec_name = self.target.GetExecutable().GetFilename() or ""
         hits: List[int] = []
+        scanned = 0
         addr = 0
         seen_end = -1
-        for _ in range(4096):
+        for _ in range(8192):
             info = lldb.SBMemoryRegionInfo()
             err = self.process.GetMemoryRegionInfo(addr, info)
             if not err.Success():
@@ -712,18 +767,22 @@ class Debugger:
             seen_end = end
             size = end - base
             addr = end
-            if not info.IsReadable() or size <= 0 or size > 256 * 1024 * 1024:
+            if not info.IsReadable() or size <= 0:
+                continue
+            if scope == "target" and not self._region_in_target_scope(base, exec_name):
                 continue
             chunk_size = 4 * 1024 * 1024
             off = 0
             carry = b""
-            base_off_adjust = 0
             while off < size:
+                if scanned >= total_budget_bytes:
+                    return hits, scanned
                 take = min(chunk_size, size - off)
                 rerr = lldb.SBError()
                 data = self.process.ReadMemory(base + off, take, rerr)
                 if not rerr.Success() or not data:
                     break
+                scanned += len(data)
                 buf = carry + data
                 start = 0
                 while True:
@@ -732,8 +791,44 @@ class Debugger:
                         break
                     hits.append(base + off - len(carry) + idx)
                     if len(hits) >= max_hits:
-                        return hits
+                        return hits, scanned
                     start = idx + 1
                 carry = buf[-(len(needle) - 1):] if len(needle) > 1 else b""
                 off += take
-        return hits
+        return hits, scanned
+
+    def _region_in_target_scope(self, addr: int, exec_name: str) -> bool:
+        if not self.target or not self.target.IsValid():
+            return True
+        target_ranges, cache_low = self._scope_metadata(exec_name)
+        for lo, hi in target_ranges:
+            if lo <= addr < hi:
+                return True
+        if cache_low is not None and addr >= cache_low:
+            return False
+        return True
+
+    def _scope_metadata(self, exec_name: str):
+        cache = getattr(self, "_range_cache", None)
+        if cache and cache[0] == exec_name:
+            return cache[1], cache[2]
+        target: List[Tuple[int, int]] = []
+        other_header_low: Optional[int] = None
+        for i in range(self.target.GetNumModules()):
+            m = self.target.GetModuleAtIndex(i)
+            name = m.GetFileSpec().GetFilename() or ""
+            is_target = (name == exec_name)
+            if is_target:
+                for s in range(m.GetNumSections()):
+                    sec = m.GetSectionAtIndex(s)
+                    la = sec.GetLoadAddress(self.target)
+                    if la == lldb.LLDB_INVALID_ADDRESS or la == 0:
+                        continue
+                    target.append((la, la + sec.GetByteSize()))
+            else:
+                hdr = m.GetObjectFileHeaderAddress().GetLoadAddress(self.target)
+                if hdr != lldb.LLDB_INVALID_ADDRESS and hdr != 0:
+                    if other_header_low is None or hdr < other_header_low:
+                        other_header_low = hdr
+        self._range_cache = (exec_name, target, other_header_low)
+        return target, other_header_low

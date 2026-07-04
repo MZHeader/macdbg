@@ -67,8 +67,8 @@ class WrapperApp(App):
 
     CSS = """
     Screen { layout: vertical; }
-    #top { height: 35%; layout: horizontal; }
-    #mid { height: 25%; layout: horizontal; }
+    #top { height: 33%; layout: horizontal; }
+    #mid { height: 34%; layout: horizontal; }
     #bot { height: 1fr; layout: horizontal; }
     DisasmPane      { width: 2fr; }
     RegistersPane   { width: 1fr; }
@@ -132,6 +132,7 @@ class WrapperApp(App):
         self._search_last: Optional[bytes] = None
         self._search_hits: List[int] = []
         self._search_pos: int = 0
+        self._mem_follow_len: int = 1
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -238,12 +239,47 @@ class WrapperApp(App):
                 return
             if self.tracer.enabled and self._handle_possible_trace_hit():
                 return
-            self.console_pane.write("[event] state={} ({})".format(e.description, e.state))
+            self.console_pane.write(self._describe_stop())
             self._refresh_all()
         elif e.state == lldb.eStateExited:
             self.console_pane.write("process exited.")
         else:
             self.console_pane.write("[event] state={} ({})".format(e.description, e.state))
+
+    def _describe_stop(self) -> str:
+        process = self.dbg.process
+        if not process or not process.IsValid():
+            return "[stopped]"
+        thread = process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return "[stopped]"
+        reason = thread.GetStopReason()
+        pc = self.dbg.pc() or 0
+        frame = thread.GetFrameAtIndex(0)
+        sym = ""
+        if frame and frame.IsValid():
+            sym = frame.GetFunctionName() or (frame.GetSymbol().GetName() if frame.GetSymbol().IsValid() else "") or ""
+        where = " in {}".format(sym) if sym else ""
+        if reason == lldb.eStopReasonBreakpoint and thread.GetStopReasonDataCount() >= 1:
+            bp_id = thread.GetStopReasonDataAtIndex(0)
+            loc_id = thread.GetStopReasonDataAtIndex(1) if thread.GetStopReasonDataCount() >= 2 else 0
+            bp = self.dbg.target.FindBreakpointByID(bp_id) if self.dbg.target else None
+            cond = (bp.GetCondition() if bp and bp.IsValid() else None) or ""
+            cond_txt = " (cond: {})".format(cond) if cond else ""
+            return "[stop] breakpoint #{}.{} at {:#x}{}{}".format(bp_id, loc_id, pc, where, cond_txt)
+        if reason == lldb.eStopReasonWatchpoint and thread.GetStopReasonDataCount() >= 1:
+            wp_id = thread.GetStopReasonDataAtIndex(0)
+            return "[stop] watchpoint #{} at {:#x}{}".format(wp_id, pc, where)
+        if reason == lldb.eStopReasonPlanComplete:
+            return "[stop] step complete at {:#x}{}".format(pc, where)
+        if reason == lldb.eStopReasonException:
+            return "[stop] exception at {:#x}{}: {}".format(pc, where, thread.GetStopDescription(256))
+        if reason == lldb.eStopReasonSignal and thread.GetStopReasonDataCount() >= 1:
+            sig = thread.GetStopReasonDataAtIndex(0)
+            return "[stop] signal {} at {:#x}{}".format(sig, pc, where)
+        if reason == lldb.eStopReasonTrace:
+            return "[stop] trace at {:#x}{}".format(pc, where)
+        return "[stop] at {:#x}{} (reason={})".format(pc, where, reason)
 
     def _handle_anti_debug_hit(self) -> bool:
         process = self.dbg.process
@@ -328,13 +364,14 @@ class WrapperApp(App):
         self._prev_regs = reg_snapshot(reg_rows)
 
         if sp:
-            data = self.dbg.read_memory(sp, 16 * 64)
-            self.stack.render_bytes(sp, data)
+            base, data = self._centered_read(sp, before_rows=8)
+            self.stack.render_bytes(base, data, focus_addr=sp)
 
         follow = self._mem_follow if self._mem_follow is not None else pc
         if follow:
-            data = self.dbg.read_memory(follow, 16 * 64)
-            self.mem.render_bytes(follow, data)
+            base, data = self._centered_read(follow, before_rows=32)
+            self.mem.render_bytes(base, data, focus_addr=follow,
+                                  focus_len=self._mem_follow_len if self._mem_follow is not None else 1)
 
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
         self.threads_pane.render_rows(self.dbg.threads())
@@ -389,9 +426,9 @@ class WrapperApp(App):
             return
         self._mem_history.pop()
         prev = self._mem_history[-1]
-        self._mem_follow = prev
-        data = self.dbg.read_memory(prev, 16 * 64)
-        self.mem.render_bytes(prev, data)
+        prior = self._mem_history[:]
+        self._follow_memory(prev)
+        self._mem_history = prior
         self.console_pane.write("mem back -> {:#x}".format(prev))
 
     def action_mem_search(self) -> None:
@@ -405,7 +442,7 @@ class WrapperApp(App):
         async def _run() -> None:
             val = await self.push_screen_wait(PromptScreen(
                 "Search memory  —  ASCII (e.g. 'firefox') or hex ('de ad be ef' / '0xdeadbeef'). "
-                "Enter alone repeats last search (next hit).",
+                "Prefix 'all:' to include libraries. Enter alone repeats last search.",
                 initial="",
             ))
             if val is None:
@@ -417,29 +454,44 @@ class WrapperApp(App):
                     return
                 self._search_pos = (self._search_pos + 1) % len(self._search_hits)
                 addr = self._search_hits[self._search_pos]
-                self._follow_memory(addr)
+                self._follow_memory(addr, focus_len=len(self._search_last or b"") or 1)
                 self.console_pane.write("[search] hit {}/{} at {:#x}".format(
                     self._search_pos + 1, len(self._search_hits), addr))
                 return
+            scope = "target"
+            if v.lower().startswith("all:"):
+                scope = "all"
+                v = v[4:].lstrip()
+            elif v.lower().startswith("all "):
+                scope = "all"
+                v = v[4:].lstrip()
             needle = self._parse_search_needle(v)
             if needle is None:
                 self.console_pane.write(
                     "[search] could not parse {!r} as hex or ASCII".format(v), error=True)
                 return
-            self.console_pane.write("[search] scanning readable regions for {} byte(s)…".format(len(needle)))
-            hits = self.dbg.memory_search(needle, max_hits=64)
+            self.console_pane.write(
+                "[search] scope={} — scanning for {} byte(s)…".format(scope, len(needle)))
+            hits, scanned = self.dbg.memory_search(
+                needle, max_hits=64,
+                total_budget_bytes=1024 * 1024 * 1024, scope=scope)
             if not hits:
-                self.console_pane.write("[search] no hits", error=True)
+                self.console_pane.write(
+                    "[search] no hits for {!r} in {} (scanned {} MB). "
+                    "Prefix with 'all:' to also search libraries.".format(
+                        v, scope, scanned // (1024 * 1024)),
+                    error=True)
                 self._search_hits = []
                 self._search_last = needle
                 return
             self._search_hits = hits
             self._search_last = needle
             self._search_pos = 0
-            self._follow_memory(hits[0])
+            self._follow_memory(hits[0], focus_len=len(needle))
             self.console_pane.write(
-                "[search] {} hit(s); showing 1/{} at {:#x}. Ctrl+F Enter repeats for next.".format(
-                    len(hits), len(hits), hits[0]))
+                "[search] {} hit(s) in scope={}; showing 1/{} at {:#x}. "
+                "Ctrl+F Enter for next.".format(
+                    len(hits), scope, len(hits), hits[0]))
         self.run_worker(_run(), exclusive=True)
 
     @staticmethod
@@ -985,14 +1037,18 @@ class WrapperApp(App):
         target = extract_addr(row.operands) or row.addr
         self._follow_memory(target)
 
-    def _follow_memory(self, addr: int) -> None:
+    def _centered_read(self, addr: int, before_rows: int = 32, total_rows: int = 64):
+        return self.dbg.read_around(addr, before=before_rows * 16, total=total_rows * 16)
+
+    def _follow_memory(self, addr: int, focus_len: int = 1) -> None:
         self._mem_follow = addr
+        self._mem_follow_len = focus_len
         if not self._mem_history or self._mem_history[-1] != addr:
             self._mem_history.append(addr)
             if len(self._mem_history) > 32:
                 self._mem_history = self._mem_history[-32:]
-        data = self.dbg.read_memory(addr, 16 * 64)
-        self.mem.render_bytes(addr, data)
+        base, data = self._centered_read(addr, before_rows=32)
+        self.mem.render_bytes(base, data, focus_addr=addr, focus_len=focus_len)
         self.console_pane.write("follow -> {:#x}".format(addr))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -1018,8 +1074,6 @@ class WrapperApp(App):
             text = event.value.strip()
             try:
                 addr = int(text, 0)
-                self._mem_follow = addr
-                data = self.dbg.read_memory(addr, 16 * 64)
-                self.mem.render_bytes(addr, data)
+                self._follow_memory(addr)
             except ValueError:
                 self.console_pane.write("bad address: {}".format(text), error=True)

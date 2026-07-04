@@ -73,12 +73,25 @@ class DisasmPane(Vertical):
         if pc_row_key is not None:
             try:
                 pc_idx = self.table.get_row_index(pc_row_key)
-                self.table.move_cursor(row=pc_idx, animate=False)
-                visible = max(1, self.table.size.height - 2)
-                target = max(0, pc_idx - visible // 2)
-                self.table.scroll_to(y=target, animate=False)
             except Exception:
-                pass
+                pc_idx = None
+            if pc_idx is not None:
+                try:
+                    self.table.move_cursor(row=pc_idx, animate=False, scroll=False)
+                except Exception:
+                    pass
+                def _scroll(idx=pc_idx) -> None:
+                    try:
+                        visible = max(1, self.table.size.height - 2)
+                        target = max(0, idx - visible // 2)
+                        self.table.scroll_to(y=target, animate=False, immediate=True)
+                    except Exception:
+                        pass
+                try:
+                    self.table.call_after_refresh(_scroll)
+                    self.table.call_after_refresh(_scroll)
+                except Exception:
+                    _scroll()
 
 
 class RegistersPane(Vertical):
@@ -123,14 +136,53 @@ class HexPane(Vertical):
     def on_mount(self) -> None:
         self.table.add_columns("addr", "hex", "ascii")
 
-    def render_bytes(self, base: int, data: bytes) -> None:
+    def render_bytes(
+        self,
+        base: int,
+        data: bytes,
+        focus_addr: Optional[int] = None,
+        focus_len: int = 1,
+    ) -> None:
         self.table.clear()
-        for addr, hex_part, ascii_part in hexdump_rows(data, base):
-            self.table.add_row(
-                Text("{:016x}".format(addr), style="cyan"),
-                Text(hex_part),
-                Text(ascii_part, style="green"),
-            )
+        focus_row = None
+        rows = hexdump_rows(data, base)
+        focus_end = focus_addr + focus_len if focus_addr is not None else None
+        for idx, (addr, hex_part, ascii_part) in enumerate(rows):
+            addr_txt = Text("{:016x}".format(addr), style="cyan")
+            hex_txt = Text(hex_part)
+            ascii_txt = Text(ascii_part, style="green")
+            if focus_addr is not None and addr + 16 > focus_addr and addr < focus_end:
+                lo = max(0, focus_addr - addr)
+                hi = min(16, focus_end - addr)
+                if focus_row is None and addr <= focus_addr < addr + 16:
+                    focus_row = idx
+                    addr_txt.stylize("bold black on yellow")
+                hex_start = lo * 3
+                hex_end = hi * 3 - 1 if hi > 0 else 0
+                hex_txt.stylize("bold black on yellow", hex_start, hex_end)
+                ascii_txt.stylize("bold black on yellow", lo, hi)
+            self.table.add_row(addr_txt, hex_txt, ascii_txt)
+        if focus_row is not None:
+            self._center_on(focus_row)
+
+    def _center_on(self, focus_row: int) -> None:
+        try:
+            self.table.move_cursor(row=focus_row, animate=False, scroll=False)
+        except Exception:
+            return
+        def _do_scroll() -> None:
+            try:
+                visible = max(1, self.table.size.height - 2)
+                offset = max(1, visible // 3)
+                target = max(0, focus_row - offset)
+                self.table.scroll_to(y=target, animate=False, immediate=True)
+            except Exception:
+                pass
+        try:
+            self.table.call_after_refresh(_do_scroll)
+            self.table.call_after_refresh(_do_scroll)
+        except Exception:
+            _do_scroll()
 
 
 class BreakpointsPane(Vertical):
