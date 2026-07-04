@@ -230,20 +230,20 @@ class Tracer:
         self._bp_to_name: Dict[int, str] = {}
         self.enabled = False
 
-    def enable(self, target: lldb.SBTarget) -> int:
+    def enable(self, target: lldb.SBTarget) -> Tuple[int, int]:
         if self.enabled or not target or not target.IsValid():
-            return 0
+            return (0, 0)
+        resolved_now = 0
         for name in SIGS:
             bp = target.BreakpointCreateByName(name)
             if not bp.IsValid():
                 continue
+            self._bp_ids.append(bp.GetID())
+            self._bp_to_name[bp.GetID()] = name
             if bp.GetNumLocations() > 0:
-                self._bp_ids.append(bp.GetID())
-                self._bp_to_name[bp.GetID()] = name
-            else:
-                target.BreakpointDelete(bp.GetID())
-        self.enabled = len(self._bp_ids) > 0
-        return len(self._bp_ids)
+                resolved_now += 1
+        self.enabled = True
+        return (len(self._bp_ids), resolved_now)
 
     def disable(self, target: lldb.SBTarget) -> None:
         if not target or not target.IsValid():

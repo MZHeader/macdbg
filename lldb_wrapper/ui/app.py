@@ -281,14 +281,18 @@ class WrapperApp(App):
             self.tracer.disable(self.dbg.target)
             self.console_pane.write("[trace] disabled")
         else:
-            n = self.tracer.enable(self.dbg.target)
-            if n == 0:
-                self.console_pane.write(
-                    "[trace] no symbols matched (still at entry? libSystem may not be loaded yet — F9 to run past dyld first)",
-                    error=True,
-                )
+            total, resolved = self.tracer.enable(self.dbg.target)
+            if total == 0:
+                self.console_pane.write("[trace] could not create breakpoints", error=True)
                 return
-            self.console_pane.write("[trace] enabled — watching {} symbols".format(n))
+            if resolved == 0:
+                self.console_pane.write(
+                    "[trace] armed {} pending symbols. Locations will resolve as libSystem loads; hits will start appearing then.".format(total)
+                )
+            else:
+                self.console_pane.write(
+                    "[trace] enabled: {}/{} symbols already resolved, the rest are pending".format(resolved, total)
+                )
             try:
                 self.query_one(TabbedContent).active = "tab_trace"
                 self.trace_pane.table.focus()
