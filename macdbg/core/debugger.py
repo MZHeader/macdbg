@@ -5,6 +5,8 @@ from typing import Dict, List, Optional, Tuple
 
 import lldb
 
+from .state import BinaryState, StoredBP, load_for
+
 
 class Debugger:
     def __init__(self) -> None:
@@ -14,6 +16,8 @@ class Debugger:
         self.target: Optional[lldb.SBTarget] = None
         self.process: Optional[lldb.SBProcess] = None
         self.listener: lldb.SBListener = self.dbg.GetListener()
+        self._attached: bool = False
+        self.state: Optional[BinaryState] = None
 
         self._out_r_fd, self._out_w_fd = os.pipe()
         os.set_blocking(self._out_r_fd, False)
@@ -36,7 +40,67 @@ class Debugger:
         self.target = self.dbg.CreateTarget(path, None, None, True, err)
         if not err.Success() or not self.target.IsValid():
             raise RuntimeError(f"CreateTarget failed: {err.GetCString()}")
+        try:
+            self.state = load_for(path)
+        except Exception:
+            self.state = None
         return self.target
+
+    def restore_stored_breakpoints(self) -> int:
+        if not self.state or not self.target or not self.target.IsValid():
+            return 0
+        n = 0
+        for sbp in self.state.breakpoints:
+            bp = self.target.BreakpointCreateByAddress(sbp.addr)
+            if not bp.IsValid():
+                continue
+            if sbp.condition:
+                bp.SetCondition(sbp.condition)
+            if sbp.commands:
+                sl = lldb.SBStringList()
+                for line in sbp.commands:
+                    sl.AppendString(line)
+                bp.SetCommandLineCommands(sl)
+            bp.SetEnabled(sbp.enabled)
+            n += 1
+        return n
+
+    def snapshot_user_breakpoints(self, exclude_ids: set) -> List[StoredBP]:
+        out: List[StoredBP] = []
+        if not self.target:
+            return out
+        for i in range(self.target.GetNumBreakpoints()):
+            bp = self.target.GetBreakpointAtIndex(i)
+            if bp.GetID() in exclude_ids:
+                continue
+            if bp.GetNumLocations() == 0:
+                continue
+            loc = bp.GetLocationAtIndex(0)
+            addr = loc.GetLoadAddress()
+            if addr == lldb.LLDB_INVALID_ADDRESS or addr == 0:
+                continue
+            symbol = ""
+            try:
+                symbol = loc.GetAddress().GetSymbol().GetName() or ""
+            except Exception:
+                pass
+            sl = lldb.SBStringList()
+            bp.GetCommandLineCommands(sl)
+            commands = [sl.GetStringAtIndex(j) for j in range(sl.GetSize())]
+            out.append(StoredBP(
+                addr=addr,
+                symbol=symbol,
+                condition=bp.GetCondition() or "",
+                commands=commands,
+                enabled=bp.IsEnabled(),
+            ))
+        return out
+
+    def save_state(self, exclude_ids: set) -> Optional[str]:
+        if not self.state:
+            return None
+        self.state.breakpoints = self.snapshot_user_breakpoints(exclude_ids)
+        return self.state.save()
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
         assert self.target is not None
@@ -48,6 +112,7 @@ class Debugger:
         self.process = self.target.Launch(info, err)
         if not err.Success():
             raise RuntimeError(f"Launch failed: {err.GetCString()}")
+        self._attached = False
         self._hook_listener(self.process)
         return self.process
 
@@ -62,6 +127,7 @@ class Debugger:
         if not err.Success() or not self.process or not self.process.IsValid():
             raise RuntimeError(
                 "attach failed: {}".format(err.GetCString() or "unknown"))
+        self._attached = True
         self._hook_listener(self.process)
         return self.process
 
@@ -87,7 +153,14 @@ class Debugger:
 
     def destroy(self) -> None:
         if self.process and self.process.IsValid():
-            self.process.Kill()
+            if self._attached:
+                self.process.Detach()
+            else:
+                self.process.Kill()
+        try:
+            self._out_w_file.close()
+        except Exception:
+            pass
         lldb.SBDebugger.Destroy(self.dbg)
 
     def cont(self) -> None:
@@ -602,3 +675,65 @@ class Debugger:
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand(cmd, ret, False)
         return (ret.Succeeded(), ret.GetOutput() or "", ret.GetError() or "")
+
+    def backtrace(self) -> List[Tuple[int, int, str, str]]:
+        out: List[Tuple[int, int, str, str]] = []
+        thread = self._thread()
+        if not thread:
+            return out
+        for i in range(thread.GetNumFrames()):
+            f = thread.GetFrameAtIndex(i)
+            if not f.IsValid():
+                break
+            pc = f.GetPC()
+            fn = f.GetFunctionName() or (f.GetSymbol().GetName() if f.GetSymbol().IsValid() else "") or "?"
+            mod = ""
+            m = f.GetModule()
+            if m.IsValid():
+                mod = m.GetFileSpec().GetFilename() or ""
+            out.append((i, pc, fn, mod))
+        return out
+
+    def memory_search(self, needle: bytes, max_hits: int = 32) -> List[int]:
+        if not self.process or not self.process.IsValid() or not needle:
+            return []
+        hits: List[int] = []
+        addr = 0
+        seen_end = -1
+        for _ in range(4096):
+            info = lldb.SBMemoryRegionInfo()
+            err = self.process.GetMemoryRegionInfo(addr, info)
+            if not err.Success():
+                break
+            base = info.GetRegionBase()
+            end = info.GetRegionEnd()
+            if end <= seen_end or end == base:
+                break
+            seen_end = end
+            size = end - base
+            addr = end
+            if not info.IsReadable() or size <= 0 or size > 256 * 1024 * 1024:
+                continue
+            chunk_size = 4 * 1024 * 1024
+            off = 0
+            carry = b""
+            base_off_adjust = 0
+            while off < size:
+                take = min(chunk_size, size - off)
+                rerr = lldb.SBError()
+                data = self.process.ReadMemory(base + off, take, rerr)
+                if not rerr.Success() or not data:
+                    break
+                buf = carry + data
+                start = 0
+                while True:
+                    idx = buf.find(needle, start)
+                    if idx < 0:
+                        break
+                    hits.append(base + off - len(carry) + idx)
+                    if len(hits) >= max_hits:
+                        return hits
+                    start = idx + 1
+                carry = buf[-(len(needle) - 1):] if len(needle) > 1 else b""
+                off += take
+        return hits

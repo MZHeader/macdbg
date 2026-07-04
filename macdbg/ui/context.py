@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -35,10 +35,13 @@ class ContextMenu(ModalScreen):
         items: List[Tuple[str, Callable[[], None]]],
         x: int = 0,
         y: int = 0,
+        on_dismiss: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__()
         self._items = items
         self._x, self._y = x, y
+        self._on_dismiss = on_dismiss
+        self._picked = False
 
     def compose(self) -> ComposeResult:
         opts = [Option(" " + label + " ", id=str(i)) for i, (label, _) in enumerate(self._items)]
@@ -60,6 +63,7 @@ class ContextMenu(ModalScreen):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         idx = int(event.option.id or "0")
         _, callback = self._items[idx]
+        self._picked = True
         self.dismiss(None)
         self.app.call_after_refresh(callback)
 
@@ -67,6 +71,12 @@ class ContextMenu(ModalScreen):
         menu = self.query_one("#menu_list", OptionList)
         if event.widget is not menu and menu not in getattr(event.widget, "ancestors", []):
             self.dismiss(None)
+
+    def dismiss(self, result=None):
+        if not self._picked and self._on_dismiss is not None:
+            self.app.call_after_refresh(self._on_dismiss)
+            self._on_dismiss = None
+        return super().dismiss(result)
 
 
 class PromptScreen(ModalScreen[Optional[str]]):

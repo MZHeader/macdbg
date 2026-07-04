@@ -128,6 +128,7 @@ def collect(
     prev: Dict[str, str],
     read_mem: Optional[Callable[[int, int], bytes]] = None,
     target: Optional[lldb.SBTarget] = None,
+    annot_cache: Optional[Dict[str, str]] = None,
 ) -> List[RegRow]:
     if frame is None or not frame.IsValid():
         return []
@@ -143,6 +144,13 @@ def collect(
     def annotate(name: str, val: str) -> str:
         if read_mem is None or name in _SKIP_DEREF:
             return ""
+        if annot_cache is not None:
+            key = "{}={}".format(name, val)
+            if key in annot_cache:
+                return annot_cache[key]
+            ann = _annotate_value(val, target, read_mem)
+            annot_cache[key] = ann
+            return ann
         return _annotate_value(val, target, read_mem)
 
     ordered: List[RegRow] = []

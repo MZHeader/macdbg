@@ -18,6 +18,7 @@ from ..core.registers import collect as collect_regs, snapshot as reg_snapshot
 from ..core.tracer import Tracer
 from .palette import LldbCommandProvider
 from .panes import (
+    BacktracePane,
     BreakpointsPane,
     ConsolePane,
     DisasmPane,
@@ -101,6 +102,10 @@ class WrapperApp(App):
         Binding("ctrl+k", "clear_trace", "Clear Trace"),
         Binding("ctrl+y", "cycle_trace_depth", "Trace Scope"),
         Binding("ctrl+d", "defenses", "Defenses", priority=True),
+        Binding("ctrl+b", "interrupt", "Break", priority=True),
+        Binding("ctrl+f", "mem_search", "Find in Mem", priority=True),
+        Binding("ctrl+backslash", "toggle_scroll_lock", "Scroll Lock", priority=True),
+        Binding("alt+left", "mem_back", "Mem Back", priority=True),
         Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
     ]
 
@@ -117,11 +122,16 @@ class WrapperApp(App):
         self.dbg = Debugger()
         self.pump: Optional[EventPump] = None
         self._prev_regs: Dict[str, str] = {}
+        self._annot_cache: Dict[str, str] = {}
         self._mem_follow: Optional[int] = None
+        self._mem_history: List[int] = []
         self.tracer = Tracer()
         self._trace_count = 0
         self._output_stop = threading.Event()
         self._output_thread: Optional[threading.Thread] = None
+        self._search_last: Optional[bytes] = None
+        self._search_hits: List[int] = []
+        self._search_pos: int = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -133,6 +143,7 @@ class WrapperApp(App):
         self.threads_pane = ThreadsPane()
         self.modules_pane = ModulesPane()
         self.trace_pane = TracePane()
+        self.backtrace_pane = BacktracePane()
         self.console_pane = ConsolePane()
 
         with Horizontal(id="top"):
@@ -145,6 +156,8 @@ class WrapperApp(App):
             with TabbedContent(id="tabs"):
                 with TabPane("Breakpoints", id="tab_bps"):
                     yield self.bps
+                with TabPane("Call Stack", id="tab_backtrace"):
+                    yield self.backtrace_pane
                 with TabPane("Threads", id="tab_threads"):
                     yield self.threads_pane
                 with TabPane("Modules", id="tab_modules"):
@@ -179,15 +192,33 @@ class WrapperApp(App):
         elif self.program:
             try:
                 self.dbg.create_target(self.program)
+                restored = self.dbg.restore_stored_breakpoints()
                 self.dbg.launch([self.program] + list(self.program_args))
                 self.console_pane.write("launched {}".format(self.program))
+                if self.dbg.state:
+                    self.console_pane.write(
+                        "[state] loaded sha={}… ({} bp(s), {} comment(s), {} bookmark(s))".format(
+                            self.dbg.state.sha256[:12], restored,
+                            len(self.dbg.state.comments),
+                            len(self.dbg.state.bookmarks),
+                        )
+                    )
             except Exception as e:
                 self.console_pane.write("launch failed: {}".format(e), error=True)
+        else:
+            self.console_pane.write(
+                "no target loaded. relaunch with a program path or --attach <pid>, "
+                "or type ':' then an lldb command (e.g. 'target create /bin/ls') to load one."
+            )
 
     def on_unmount(self) -> None:
         if self.pump:
             self.pump.stop()
         self._output_stop.set()
+        try:
+            self.dbg.save_state(self._hidden_bp_ids())
+        except Exception:
+            pass
         try:
             self.dbg.destroy()
         except Exception:
@@ -276,6 +307,12 @@ class WrapperApp(App):
 
         if self.dbg.target:
             rows = disasm_around(self.dbg.target, pc, count=40)
+            comments = self.dbg.state.comments if self.dbg.state else {}
+            if comments:
+                for r in rows:
+                    c = comments.get(r.addr)
+                    if c:
+                        r.comment = (r.comment + " | " if r.comment else "") + "user: " + c
             self.disasm.render_rows(rows)
 
         reg_rows = collect_regs(
@@ -283,7 +320,10 @@ class WrapperApp(App):
             self._prev_regs,
             read_mem=self.dbg.read_memory,
             target=self.dbg.target,
+            annot_cache=self._annot_cache,
         )
+        if len(self._annot_cache) > 4096:
+            self._annot_cache.clear()
         self.regs.render_rows(reg_rows)
         self._prev_regs = reg_snapshot(reg_rows)
 
@@ -299,6 +339,7 @@ class WrapperApp(App):
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
         self.threads_pane.render_rows(self.dbg.threads())
         self.modules_pane.render_rows(self.dbg.modules())
+        self.backtrace_pane.render_rows(self.dbg.backtrace())
 
     def action_step_in(self) -> None:
         self.dbg.step_in()
@@ -322,6 +363,104 @@ class WrapperApp(App):
 
     def action_focus_mem(self) -> None:
         self.mem.addr_input.focus()
+
+    def action_interrupt(self) -> None:
+        if not self.dbg.process or not self.dbg.process.IsValid():
+            self.console_pane.write("[wrapper] no process to interrupt", error=True)
+            return
+        state = self.dbg.process.GetState()
+        if state == lldb.eStateRunning:
+            self.dbg.interrupt()
+            self.console_pane.write("[wrapper] interrupt requested")
+        else:
+            self.console_pane.write(
+                "[wrapper] process is {} — nothing to interrupt".format(
+                    lldb.SBDebugger.StateAsCString(state)))
+
+    def action_toggle_scroll_lock(self) -> None:
+        v = self.console_pane.log_view
+        v.auto_scroll = not v.auto_scroll
+        self.console_pane.write(
+            "[wrapper] console auto-scroll: {}".format("ON" if v.auto_scroll else "PAUSED"))
+
+    def action_mem_back(self) -> None:
+        if len(self._mem_history) < 2:
+            self.console_pane.write("[wrapper] no earlier memory follow", error=True)
+            return
+        self._mem_history.pop()
+        prev = self._mem_history[-1]
+        self._mem_follow = prev
+        data = self.dbg.read_memory(prev, 16 * 64)
+        self.mem.render_bytes(prev, data)
+        self.console_pane.write("mem back -> {:#x}".format(prev))
+
+    def action_mem_search(self) -> None:
+        if not self.dbg.process or not self.dbg.process.IsValid():
+            self.console_pane.write("[search] no process", error=True)
+            return
+        state = self.dbg.process.GetState()
+        if state != lldb.eStateStopped:
+            self.console_pane.write("[search] process not stopped", error=True)
+            return
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Search memory  —  ASCII (e.g. 'firefox') or hex ('de ad be ef' / '0xdeadbeef'). "
+                "Enter alone repeats last search (next hit).",
+                initial="",
+            ))
+            if val is None:
+                return
+            v = val.strip()
+            if not v:
+                if not self._search_hits:
+                    self.console_pane.write("[search] no previous search to repeat", error=True)
+                    return
+                self._search_pos = (self._search_pos + 1) % len(self._search_hits)
+                addr = self._search_hits[self._search_pos]
+                self._follow_memory(addr)
+                self.console_pane.write("[search] hit {}/{} at {:#x}".format(
+                    self._search_pos + 1, len(self._search_hits), addr))
+                return
+            needle = self._parse_search_needle(v)
+            if needle is None:
+                self.console_pane.write(
+                    "[search] could not parse {!r} as hex or ASCII".format(v), error=True)
+                return
+            self.console_pane.write("[search] scanning readable regions for {} byte(s)…".format(len(needle)))
+            hits = self.dbg.memory_search(needle, max_hits=64)
+            if not hits:
+                self.console_pane.write("[search] no hits", error=True)
+                self._search_hits = []
+                self._search_last = needle
+                return
+            self._search_hits = hits
+            self._search_last = needle
+            self._search_pos = 0
+            self._follow_memory(hits[0])
+            self.console_pane.write(
+                "[search] {} hit(s); showing 1/{} at {:#x}. Ctrl+F Enter repeats for next.".format(
+                    len(hits), len(hits), hits[0]))
+        self.run_worker(_run(), exclusive=True)
+
+    @staticmethod
+    def _parse_search_needle(v: str) -> Optional[bytes]:
+        s = v.strip()
+        low = s.lower()
+        if low.startswith("0x"):
+            hx = low[2:]
+            if len(hx) % 2:
+                hx = "0" + hx
+            try:
+                return bytes.fromhex(hx)
+            except ValueError:
+                return None
+        parts = s.split()
+        if parts and all(len(p) <= 2 and all(c in "0123456789abcdefABCDEF" for c in p) for p in parts):
+            try:
+                return bytes(int(p, 16) for p in parts)
+            except ValueError:
+                pass
+        return s.encode()
 
     def action_cycle_trace_depth(self) -> None:
         cycle = [
@@ -439,14 +578,26 @@ class WrapperApp(App):
             self.dbg.resolve_exec(block=True)
             self.console_pane.write('[anti-debug] blocked {}("{}") — returned -1'.format(name, cmd[:120]))
 
+        def default_block():
+            self.dbg.resolve_exec(block=True)
+            self.console_pane.write(
+                '[anti-debug] dismissed without choice — blocked {}("{}") — returned -1'.format(
+                    name, cmd[:120]))
+
         title = 'Outbound {}: "{}"'.format(name, cmd[:80])
         items = [
             ("Allow  (let it run and return normally)", allow),
             ("Block  (return -1, do not run)",          block),
         ]
-        self.console_pane.write("[anti-debug] {}? paused — choose Allow or Block".format(title))
+        self.console_pane.write(
+            "[anti-debug] {}? paused — choose Allow or Block (Esc = Block)".format(title))
         w, h = self.size
-        self.push_screen(ContextMenu(items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
+        self.push_screen(ContextMenu(
+            items,
+            x=max(0, w // 2 - 25),
+            y=max(0, h // 3),
+            on_dismiss=default_block,
+        ))
 
     def _toggle_exec_sandbox(self) -> None:
         if self.dbg.exec_bp_ids:
@@ -554,10 +705,13 @@ class WrapperApp(App):
             if drow is None:
                 return
             target = extract_addr(drow.operands) or drow.addr
+            has_comment = bool(self.dbg.state and self.dbg.state.comments.get(drow.addr))
             items = [
                 ("Goto (follow operand in Memory)", lambda: self._follow_memory(target)),
                 ("Toggle breakpoint here",          lambda: self._toggle_bp(drow.addr)),
                 ("Run to cursor",                   lambda: self._run_to(drow.addr)),
+                ("Edit comment…" if has_comment else "Add comment…",
+                 lambda: self._prompt_edit_comment(drow.addr)),
                 ("Copy address",                    lambda: self._copy("{:#x}".format(drow.addr))),
             ]
         elif pane == "trace":
@@ -615,7 +769,7 @@ class WrapperApp(App):
         if not s:
             return None
         try:
-            return int(s, 16) if not s.startswith("0x") else int(s, 16)
+            return int(s, 16)
         except ValueError:
             try:
                 return int(s)
@@ -675,14 +829,16 @@ class WrapperApp(App):
             category, "shown" if not cur else "hidden"))
 
     def _copy_trace(self, all_rows: bool, only: Optional[int] = None) -> None:
-        table = self.trace_pane.table
-        lines = []
-        for i in range(table.row_count):
-            if not all_rows and only is not None and i != only:
-                continue
-            row = table.get_row_at(i)
-            cells = [c.plain if hasattr(c, "plain") else str(c) for c in row]
-            lines.append("\t".join(c.strip() for c in cells))
+        lines: List[str] = []
+        if all_rows:
+            for n, cat, call in self.trace_pane.all_hits():
+                lines.append("{}\t{}\t{}".format(n, cat, call))
+        else:
+            table = self.trace_pane.table
+            if only is not None and 0 <= only < table.row_count:
+                row = table.get_row_at(only)
+                cells = [c.plain if hasattr(c, "plain") else str(c) for c in row]
+                lines.append("\t".join(c.strip() for c in cells))
         if not lines:
             self.console_pane.write("[copy] no trace rows to copy", error=True)
             return
@@ -754,6 +910,30 @@ class WrapperApp(App):
         self.console_pane.write("bp #{} deleted".format(bp_id))
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
+    def _prompt_edit_comment(self, addr: int) -> None:
+        state = self.dbg.state
+        if not state:
+            self.console_pane.write("[comment] no persistent state (target not loaded via path)", error=True)
+            return
+        current = state.comments.get(addr, "")
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Comment at {:#x}  —  empty to remove, Ctrl+U clears, Esc cancels".format(addr),
+                initial=current,
+            ))
+            if val is None:
+                return
+            v = val.strip()
+            if v:
+                state.comments[addr] = v
+                self.console_pane.write("[comment] {:#x} = {!r}".format(addr, v))
+            else:
+                state.comments.pop(addr, None)
+                self.console_pane.write("[comment] {:#x} cleared".format(addr))
+            state.save()
+            self._refresh_all()
+        self.run_worker(_run(), exclusive=True)
+
     def _prompt_edit_reg(self, name: str, current: str) -> None:
         async def _run() -> None:
             val = await self.push_screen_wait(PromptScreen(
@@ -807,6 +987,10 @@ class WrapperApp(App):
 
     def _follow_memory(self, addr: int) -> None:
         self._mem_follow = addr
+        if not self._mem_history or self._mem_history[-1] != addr:
+            self._mem_history.append(addr)
+            if len(self._mem_history) > 32:
+                self._mem_history = self._mem_history[-32:]
         data = self.dbg.read_memory(addr, 16 * 64)
         self.mem.render_bytes(addr, data)
         self.console_pane.write("follow -> {:#x}".format(addr))

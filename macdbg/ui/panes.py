@@ -225,6 +225,31 @@ class ModulesPane(Vertical):
             )
 
 
+class BacktracePane(Vertical):
+    DEFAULT_CSS = """
+    BacktracePane { border: solid $accent; }
+    BacktracePane > .title { background: $accent; color: $text; padding: 0 1; }
+    """
+
+    def compose(self):
+        yield Static("Call Stack", classes="title")
+        self.table = RightClickTable(cursor_type="row", zebra_stripes=False)
+        yield self.table
+
+    def on_mount(self) -> None:
+        self.table.add_columns("#", "pc", "function", "module")
+
+    def render_rows(self, rows) -> None:
+        self.table.clear()
+        for idx, pc, fn, mod in rows:
+            self.table.add_row(
+                Text(str(idx), style="dim"),
+                Text("{:016x}".format(pc), style="cyan"),
+                Text(fn),
+                Text(mod, style="dim"),
+            )
+
+
 class TracePane(Vertical):
     DEFAULT_CSS = """
     TracePane { border: solid $accent; }
@@ -286,6 +311,9 @@ class TracePane(Vertical):
             return
         self.category_filter[category] = enabled
         self._rebuild()
+
+    def all_hits(self):
+        return list(self._all_hits)
 
     def clear(self) -> None:
         self.table.clear()
