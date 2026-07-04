@@ -145,7 +145,3 @@ Whatever you type in the console goes into `SBCommandInterpreter.HandleCommand`.
 - **Inline dereference hints.** `adrp + add` and `adrp + ldr` pairs get a bright blue `; = 0x…  "resolved string"` or `; load @ 0x…  symbol` comment showing what the address materializes to, right in the disasm line.
 - **Follow in disassembly.** Right-click a call or branch operand, or a register value, pick Follow in disassembly, and browse that address without moving pc. F5 snaps back.
 - **Call Stack tab.** Full backtrace of the selected thread with pc, function, and module.
-- **Attach preserves the target.** Quitting after `--attach <pid>` detaches instead of killing.
-- **Rich stop messages.** `[stop] breakpoint #3.1 at 0x100000540 in main`, `[stop] signal 11 at 0x0`, and so on, instead of raw state codes. Process exit prints the actual exit code.
-- **Live tab titles.** The trace tab shows `[ON, scope: balanced]` and updates as you cycle scope. The memory pane title shows the current follow address and `hit N/M` during a search.
-- **`clear-state` console command.** Yes/Cancel modal, drops the per-binary state file and all user breakpoints.
