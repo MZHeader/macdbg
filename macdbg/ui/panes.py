@@ -11,6 +11,7 @@ from textual.widgets import DataTable, Input, RichLog, Static
 from ..core.disasm import DisasmRow, format_bytes
 from ..core.memory import hexdump_rows
 from ..core.registers import RegRow
+from .syntax import style_disasm_line
 
 
 class RightClickTable(DataTable):
@@ -56,12 +57,15 @@ class DisasmPane(Vertical):
         for r in rows:
             addr = Text("{:016x}".format(r.addr))
             bytez = Text(format_bytes(r.raw))
-            insn = Text("{:<8} {}".format(r.mnemonic, r.operands))
+            mn, op = style_disasm_line(r.mnemonic, r.operands)
+            insn = Text.assemble(mn, " ", op)
             if r.comment:
-                insn.append("  ; " + r.comment, style="dim")
+                insn.append("  ; " + r.comment, style="dim green")
             if r.is_pc:
                 addr.stylize("bold black on yellow")
                 bytez.stylize("black on yellow")
+                insn = Text("{:<8} {}".format(r.mnemonic, r.operands) + (
+                    "  ; " + r.comment if r.comment else ""))
                 insn.stylize("bold black on yellow")
             key = self.table.add_row(addr, bytez, insn)
             if r.is_pc:
