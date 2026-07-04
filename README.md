@@ -4,6 +4,16 @@ A Textual TUI for Apple's system LLDB. Gives you a multi-pane view of the runnin
 
 ![Main view](docs/img/main.png)
 
+## Run
+
+```sh
+./macdbg.sh /path/to/your/binary
+```
+
+Requires macOS with Xcode Command Line Tools installed (so `/usr/bin/lldb` is present) and the system Python at `/usr/bin/python3`. Textual is vendored under `./vendor`, so nothing needs installing.
+
+`macdbg.sh` sets `PYTHONPATH=$(lldb -P)` so `import lldb` resolves to the framework build. ASLR is disabled on every launch so addresses stay stable across runs.
+
 ## Edit registers and memory in place
 
 Right-click any register row and pick **Edit value**. The prompt is prefilled with the current value so you can see what you're overwriting, and Ctrl+U clears if you want to replace it all.
@@ -45,18 +55,6 @@ Ctrl+P opens a fuzzy palette over every lldb command, with lldb's own help text 
 ![Command palette](docs/img/ctrl-p.png)
 
 ![Fuzzy search](docs/img/fuzzy-search.png)
-
-## Requirements
-
-macOS with Xcode Command Line Tools installed, so `/usr/bin/lldb` is present. The wrapper uses the system Python (`/usr/bin/python3`, 3.9) because that's what Apple's `lldb` module was built against. Textual is vendored under `./vendor`, so nothing needs installing.
-
-## Run
-
-```sh
-./macdbg.sh /path/to/your/binary
-```
-
-`macdbg.sh` sets `PYTHONPATH=$(lldb -P)` so `import lldb` resolves to the framework build. ASLR is disabled on every launch so addresses stay stable across runs.
 
 ## Themes
 
