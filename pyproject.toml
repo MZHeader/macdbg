@@ -1,0 +1,9 @@
+[project]
+name = "lldb-wrapper"
+version = "0.1.0"
+description = "x64dbg-style Textual TUI wrapper around LLDB."
+requires-python = ">=3.9"
+dependencies = ["textual>=8,<9"]
+
+[tool.setuptools.packages.find]
+include = ["lldb_wrapper*"]
