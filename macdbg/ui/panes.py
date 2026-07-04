@@ -242,18 +242,34 @@ class TracePane(Vertical):
         self.table.add_column("cat", width=5)
         self.table.add_column("call")
         self._n_hits = 0
+        self._all_hits: List[Tuple[int, str, str]] = []
+        self.category_filter = {"FILE": True, "NET": True, "PROC": True}
         self.table.can_focus = True
 
-    def add_hit(self, n: int, category: str, call: str) -> None:
-        colors = {"FILE": "cyan", "NET": "magenta", "PROC": "yellow"}
-        style = colors.get(category, "white")
-        at_bottom = self.table.cursor_row >= self.table.row_count - 1
+    def _row_style(self, category: str):
+        return {"FILE": "cyan", "NET": "magenta", "PROC": "yellow"}.get(category, "white")
+
+    def _append_visible(self, n: int, category: str, call: str) -> None:
+        style = self._row_style(category)
         self.table.add_row(
             Text("{:>4}".format(n), style="dim"),
             Text(category, style=style + " bold"),
             Text(call, style="white"),
         )
+
+    def _rebuild(self) -> None:
+        self.table.clear()
+        for n, cat, call in self._all_hits:
+            if self.category_filter.get(cat, True):
+                self._append_visible(n, cat, call)
+
+    def add_hit(self, n: int, category: str, call: str) -> None:
+        self._all_hits.append((n, category, call))
         self._n_hits += 1
+        if not self.category_filter.get(category, True):
+            return
+        at_bottom = self.table.cursor_row >= self.table.row_count - 1
+        self._append_visible(n, category, call)
         if at_bottom:
             try:
                 self.table.action_scroll_end()
@@ -261,8 +277,15 @@ class TracePane(Vertical):
             except Exception:
                 pass
 
+    def set_category_filter(self, category: str, enabled: bool) -> None:
+        if category not in self.category_filter:
+            return
+        self.category_filter[category] = enabled
+        self._rebuild()
+
     def clear(self) -> None:
         self.table.clear()
+        self._all_hits = []
         self._n_hits = 0
 
 

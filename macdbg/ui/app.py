@@ -562,6 +562,7 @@ class WrapperApp(App):
             ]
         elif pane == "trace":
             items = [
+                ("Filter and verbosity…",   lambda: self._open_trace_filter(x, y)),
                 ("Copy all trace rows",     lambda: self._copy_trace(all_rows=True)),
                 ("Copy this row",           lambda: self._copy_trace(all_rows=False, only=row)),
                 ("Clear trace",             lambda: (self.trace_pane.clear(), setattr(self, '_trace_count', 0))),
@@ -640,6 +641,38 @@ class WrapperApp(App):
 
     def _set_watchpoint(self, addr: int) -> None:
         self._run_palette_command("watchpoint set expression -w read_write -- {:#x}".format(addr))
+
+    def _open_trace_filter(self, x: int, y: int) -> None:
+        def tick(on: bool) -> str:
+            return "✓" if on else " "
+
+        depth_label = {
+            1:  "strict (immediate caller must be user code)",
+            5:  "balanced (user code within top 5 frames)",
+            32: "wide (any user code on the stack)",
+            0:  "off (log every hit including framework internals)",
+        }
+
+        def build_items():
+            d = self.tracer.caller_depth
+            return [
+                ("   Verbosity: {} (Enter to cycle)".format(depth_label.get(d, str(d))),
+                 self.action_cycle_trace_depth),
+                ("{}  FILE calls (open, read, write, stat, …)".format(tick(self.trace_pane.category_filter["FILE"])),
+                 lambda: self._toggle_trace_cat("FILE")),
+                ("{}  NET calls (socket, connect, send, getaddrinfo, …)".format(tick(self.trace_pane.category_filter["NET"])),
+                 lambda: self._toggle_trace_cat("NET")),
+                ("{}  PROC calls (system, execve, posix_spawn, dlopen, …)".format(tick(self.trace_pane.category_filter["PROC"])),
+                 lambda: self._toggle_trace_cat("PROC")),
+            ]
+        from .context import ToggleMenu
+        self.push_screen(ToggleMenu(build_items, x=max(0, x), y=max(0, y)))
+
+    def _toggle_trace_cat(self, category: str) -> None:
+        cur = self.trace_pane.category_filter[category]
+        self.trace_pane.set_category_filter(category, not cur)
+        self.console_pane.write("[trace] {} calls: {}".format(
+            category, "shown" if not cur else "hidden"))
 
     def _copy_trace(self, all_rows: bool, only: Optional[int] = None) -> None:
         table = self.trace_pane.table
