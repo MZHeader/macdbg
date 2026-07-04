@@ -348,49 +348,70 @@ class Debugger:
         return "direct svc #{} passed (op={:#x})".format(x16, x0)
 
     _FORK_SYMBOLS = ("fork", "vfork")
+    _SETSID_SYMBOLS = ("setsid",)
+    setsid_bp_ids: Optional[List[int]] = None
     _EXEC_SYMBOLS = ("system", "popen", "execve", "execvp",
                      "posix_spawn", "posix_spawnp")
 
-    def set_fork_mode(self, mode: str) -> Tuple[bool, str]:
-        if mode not in ("off", "suppress", "identity"):
-            return False, "invalid fork mode {!r}".format(mode)
+    def enable_fork_identity(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
             return False, "no target"
         if self.fork_bp_ids is None:
             self.fork_bp_ids = []
-        if mode == "off":
-            for bp_id in self.fork_bp_ids:
-                self.target.BreakpointDelete(bp_id)
-            self.fork_bp_ids = []
+        if self.setsid_bp_ids is None:
+            self.setsid_bp_ids = []
+        if self.fork_bp_ids:
+            self.fork_mode = "identity"
+            return True, "fork identity already armed"
+        for name in self._FORK_SYMBOLS:
+            bp = self.target.BreakpointCreateByName(name)
+            if bp.IsValid():
+                self.fork_bp_ids.append(bp.GetID())
+        for name in self._SETSID_SYMBOLS:
+            bp = self.target.BreakpointCreateByName(name)
+            if bp.IsValid():
+                self.setsid_bp_ids.append(bp.GetID())
+        self.fork_mode = "identity"
+        return True, "fork identity armed (fork+setsid faked; use direct-syscall scan for inline svc)"
+
+    def disable_fork_identity(self) -> Tuple[bool, str]:
+        if not self.target:
             self.fork_mode = "off"
-            return True, "fork mode: off"
-        if not self.fork_bp_ids:
-            for name in self._FORK_SYMBOLS:
-                bp = self.target.BreakpointCreateByName(name)
-                if bp.IsValid():
-                    self.fork_bp_ids.append(bp.GetID())
-        self.fork_mode = mode
-        label = ("suppress (fork returns -1, no child spawns)" if mode == "suppress"
-                 else "identity (fork returns 0, parent takes child code path)")
-        return True, "fork mode: " + label
+            return True, "fork identity already off"
+        for bp_id in (self.fork_bp_ids or []):
+            self.target.BreakpointDelete(bp_id)
+        for bp_id in (self.setsid_bp_ids or []):
+            self.target.BreakpointDelete(bp_id)
+        self.fork_bp_ids = []
+        self.setsid_bp_ids = []
+        self.fork_mode = "off"
+        return True, "fork identity disabled"
+
+    def handle_setsid_hit(self, bp_id: int) -> Optional[str]:
+        if not self.setsid_bp_ids or bp_id not in self.setsid_bp_ids or not self.process:
+            return None
+        if self.fork_mode != "identity":
+            return None
+        fake_sid = self.process.GetProcessID() or 1
+        ret = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("thread return {}".format(fake_sid), ret, False)
+        self.process.Continue()
+        return "identity: setsid() faked, returned {} (real call would fail)".format(fake_sid)
 
     def handle_fork_hit(self, bp_id: int) -> Optional[str]:
         if not self.fork_bp_ids or bp_id not in self.fork_bp_ids or not self.process:
             return None
-        if self.fork_mode == "off":
+        if self.fork_mode != "identity":
             return None
         thread = self.process.GetSelectedThread()
         if not thread or not thread.IsValid():
             return None
         frame = thread.GetFrameAtIndex(0)
         fname = frame.GetFunctionName() or "fork"
-        ret_val = 0 if self.fork_mode == "identity" else -1
         ret = lldb.SBCommandReturnObject()
-        self.ci.HandleCommand("thread return {}".format(ret_val), ret, False)
+        self.ci.HandleCommand("thread return 0", ret, False)
         self.process.Continue()
-        if self.fork_mode == "identity":
-            return "identity: {}() returned 0, parent will take child code path".format(fname)
-        return "suppress: {}() returned -1, no child spawned".format(fname)
+        return "identity: {}() returned 0, parent takes child code path".format(fname)
 
     def enable_exec_sandbox(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():

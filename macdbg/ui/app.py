@@ -230,6 +230,7 @@ class WrapperApp(App):
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
                         self.dbg.handle_fork_hit,
+                        self.dbg.handle_setsid_hit,
                         self.dbg.handle_exec_hit):
             msg = handler(bp_id)
             if msg is not None:
@@ -343,6 +344,8 @@ class WrapperApp(App):
             ids.update(self.dbg.direct_syscall_bp_ids)
         if self.dbg.fork_bp_ids:
             ids.update(self.dbg.fork_bp_ids)
+        if self.dbg.setsid_bp_ids:
+            ids.update(self.dbg.setsid_bp_ids)
         if self.dbg.exec_bp_ids:
             ids.update(self.dbg.exec_bp_ids.keys())
         return ids
@@ -363,8 +366,8 @@ class WrapperApp(App):
                  self._toggle_hw_bps),
                 ("{}  Hardware BPs for tracer breakpoints".format(tick(self.tracer.hardware)),
                  self._toggle_tracer_hw),
-                ("   Fork mode: {} (Enter to cycle off/suppress/identity)".format(self.dbg.fork_mode),
-                 self._cycle_fork_mode),
+                ("{}  Fork identity mode (fork+setsid faked, parent runs child path)".format(tick(self.dbg.fork_mode == "identity")),
+                 self._toggle_fork_identity),
                 ("{}  Outbound exec sandbox (system/popen/execve/posix_spawn)".format(tick(bool(self.dbg.exec_bp_ids))),
                  self._toggle_exec_sandbox),
             ]
@@ -411,9 +414,11 @@ class WrapperApp(App):
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
-    def _cycle_fork_mode(self) -> None:
-        nxt = {"off": "suppress", "suppress": "identity", "identity": "off"}[self.dbg.fork_mode]
-        _, msg = self.dbg.set_fork_mode(nxt)
+    def _toggle_fork_identity(self) -> None:
+        if self.dbg.fork_mode == "identity":
+            _, msg = self.dbg.disable_fork_identity()
+        else:
+            _, msg = self.dbg.enable_fork_identity()
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
