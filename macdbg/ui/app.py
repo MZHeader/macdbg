@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, TabbedContent, TabPane
 
 from .context import ContextMenu, MultilineEditor, PromptScreen, ToggleMenu
@@ -67,12 +67,13 @@ class WrapperApp(App):
 
     CSS = """
     Screen { layout: vertical; }
-    #top { height: 33%; layout: horizontal; }
-    #mid { height: 34%; layout: horizontal; }
+    #top { height: 72%; layout: horizontal; }
     #bot { height: 1fr; layout: horizontal; }
     DisasmPane      { width: 2fr; }
-    RegistersPane   { width: 1fr; }
-    HexPane, MemoryPane { width: 1fr; }
+    #right_col      { width: 1fr; min-width: 55; max-width: 90; layout: vertical; }
+    RegistersPane   { height: 45%; }
+    #mem_tabs       { height: 1fr; border: solid $accent; }
+    HexPane, MemoryPane { height: 1fr; }
     #tabs           { width: 3fr; border: solid $accent; }
     ConsolePane     { width: 2fr; }
     TracePane RightClickTable { height: 1fr; }
@@ -150,10 +151,13 @@ class WrapperApp(App):
 
         with Horizontal(id="top"):
             yield self.disasm
-            yield self.regs
-        with Horizontal(id="mid"):
-            yield self.stack
-            yield self.mem
+            with Vertical(id="right_col"):
+                yield self.regs
+                with TabbedContent(id="mem_tabs"):
+                    with TabPane("Memory", id="tab_mem"):
+                        yield self.mem
+                    with TabPane("Stack", id="tab_stack"):
+                        yield self.stack
         with Horizontal(id="bot"):
             with TabbedContent(id="tabs"):
                 with TabPane("Breakpoints", id="tab_bps"):
@@ -347,12 +351,17 @@ class WrapperApp(App):
         self.console_pane.write(e.text, error=e.is_error)
 
     def _refresh_all(self) -> None:
+        with self.batch_update():
+            self._do_refresh_all()
+
+    def _do_refresh_all(self) -> None:
         frame = self.dbg.frame()
         pc = self.dbg.pc() or 0
         sp = self.dbg.sp() or 0
 
         if self.dbg.target:
-            rows = disasm_around(self.dbg.target, pc, count=40)
+            rows = disasm_around(self.dbg.target, pc, count=512,
+                                 read_mem=self.dbg.read_memory)
             comments = self.dbg.state.comments if self.dbg.state else {}
             if comments:
                 for r in rows:
@@ -361,6 +370,7 @@ class WrapperApp(App):
                         r.user_comment = c
             self.disasm.render_rows(rows)
 
+        self._annot_cache.clear()
         reg_rows = collect_regs(
             frame,
             self._prev_regs,
@@ -368,8 +378,6 @@ class WrapperApp(App):
             target=self.dbg.target,
             annot_cache=self._annot_cache,
         )
-        if len(self._annot_cache) > 4096:
-            self._annot_cache.clear()
         self.regs.render_rows(reg_rows)
         self._prev_regs = reg_snapshot(reg_rows)
 
@@ -1123,6 +1131,12 @@ class WrapperApp(App):
                 self._mem_history = self._mem_history[-32:]
         base, data = self._centered_read(addr, before_rows=32)
         self.mem.render_bytes(base, data, focus_addr=addr, focus_len=focus_len)
+        self._last_rendered_follow = addr
+        extra = ""
+        if self._search_hits and addr in self._search_hits:
+            idx = self._search_hits.index(addr)
+            extra = "hit {}/{}".format(idx + 1, len(self._search_hits))
+        self.mem.sync_follow(addr, extra=extra)
         self.console_pane.write("follow -> {:#x}".format(addr))
 
     _CLEAR_STATE_ALIASES = ("clear-state", "macdbg clear-state", "macdbg clear")

@@ -9,9 +9,42 @@ from textual.message import Message
 from textual.widgets import DataTable, Input, RichLog, Static
 
 from ..core.disasm import DisasmRow, format_bytes
-from ..core.memory import hexdump_rows
+from ..core.memory import bytes_per_row_for, hexdump_rows
 from ..core.registers import RegRow
 from .syntax import style_disasm_line
+
+
+def _force_dimensions_settled(table: DataTable) -> None:
+    """Force DataTable to compute its virtual size synchronously so scroll_to
+    can use it in the same event-loop tick. Without this, add_row batches the
+    dimension update to on_idle, causing a one-frame flash where the paint
+    happens before scroll can find its target."""
+    if not getattr(table, "_require_update_dimensions", False):
+        return
+    try:
+        new_rows = table._new_rows.copy()
+        table._new_rows.clear()
+        table._require_update_dimensions = False
+        table._update_dimensions(new_rows)
+    except Exception:
+        pass
+
+
+def _settle_and_center(table: DataTable, pc_key, new_keys) -> None:
+    if pc_key is None:
+        return
+    try:
+        _force_dimensions_settled(table)
+        pc_idx = table.get_row_index(pc_key)
+    except Exception:
+        return
+    try:
+        table.move_cursor(row=pc_idx, animate=False, scroll=False)
+        visible = max(1, table.size.height - 2)
+        target = max(0, pc_idx - visible // 2)
+        table.scroll_to(y=target, animate=False, immediate=True)
+    except Exception:
+        pass
 
 
 class RightClickTable(DataTable):
@@ -54,6 +87,7 @@ class DisasmPane(Vertical):
         self._rows = list(rows)
         self.table.clear()
         pc_row_key = None
+        new_keys = []
         for r in rows:
             addr = Text("{:016x}".format(r.addr))
             bytez = Text(format_bytes(r.raw))
@@ -61,6 +95,8 @@ class DisasmPane(Vertical):
             insn = Text.assemble(mn, " ", op)
             if r.comment:
                 insn.append("  ; " + r.comment, style="dim green")
+            if r.inline_hint:
+                insn.append("  ; " + r.inline_hint, style="#5fafff")
             if r.user_comment:
                 insn.append("  ← " + r.user_comment, style="bold #ffd75f")
             if r.is_pc:
@@ -69,35 +105,17 @@ class DisasmPane(Vertical):
                 plain = "{:<8} {}".format(r.mnemonic, r.operands)
                 if r.comment:
                     plain += "  ; " + r.comment
+                if r.inline_hint:
+                    plain += "  ; " + r.inline_hint
                 if r.user_comment:
                     plain += "  ← " + r.user_comment
                 insn = Text(plain)
                 insn.stylize("bold black on yellow")
             key = self.table.add_row(addr, bytez, insn)
+            new_keys.append(key)
             if r.is_pc:
                 pc_row_key = key
-        if pc_row_key is not None:
-            try:
-                pc_idx = self.table.get_row_index(pc_row_key)
-            except Exception:
-                pc_idx = None
-            if pc_idx is not None:
-                try:
-                    self.table.move_cursor(row=pc_idx, animate=False, scroll=False)
-                except Exception:
-                    pass
-                def _scroll(idx=pc_idx) -> None:
-                    try:
-                        visible = max(1, self.table.size.height - 2)
-                        target = max(0, idx - visible // 2)
-                        self.table.scroll_to(y=target, animate=False, immediate=True)
-                    except Exception:
-                        pass
-                try:
-                    self.table.call_after_refresh(_scroll)
-                    self.table.call_after_refresh(_scroll)
-                except Exception:
-                    _scroll()
+        _settle_and_center(self.table, pc_row_key, new_keys)
 
 
 class RegistersPane(Vertical):
@@ -152,16 +170,17 @@ class HexPane(Vertical):
     ) -> None:
         self.table.clear()
         focus_row = None
-        rows = hexdump_rows(data, base)
+        width = bytes_per_row_for(self.size.width)
+        rows = hexdump_rows(data, base, width=width)
         focus_end = focus_addr + focus_len if focus_addr is not None else None
         for idx, (addr, hex_part, ascii_part) in enumerate(rows):
             addr_txt = Text("{:016x}".format(addr), style="cyan")
             hex_txt = Text(hex_part)
             ascii_txt = Text(ascii_part, style="green")
-            if focus_addr is not None and addr + 16 > focus_addr and addr < focus_end:
+            if focus_addr is not None and addr + width > focus_addr and addr < focus_end:
                 lo = max(0, focus_addr - addr)
-                hi = min(16, focus_end - addr)
-                if focus_row is None and addr <= focus_addr < addr + 16:
+                hi = min(width, focus_end - addr)
+                if focus_row is None and addr <= focus_addr < addr + width:
                     focus_row = idx
                     addr_txt.stylize("bold black on yellow")
                 hex_start = lo * 3
@@ -172,24 +191,19 @@ class HexPane(Vertical):
         if focus_row is not None and not preserve_scroll:
             self._center_on(focus_row)
 
-    def _center_on(self, focus_row: int) -> None:
+    def _center_on(self, focus_row: int, top_bias: int = 3) -> None:
+        """Center the cursor on `focus_row`, biased so `1/top_bias` of visible
+        rows sit above it. Runs synchronously — forces virtual-size settle so
+        the batched paint sees final scroll state (no flash)."""
         try:
+            _force_dimensions_settled(self.table)
             self.table.move_cursor(row=focus_row, animate=False, scroll=False)
+            visible = max(1, self.table.size.height - 2)
+            offset = max(1, visible // top_bias)
+            target = max(0, focus_row - offset)
+            self.table.scroll_to(y=target, animate=False, immediate=True)
         except Exception:
-            return
-        def _do_scroll() -> None:
-            try:
-                visible = max(1, self.table.size.height - 2)
-                offset = max(1, visible // 3)
-                target = max(0, focus_row - offset)
-                self.table.scroll_to(y=target, animate=False, immediate=True)
-            except Exception:
-                pass
-        try:
-            self.table.call_after_refresh(_do_scroll)
-            self.table.call_after_refresh(_do_scroll)
-        except Exception:
-            _do_scroll()
+            pass
 
 
 class BreakpointsPane(Vertical):
