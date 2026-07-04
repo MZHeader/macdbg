@@ -88,7 +88,7 @@ class WrapperApp(App):
         Binding("ctrl+k", "clear_trace", "Clear Trace"),
         Binding("ctrl+y", "cycle_trace_depth", "Trace Scope"),
         Binding("ctrl+d", "defenses", "Defenses"),
-        Binding("ctrl+c", "noop", "Exit (disabled)"),
+        Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
     ]
 
     def __init__(self, program: Optional[str], program_args: List[str]) -> None:
@@ -262,9 +262,6 @@ class WrapperApp(App):
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
         self.threads_pane.render_rows(self.dbg.threads())
         self.modules_pane.render_rows(self.dbg.modules())
-
-    def action_noop(self) -> None:
-        pass
 
     def action_step_in(self) -> None:
         self.dbg.step_in()
