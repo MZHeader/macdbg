@@ -97,6 +97,59 @@ class PromptScreen(ModalScreen[Optional[str]]):
         self.dismiss(event.value)
 
 
+class ToggleMenu(ModalScreen):
+    BINDINGS = [Binding("escape", "dismiss", "close")]
+
+    DEFAULT_CSS = ContextMenu.DEFAULT_CSS
+
+    def __init__(self, get_items, x: int = 0, y: int = 0) -> None:
+        super().__init__()
+        self._get_items = get_items
+        self._x, self._y = x, y
+
+    def compose(self) -> ComposeResult:
+        yield OptionList(id="menu_list")
+
+    def _repopulate(self) -> None:
+        ol = self.query_one("#menu_list", OptionList)
+        items = self._get_items()
+        self._current = items
+        ol.clear_options()
+        for i, (label, _) in enumerate(items):
+            ol.add_option(Option(" " + label + " ", id=str(i)))
+
+    def on_mount(self) -> None:
+        self._repopulate()
+        items = self._current
+        menu = self.query_one("#menu_list", OptionList)
+        longest = max(len(lbl) for lbl, _ in items)
+        width = longest + 10
+        height = len(items) + 2
+        screen_w, screen_h = self.app.size
+        x = min(self._x, max(0, screen_w - width))
+        y = min(self._y, max(0, screen_h - height))
+        menu.styles.offset = (x, y)
+        menu.styles.width = width
+        menu.styles.height = height
+        menu.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        idx = int(event.option.id or "0")
+        highlighted = event.option_list.highlighted
+        _, callback = self._current[idx]
+        callback()
+        self._repopulate()
+        try:
+            self.query_one(OptionList).highlighted = highlighted
+        except Exception:
+            pass
+
+    def on_click(self, event) -> None:
+        menu = self.query_one("#menu_list", OptionList)
+        if event.widget is not menu and menu not in getattr(event.widget, "ancestors", []):
+            self.dismiss(None)
+
+
 class MultilineEditor(ModalScreen[Optional[str]]):
     BINDINGS = [
         Binding("escape", "dismiss('')", "cancel"),

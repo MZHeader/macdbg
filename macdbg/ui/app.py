@@ -9,7 +9,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import DataTable, Footer, Header, Input, TabbedContent, TabPane
 
-from .context import ContextMenu, MultilineEditor, PromptScreen
+from .context import ContextMenu, MultilineEditor, PromptScreen, ToggleMenu
 
 from ..core.debugger import Debugger
 from ..core.disasm import disasm_around, extract_addr
@@ -348,27 +348,28 @@ class WrapperApp(App):
         return ids
 
     def action_defenses(self) -> None:
-        def tag(on: bool) -> str:
-            return "[on] " if on else "[off]"
+        def tick(on: bool) -> str:
+            return "✓" if on else " "
 
-        items = [
-            ("{}  PT_DENY_ATTACH bypass (symbol hook)".format(tag(bool(self.dbg.anti_ptrace_bp_id))),
-             self._toggle_deny_attach_bypass),
-            ("{}  Direct-syscall ptrace scan (mov x16,#26 / svc)".format(tag(bool(self.dbg.direct_syscall_bp_ids))),
-             self._toggle_direct_syscall_scan),
-            ("{}  Mach exception port cloak".format(tag(bool(self.dbg.anti_mach_bp_id))),
-             self._toggle_mach_ports_cloak),
-            ("{}  Hardware BPs for user breakpoints".format(tag(self.dbg.hw_breakpoints)),
-             self._toggle_hw_bps),
-            ("{}  Hardware BPs for tracer breakpoints".format(tag(self.tracer.hardware)),
-             self._toggle_tracer_hw),
-            ("Fork mode: {} (click to cycle off/suppress/identity)".format(self.dbg.fork_mode),
-             self._cycle_fork_mode),
-            ("{}  Outbound exec sandbox (system/popen/execve/posix_spawn)".format(tag(bool(self.dbg.exec_bp_ids))),
-             self._toggle_exec_sandbox),
-        ]
+        def build_items():
+            return [
+                ("{}  PT_DENY_ATTACH bypass (symbol hook)".format(tick(bool(self.dbg.anti_ptrace_bp_id))),
+                 self._toggle_deny_attach_bypass),
+                ("{}  Direct-syscall ptrace scan (mov x16,#26 / svc)".format(tick(bool(self.dbg.direct_syscall_bp_ids))),
+                 self._toggle_direct_syscall_scan),
+                ("{}  Mach exception port cloak".format(tick(bool(self.dbg.anti_mach_bp_id))),
+                 self._toggle_mach_ports_cloak),
+                ("{}  Hardware BPs for user breakpoints".format(tick(self.dbg.hw_breakpoints)),
+                 self._toggle_hw_bps),
+                ("{}  Hardware BPs for tracer breakpoints".format(tick(self.tracer.hardware)),
+                 self._toggle_tracer_hw),
+                ("   Fork mode: {} (Enter to cycle off/suppress/identity)".format(self.dbg.fork_mode),
+                 self._cycle_fork_mode),
+                ("{}  Outbound exec sandbox (system/popen/execve/posix_spawn)".format(tick(bool(self.dbg.exec_bp_ids))),
+                 self._toggle_exec_sandbox),
+            ]
         w, h = self.size
-        self.push_screen(ContextMenu(items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
+        self.push_screen(ToggleMenu(build_items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
 
     def _toggle_deny_attach_bypass(self) -> None:
         if self.dbg.anti_ptrace_bp_id:
