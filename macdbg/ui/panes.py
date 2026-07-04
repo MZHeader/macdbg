@@ -61,11 +61,17 @@ class DisasmPane(Vertical):
             insn = Text.assemble(mn, " ", op)
             if r.comment:
                 insn.append("  ; " + r.comment, style="dim green")
+            if r.user_comment:
+                insn.append("  ← " + r.user_comment, style="bold #ffd75f")
             if r.is_pc:
                 addr.stylize("bold black on yellow")
                 bytez.stylize("black on yellow")
-                insn = Text("{:<8} {}".format(r.mnemonic, r.operands) + (
-                    "  ; " + r.comment if r.comment else ""))
+                plain = "{:<8} {}".format(r.mnemonic, r.operands)
+                if r.comment:
+                    plain += "  ; " + r.comment
+                if r.user_comment:
+                    plain += "  ← " + r.user_comment
+                insn = Text(plain)
                 insn.stylize("bold black on yellow")
             key = self.table.add_row(addr, bytez, insn)
             if r.is_pc:
@@ -142,6 +148,7 @@ class HexPane(Vertical):
         data: bytes,
         focus_addr: Optional[int] = None,
         focus_len: int = 1,
+        preserve_scroll: bool = False,
     ) -> None:
         self.table.clear()
         focus_row = None
@@ -162,7 +169,7 @@ class HexPane(Vertical):
                 hex_txt.stylize("bold black on yellow", hex_start, hex_end)
                 ascii_txt.stylize("bold black on yellow", lo, hi)
             self.table.add_row(addr_txt, hex_txt, ascii_txt)
-        if focus_row is not None:
+        if focus_row is not None and not preserve_scroll:
             self._center_on(focus_row)
 
     def _center_on(self, focus_row: int) -> None:
@@ -309,7 +316,11 @@ class TracePane(Vertical):
     """
 
     def compose(self):
-        yield Static("Trace  (Ctrl+T toggles — arrow keys / mouse wheel to scroll)", classes="title")
+        self.title_widget = Static(
+            "Trace  (Ctrl+T toggles — arrow keys / mouse wheel to scroll)",
+            classes="title",
+        )
+        yield self.title_widget
         self.table = RightClickTable(
             cursor_type="row",
             zebra_stripes=True,
@@ -317,6 +328,11 @@ class TracePane(Vertical):
             show_row_labels=False,
         )
         yield self.table
+
+    def set_status(self, enabled: bool, scope: str) -> None:
+        state = "ON" if enabled else "off"
+        self.title_widget.update(
+            "Trace  [{}, scope: {}]  (Ctrl+T toggles, Ctrl+Y scope)".format(state, scope))
 
     def on_mount(self) -> None:
         self.table.add_column("#", width=5)
@@ -400,8 +416,20 @@ class MemoryPane(HexPane):
     """
 
     def compose(self):
-        yield Static("Memory  (Ctrl+G to focus address)", classes="title")
+        self.title_widget = Static("Memory  (Ctrl+G to focus address)", classes="title")
+        yield self.title_widget
         self.addr_input = Input(placeholder="0x... address to follow", id="mem_addr")
         yield self.addr_input
         self.table = RightClickTable(cursor_type="row", zebra_stripes=False, show_header=False)
         yield self.table
+
+    def sync_follow(self, addr: Optional[int], extra: str = "") -> None:
+        if addr is None:
+            self.addr_input.value = ""
+            self.title_widget.update("Memory  (Ctrl+G to focus address)")
+            return
+        addr_s = "{:#x}".format(addr)
+        if self.addr_input.value != addr_s and not self.addr_input.has_focus:
+            self.addr_input.value = addr_s
+        suffix = ("  " + extra) if extra else ""
+        self.title_widget.update("Memory  ({}{})".format(addr_s, suffix))

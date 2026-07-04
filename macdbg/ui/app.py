@@ -133,6 +133,7 @@ class WrapperApp(App):
         self._search_hits: List[int] = []
         self._search_pos: int = 0
         self._mem_follow_len: int = 1
+        self._last_rendered_follow: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -242,9 +243,18 @@ class WrapperApp(App):
             self.console_pane.write(self._describe_stop())
             self._refresh_all()
         elif e.state == lldb.eStateExited:
-            self.console_pane.write("process exited.")
+            self.console_pane.write(self._describe_exit())
         else:
             self.console_pane.write("[event] state={} ({})".format(e.description, e.state))
+
+    def _describe_exit(self) -> str:
+        p = self.dbg.process
+        if not p or not p.IsValid():
+            return "process exited."
+        code = p.GetExitStatus()
+        desc = p.GetExitDescription() or ""
+        base = "process exited with code {}".format(code)
+        return base + (" ({})".format(desc) if desc else "") + "."
 
     def _describe_stop(self) -> str:
         process = self.dbg.process
@@ -265,7 +275,7 @@ class WrapperApp(App):
             loc_id = thread.GetStopReasonDataAtIndex(1) if thread.GetStopReasonDataCount() >= 2 else 0
             bp = self.dbg.target.FindBreakpointByID(bp_id) if self.dbg.target else None
             cond = (bp.GetCondition() if bp and bp.IsValid() else None) or ""
-            cond_txt = " (cond: {})".format(cond) if cond else ""
+            cond_txt = " (cond: {})".format(cond) if cond and cond.strip() not in ("", "1") else ""
             return "[stop] breakpoint #{}.{} at {:#x}{}{}".format(bp_id, loc_id, pc, where, cond_txt)
         if reason == lldb.eStopReasonWatchpoint and thread.GetStopReasonDataCount() >= 1:
             wp_id = thread.GetStopReasonDataAtIndex(0)
@@ -348,7 +358,7 @@ class WrapperApp(App):
                 for r in rows:
                     c = comments.get(r.addr)
                     if c:
-                        r.comment = (r.comment + " | " if r.comment else "") + "user: " + c
+                        r.user_comment = c
             self.disasm.render_rows(rows)
 
         reg_rows = collect_regs(
@@ -370,8 +380,16 @@ class WrapperApp(App):
         follow = self._mem_follow if self._mem_follow is not None else pc
         if follow:
             base, data = self._centered_read(follow, before_rows=32)
+            preserve = (follow == self._last_rendered_follow)
             self.mem.render_bytes(base, data, focus_addr=follow,
-                                  focus_len=self._mem_follow_len if self._mem_follow is not None else 1)
+                                  focus_len=self._mem_follow_len if self._mem_follow is not None else 1,
+                                  preserve_scroll=preserve)
+            self._last_rendered_follow = follow
+            extra = ""
+            if self._search_hits and follow in self._search_hits:
+                idx = self._search_hits.index(follow)
+                extra = "hit {}/{}".format(idx + 1, len(self._search_hits))
+            self.mem.sync_follow(follow, extra=extra)
 
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
         self.threads_pane.render_rows(self.dbg.threads())
@@ -514,6 +532,13 @@ class WrapperApp(App):
                 pass
         return s.encode()
 
+    _SCOPE_LABELS = {
+        1:  "strict",
+        5:  "balanced",
+        32: "wide",
+        0:  "off",
+    }
+
     def action_cycle_trace_depth(self) -> None:
         cycle = [
             (1,  "strict (immediate caller must be user code)"),
@@ -530,6 +555,11 @@ class WrapperApp(App):
             nxt = cycle[1]
         self.tracer.caller_depth = nxt[0]
         self.console_pane.write("[trace] scope = {}".format(nxt[1]))
+        self._update_trace_title()
+
+    def _update_trace_title(self) -> None:
+        label = self._SCOPE_LABELS.get(self.tracer.caller_depth, str(self.tracer.caller_depth))
+        self.trace_pane.set_status(self.tracer.enabled, label)
 
     def _hidden_bp_ids(self) -> set:
         ids = set(self.tracer._bp_to_name)
@@ -673,6 +703,7 @@ class WrapperApp(App):
         if self.tracer.enabled:
             self.tracer.disable(self.dbg.target)
             self.console_pane.write("[trace] disabled")
+            self._update_trace_title()
         else:
             total, resolved = self.tracer.enable(self.dbg.target, ci=self.dbg.ci)
             if total == 0:
@@ -691,6 +722,7 @@ class WrapperApp(App):
                 self.trace_pane.table.focus()
             except Exception:
                 pass
+            self._update_trace_title()
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     _RELAUNCH_ALIASES = ("run", "r", "process launch")
@@ -962,6 +994,48 @@ class WrapperApp(App):
         self.console_pane.write("bp #{} deleted".format(bp_id))
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
+    def _prompt_clear_state(self) -> None:
+        if not self.dbg.state:
+            self.console_pane.write(
+                "[state] no state to clear (target not loaded from a path)", error=True)
+            return
+        state = self.dbg.state
+        path = state.file_path()
+        summary = "sha {}… ({} bp(s), {} comment(s), {} bookmark(s))".format(
+            state.sha256[:12], len(state.breakpoints), len(state.comments), len(state.bookmarks))
+
+        def do_clear():
+            import os
+            state.comments.clear()
+            state.bookmarks.clear()
+            state.breakpoints.clear()
+            deleted = False
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    deleted = True
+            except OSError as e:
+                self.console_pane.write("[state] could not delete {}: {}".format(path, e), error=True)
+                return
+            for i in reversed(range(self.dbg.target.GetNumBreakpoints())):
+                bp = self.dbg.target.GetBreakpointAtIndex(i)
+                if bp.GetID() in self._hidden_bp_ids():
+                    continue
+                self.dbg.target.BreakpointDelete(bp.GetID())
+            self.console_pane.write(
+                "[state] cleared. removed file={} and all user breakpoints.".format(
+                    path if deleted else "(none)"))
+            self._refresh_all()
+
+        items = [
+            ("Yes  — delete state file, drop comments and user BPs", do_clear),
+            ("Cancel — keep everything as-is",                        lambda: None),
+        ]
+        self.console_pane.write(
+            "[state] confirm clear for {} — this cannot be undone".format(summary))
+        w, h = self.size
+        self.push_screen(ContextMenu(items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
+
     def _prompt_edit_comment(self, addr: int) -> None:
         state = self.dbg.state
         if not state:
@@ -1051,6 +1125,8 @@ class WrapperApp(App):
         self.mem.render_bytes(base, data, focus_addr=addr, focus_len=focus_len)
         self.console_pane.write("follow -> {:#x}".format(addr))
 
+    _CLEAR_STATE_ALIASES = ("clear-state", "macdbg clear-state", "macdbg clear")
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "cmd_input":
             cmd = event.value.strip()
@@ -1058,6 +1134,9 @@ class WrapperApp(App):
             if not cmd:
                 return
             self.console_pane.write("> " + cmd)
+            if cmd.lower() in self._CLEAR_STATE_ALIASES:
+                self._prompt_clear_state()
+                return
             self._preempt_interactive(cmd)
             ok, out, err = self.dbg.handle_command(cmd)
             if out:
@@ -1068,6 +1147,9 @@ class WrapperApp(App):
                 self.console_pane.write("[wrapper] re-hooked event listener to new process")
                 self._prev_regs = {}
                 self._mem_follow = None
+                self._trace_count = 0
+                self._annot_cache.clear()
+                self.trace_pane.clear()
             if self.dbg.process and self.dbg.process.GetState() == lldb.eStateStopped:
                 self._refresh_all()
         elif event.input.id == "mem_addr":

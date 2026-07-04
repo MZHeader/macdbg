@@ -15,6 +15,7 @@ class DisasmRow:
     operands: str
     comment: str
     is_pc: bool
+    user_comment: str = ""
 
 
 def disasm_around(target: lldb.SBTarget, pc: int, count: int = 40) -> List[DisasmRow]:
