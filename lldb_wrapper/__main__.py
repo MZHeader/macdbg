@@ -7,7 +7,7 @@ from .ui.app import WrapperApp
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(prog="lldb-wrapper")
+    p = argparse.ArgumentParser(prog="macdbg")
     p.add_argument("program", nargs="?")
     p.add_argument("args", nargs=argparse.REMAINDER)
     ns = p.parse_args()

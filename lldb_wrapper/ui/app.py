@@ -136,7 +136,7 @@ class WrapperApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = "lldb-wrapper"
+        self.title = "macdbg"
         self.sub_title = self.program or "(no target)"
         self.pump = EventPump(
             self.dbg.listener,
