@@ -14,7 +14,7 @@ macOS with Xcode Command Line Tools installed, so `/usr/bin/lldb` is present. Th
 ./run.sh /path/to/your/binary
 ```
 
-On first launch `run.sh` fetches Textual into a local `./vendor` directory. No system-wide install and nothing you need to activate.
+Textual is vendored in `./vendor`, so the wrapper runs on a machine that has never seen the internet as long as `/usr/bin/lldb` and `/usr/bin/python3` are present.
 
 Point it at a binary you compiled yourself, or any non-signed Homebrew binary. System binaries under `/bin`, `/usr/bin`, and other SIP-protected paths are blocked from being debugged and will fail to launch.
 
