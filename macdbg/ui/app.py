@@ -524,7 +524,7 @@ class WrapperApp(App):
         for pane_name, pane in (
             ("regs", self.regs), ("disasm", self.disasm),
             ("mem", self.mem), ("stack", self.stack),
-            ("bps", self.bps),
+            ("bps", self.bps), ("trace", self.trace_pane),
         ):
             if event.table is pane.table:
                 self._open_menu_for(pane_name, event.row, event.screen_x, event.screen_y)
@@ -560,6 +560,15 @@ class WrapperApp(App):
                 ("Run to cursor",                   lambda: self._run_to(drow.addr)),
                 ("Copy address",                    lambda: self._copy("{:#x}".format(drow.addr))),
             ]
+        elif pane == "trace":
+            items = [
+                ("Copy all trace rows",     lambda: self._copy_trace(all_rows=True)),
+                ("Copy this row",           lambda: self._copy_trace(all_rows=False, only=row)),
+                ("Clear trace",             lambda: (self.trace_pane.clear(), setattr(self, '_trace_count', 0))),
+            ]
+            if items:
+                self.push_screen(ContextMenu(items, x=max(0, x), y=max(0, y)))
+            return
         elif pane == "bps":
             bp_id = self.bps.bp_id_at(row)
             if bp_id is None:
@@ -631,6 +640,22 @@ class WrapperApp(App):
 
     def _set_watchpoint(self, addr: int) -> None:
         self._run_palette_command("watchpoint set expression -w read_write -- {:#x}".format(addr))
+
+    def _copy_trace(self, all_rows: bool, only: Optional[int] = None) -> None:
+        table = self.trace_pane.table
+        lines = []
+        for i in range(table.row_count):
+            if not all_rows and only is not None and i != only:
+                continue
+            row = table.get_row_at(i)
+            cells = [c.plain if hasattr(c, "plain") else str(c) for c in row]
+            lines.append("\t".join(c.strip() for c in cells))
+        if not lines:
+            self.console_pane.write("[copy] no trace rows to copy", error=True)
+            return
+        payload = "\n".join(lines)
+        self._copy(payload)
+        self.console_pane.write("[copy] {} trace row(s) to clipboard".format(len(lines)))
 
     def _copy(self, text: str) -> None:
         import subprocess
