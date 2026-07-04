@@ -78,7 +78,7 @@ Lots of themes to choose from :)
 | Ctrl+K | Clear the trace tab |
 | Ctrl+Y | Cycle trace scope (strict / balanced / wide / off) |
 | Ctrl+D | Defenses menu |
-| Ctrl+C | Quit |
+| Ctrl+C | Exit (disabled, kept so accidental Ctrl+C doesn't kill your session) |
 | Right click on a row | Pane-specific context menu |
 
 Whatever you type in the console goes into `SBCommandInterpreter.HandleCommand`. If a command would trigger an interactive Y/N prompt (`run`, `br del`), the wrapper answers it for you before the command reaches lldb.
