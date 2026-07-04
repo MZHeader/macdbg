@@ -1,9 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "lldb-wrapper"
-version = "0.1.0"
-description = "x64dbg-style Textual TUI wrapper around LLDB."
+name = "macdbg"
+version = "1.0.0"
+description = "x64dbg-style Textual TUI wrapper around LLDB for reverse engineers and malware analysts."
+readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["textual>=8,<9"]
+license = { text = "MIT" }
+authors = [{ name = "Liam Chugg" }]
+keywords = ["lldb", "debugger", "tui", "reverse-engineering", "malware-analysis", "macos"]
+
+# macdbg is run via ./macdbg.sh, not pip: LLDB's Python bindings are supplied
+# from the system install (`lldb -P`) and the UI dependencies are vendored in
+# vendor/. Neither can come from PyPI, so no runtime dependencies are declared
+# here. See the README for how to run it.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MZHeader/macdbg"
+Blog = "https://mzheader.tech/"
 
 [tool.setuptools.packages.find]
 include = ["macdbg*"]

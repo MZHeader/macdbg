@@ -8,14 +8,21 @@ A Textual TUI for Apple's system LLDB. Gives you a multi-pane view of the runnin
 
 For reverse engineers debugging macOS binaries who aren't very good at remembering CLI commands and want an experience closer to x64dbg.
 
-## How To Use It
+## Requirements
 
-As simple as:
+- macOS with the Xcode Command Line Tools installed (`xcode-select --install`) — this provides `/usr/bin/lldb` and `/usr/bin/python3`, both of which macdbg uses directly.
+
+There is nothing to `pip install`: LLDB's Python bindings come from the system LLDB (they are not on PyPI) and the UI dependencies (textual, rich, and friends) are vendored under [`vendor/`](vendor), so a clone is self-contained.
+
+## Install
+
 ```sh
+git clone https://github.com/MZHeader/macdbg
+cd macdbg
 ./macdbg.sh /path/to/your/binary
 ```
 
-Requires macOS with Xcode Command Line Tools installed.
+`macdbg.sh` is the entry point: it points `PYTHONPATH` at the system LLDB bindings (`lldb -P`) and the vendored dependencies, then launches the TUI. Run it from the clone.
 
 ## Syscall and Network Tracer
 
