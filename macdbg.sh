@@ -11,4 +11,4 @@ fi
 
 export PYTHONPATH="$(/usr/bin/lldb -P):$DIR:$VENDOR${PYTHONPATH:+:$PYTHONPATH}"
 cd "$DIR"
-exec /usr/bin/python3 -m lldb_wrapper "$@"
+exec /usr/bin/python3 -m macdbg "$@"
