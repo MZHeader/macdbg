@@ -200,7 +200,9 @@ class WrapperApp(App):
         bp_id = thread.GetStopReasonDataAtIndex(0)
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_anti_mach_hit,
-                        self.dbg.handle_direct_syscall_hit):
+                        self.dbg.handle_direct_syscall_hit,
+                        self.dbg.handle_fork_hit,
+                        self.dbg.handle_exec_hit):
             msg = handler(bp_id)
             if msg is not None:
                 self.console_pane.write("[anti-debug] " + msg)
@@ -311,6 +313,10 @@ class WrapperApp(App):
             ids.add(self.dbg.anti_mach_bp_id)
         if self.dbg.direct_syscall_bp_ids:
             ids.update(self.dbg.direct_syscall_bp_ids)
+        if self.dbg.fork_bp_ids:
+            ids.update(self.dbg.fork_bp_ids)
+        if self.dbg.exec_bp_ids:
+            ids.update(self.dbg.exec_bp_ids.keys())
         return ids
 
     def action_defenses(self) -> None:
@@ -328,6 +334,10 @@ class WrapperApp(App):
              self._toggle_hw_bps),
             ("{}  Hardware BPs for tracer breakpoints".format(tag(self.tracer.hardware)),
              self._toggle_tracer_hw),
+            ("{}  Fork suppression (fork/vfork return -1)".format(tag(bool(self.dbg.fork_bp_ids))),
+             self._toggle_fork_suppression),
+            ("{}  Outbound exec sandbox (system/popen/execve/posix_spawn)".format(tag(bool(self.dbg.exec_bp_ids))),
+             self._toggle_exec_sandbox),
         ]
         w, h = self.size
         self.push_screen(ContextMenu(items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
@@ -369,6 +379,22 @@ class WrapperApp(App):
             _, msg = self.dbg.disable_direct_syscall_scan()
         else:
             _, msg = self.dbg.enable_direct_syscall_scan()
+        self.console_pane.write("[anti-debug] " + msg)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_fork_suppression(self) -> None:
+        if self.dbg.fork_bp_ids:
+            _, msg = self.dbg.disable_fork_suppression()
+        else:
+            _, msg = self.dbg.enable_fork_suppression()
+        self.console_pane.write("[anti-debug] " + msg)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_exec_sandbox(self) -> None:
+        if self.dbg.exec_bp_ids:
+            _, msg = self.dbg.disable_exec_sandbox()
+        else:
+            _, msg = self.dbg.enable_exec_sandbox()
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 

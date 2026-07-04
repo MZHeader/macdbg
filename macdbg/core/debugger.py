@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import lldb
 
@@ -177,6 +177,8 @@ class Debugger:
     anti_ptrace_bp_id: int = 0
     anti_mach_bp_id: int = 0
     direct_syscall_bp_ids: Optional[List[int]] = None
+    fork_bp_ids: Optional[List[int]] = None
+    exec_bp_ids: Optional[Dict[int, str]] = None
 
     def toggle_breakpoint_at(self, addr: int) -> Tuple[str, int]:
         assert self.target is not None
@@ -329,6 +331,85 @@ class Debugger:
             return "blocked direct ptrace(PT_DENY_ATTACH) svc at {:#x}".format(pc)
         self.process.Continue()
         return "direct svc #{} passed (op={:#x})".format(x16, x0)
+
+    _FORK_SYMBOLS = ("fork", "vfork")
+    _EXEC_SYMBOLS = ("system", "popen", "execve", "execvp",
+                     "posix_spawn", "posix_spawnp")
+
+    def enable_fork_suppression(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.fork_bp_ids is None:
+            self.fork_bp_ids = []
+        if self.fork_bp_ids:
+            return True, "already enabled"
+        for name in self._FORK_SYMBOLS:
+            bp = self.target.BreakpointCreateByName(name)
+            if bp.IsValid():
+                self.fork_bp_ids.append(bp.GetID())
+        return True, "fork suppression armed ({} symbol(s))".format(len(self.fork_bp_ids))
+
+    def disable_fork_suppression(self) -> Tuple[bool, str]:
+        if not self.target or not self.fork_bp_ids:
+            return True, "already disabled"
+        for bp_id in self.fork_bp_ids:
+            self.target.BreakpointDelete(bp_id)
+        self.fork_bp_ids = []
+        return True, "fork suppression disabled"
+
+    def handle_fork_hit(self, bp_id: int) -> Optional[str]:
+        if not self.fork_bp_ids or bp_id not in self.fork_bp_ids or not self.process:
+            return None
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        fname = frame.GetFunctionName() or "fork"
+        ret = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("thread return -1", ret, False)
+        self.process.Continue()
+        return "blocked {}() — returned -1, no child spawned".format(fname)
+
+    def enable_exec_sandbox(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.exec_bp_ids is None:
+            self.exec_bp_ids = {}
+        if self.exec_bp_ids:
+            return True, "already enabled"
+        for name in self._EXEC_SYMBOLS:
+            bp = self.target.BreakpointCreateByName(name)
+            if bp.IsValid():
+                self.exec_bp_ids[bp.GetID()] = name
+        return True, "exec sandbox armed ({} symbol(s))".format(len(self.exec_bp_ids))
+
+    def disable_exec_sandbox(self) -> Tuple[bool, str]:
+        if not self.target or not self.exec_bp_ids:
+            return True, "already disabled"
+        for bp_id in self.exec_bp_ids:
+            self.target.BreakpointDelete(bp_id)
+        self.exec_bp_ids = {}
+        return True, "exec sandbox disabled"
+
+    def handle_exec_hit(self, bp_id: int) -> Optional[str]:
+        if not self.exec_bp_ids or bp_id not in self.exec_bp_ids or not self.process:
+            return None
+        name = self.exec_bp_ids[bp_id]
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if name in ("system", "popen"):
+            cmd_ptr = frame.FindRegister("x0").GetValueAsUnsigned()
+        else:
+            cmd_ptr = frame.FindRegister("x1").GetValueAsUnsigned() if name.startswith("posix_spawn") else frame.FindRegister("x0").GetValueAsUnsigned()
+        err = lldb.SBError()
+        cmd = self.process.ReadCStringFromMemory(cmd_ptr, 512, err) if cmd_ptr else ""
+        cmd = cmd if err.Success() else "<unreadable>"
+        ret = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("thread return -1", ret, False)
+        self.process.Continue()
+        return 'blocked {}("{}") — returned -1'.format(name, cmd[:120])
 
     def handle_anti_ptrace_hit(self, bp_id: int) -> Optional[str]:
         if bp_id != self.anti_ptrace_bp_id or not self.process:
