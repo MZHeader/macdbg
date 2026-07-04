@@ -194,6 +194,7 @@ class Debugger:
     fork_bp_ids: Optional[List[int]] = None
     fork_mode: str = "off"
     exec_bp_ids: Optional[Dict[int, str]] = None
+    exec_interactive: bool = False
 
     def toggle_breakpoint_at(self, addr: int) -> Tuple[str, int]:
         assert self.target is not None
@@ -434,7 +435,9 @@ class Debugger:
         self.exec_bp_ids = {}
         return True, "exec sandbox disabled"
 
-    def handle_exec_hit(self, bp_id: int) -> Optional[str]:
+    def peek_exec_hit(self, bp_id: int) -> Optional[Tuple[str, str]]:
+        """If this stop is at an exec BP, return (symbol, command_string) without
+        advancing the process. The caller decides whether to allow or block."""
         if not self.exec_bp_ids or bp_id not in self.exec_bp_ids or not self.process:
             return None
         name = self.exec_bp_ids[bp_id]
@@ -444,14 +447,31 @@ class Debugger:
         frame = thread.GetFrameAtIndex(0)
         if name in ("system", "popen"):
             cmd_ptr = frame.FindRegister("x0").GetValueAsUnsigned()
+        elif name.startswith("posix_spawn"):
+            cmd_ptr = frame.FindRegister("x1").GetValueAsUnsigned()
         else:
-            cmd_ptr = frame.FindRegister("x1").GetValueAsUnsigned() if name.startswith("posix_spawn") else frame.FindRegister("x0").GetValueAsUnsigned()
+            cmd_ptr = frame.FindRegister("x0").GetValueAsUnsigned()
         err = lldb.SBError()
         cmd = self.process.ReadCStringFromMemory(cmd_ptr, 512, err) if cmd_ptr else ""
         cmd = cmd if err.Success() else "<unreadable>"
-        ret = lldb.SBCommandReturnObject()
-        self.ci.HandleCommand("thread return -1", ret, False)
+        return name, cmd
+
+    def resolve_exec(self, block: bool) -> None:
+        if not self.process:
+            return
+        if block:
+            ret = lldb.SBCommandReturnObject()
+            self.ci.HandleCommand("thread return -1", ret, False)
         self.process.Continue()
+
+    def handle_exec_hit(self, bp_id: int) -> Optional[str]:
+        peeked = self.peek_exec_hit(bp_id)
+        if peeked is None:
+            return None
+        if self.exec_interactive:
+            return None
+        name, cmd = peeked
+        self.resolve_exec(block=True)
         return 'blocked {}("{}") — returned -1'.format(name, cmd[:120])
 
     def handle_anti_ptrace_hit(self, bp_id: int) -> Optional[str]:

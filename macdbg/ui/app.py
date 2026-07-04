@@ -100,7 +100,7 @@ class WrapperApp(App):
         Binding("ctrl+t", "toggle_trace", "Trace"),
         Binding("ctrl+k", "clear_trace", "Clear Trace"),
         Binding("ctrl+y", "cycle_trace_depth", "Trace Scope"),
-        Binding("ctrl+d", "defenses", "Defenses"),
+        Binding("ctrl+d", "defenses", "Defenses", priority=True),
         Binding("ctrl+c", "quit", "Quit", show=True, priority=True),
     ]
 
@@ -226,6 +226,12 @@ class WrapperApp(App):
         if thread.GetStopReasonDataCount() < 1:
             return False
         bp_id = thread.GetStopReasonDataAtIndex(0)
+        if self.dbg.exec_interactive:
+            peeked = self.dbg.peek_exec_hit(bp_id)
+            if peeked is not None:
+                name, cmd = peeked
+                self._prompt_exec_decision(name, cmd)
+                return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
@@ -370,6 +376,8 @@ class WrapperApp(App):
                  self._toggle_fork_identity),
                 ("{}  Outbound exec sandbox (system/popen/execve/posix_spawn)".format(tick(bool(self.dbg.exec_bp_ids))),
                  self._toggle_exec_sandbox),
+                ("{}  Exec sandbox: interactive (prompt per call instead of auto-block)".format(tick(self.dbg.exec_interactive)),
+                 self._toggle_exec_interactive),
             ]
         w, h = self.size
         self.push_screen(ToggleMenu(build_items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
@@ -422,6 +430,24 @@ class WrapperApp(App):
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
+    def _prompt_exec_decision(self, name: str, cmd: str) -> None:
+        def allow():
+            self.dbg.resolve_exec(block=False)
+            self.console_pane.write('[anti-debug] ALLOWED {}("{}")'.format(name, cmd[:120]))
+
+        def block():
+            self.dbg.resolve_exec(block=True)
+            self.console_pane.write('[anti-debug] blocked {}("{}") — returned -1'.format(name, cmd[:120]))
+
+        title = 'Outbound {}: "{}"'.format(name, cmd[:80])
+        items = [
+            ("Allow  (let it run and return normally)", allow),
+            ("Block  (return -1, do not run)",          block),
+        ]
+        self.console_pane.write("[anti-debug] {}? paused — choose Allow or Block".format(title))
+        w, h = self.size
+        self.push_screen(ContextMenu(items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
+
     def _toggle_exec_sandbox(self) -> None:
         if self.dbg.exec_bp_ids:
             _, msg = self.dbg.disable_exec_sandbox()
@@ -429,6 +455,11 @@ class WrapperApp(App):
             _, msg = self.dbg.enable_exec_sandbox()
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_exec_interactive(self) -> None:
+        self.dbg.exec_interactive = not self.dbg.exec_interactive
+        self.console_pane.write("[anti-debug] exec sandbox interactive mode: {}".format(
+            "ON" if self.dbg.exec_interactive else "OFF"))
 
     def action_clear_trace(self) -> None:
         self.trace_pane.clear()
