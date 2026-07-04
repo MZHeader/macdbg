@@ -235,10 +235,14 @@ class Tracer:
             return 0
         for name in SIGS:
             bp = target.BreakpointCreateByName(name)
-            if bp.IsValid() and bp.GetNumLocations() > 0:
+            if not bp.IsValid():
+                continue
+            if bp.GetNumLocations() > 0:
                 self._bp_ids.append(bp.GetID())
                 self._bp_to_name[bp.GetID()] = name
-        self.enabled = True
+            else:
+                target.BreakpointDelete(bp.GetID())
+        self.enabled = len(self._bp_ids) > 0
         return len(self._bp_ids)
 
     def disable(self, target: lldb.SBTarget) -> None:
