@@ -2,7 +2,7 @@
 
 A Textual TUI for Apple's system LLDB. Gives you a multi-pane view of the running process. Includes a lazy syscall & network tracer, defeats anti-debugging checks, and lets you edit registers and memory in place.
 
-![Main view](docs/img/main.png)
+![Main view](docs/img/main-v2.png)
 
 ## Who Is This For
 
