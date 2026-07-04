@@ -90,6 +90,7 @@ class WrapperApp(App):
         Binding("f6", "mem_scroll(1)", "Mem ↓"),
         Binding("ctrl+t", "toggle_trace", "Trace"),
         Binding("ctrl+k", "clear_trace", "Clear Trace"),
+        Binding("ctrl+y", "cycle_trace_depth", "Trace Scope"),
         Binding("ctrl+c", "quit", "Quit"),
     ]
 
@@ -270,6 +271,23 @@ class WrapperApp(App):
 
     def action_focus_mem(self) -> None:
         self.mem.addr_input.focus()
+
+    def action_cycle_trace_depth(self) -> None:
+        cycle = [
+            (1,  "strict (immediate caller must be user code)"),
+            (5,  "balanced (user code within top 5 frames)"),
+            (32, "wide (any user code on the stack)"),
+            (0,  "off (log every hit including framework internals)"),
+        ]
+        current = self.tracer.caller_depth
+        for i, (depth, _) in enumerate(cycle):
+            if depth == current:
+                nxt = cycle[(i + 1) % len(cycle)]
+                break
+        else:
+            nxt = cycle[1]
+        self.tracer.caller_depth = nxt[0]
+        self.console_pane.write("[trace] scope = {}".format(nxt[1]))
 
     def action_clear_trace(self) -> None:
         self.trace_pane.clear()

@@ -359,6 +359,7 @@ class Tracer:
         self._bp_to_name: Dict[int, str] = {}
         self.enabled = False
         self._exec_name: str = ""
+        self.caller_depth: int = 5
 
     def enable(self, target: lldb.SBTarget) -> Tuple[int, int]:
         if self.enabled or not target or not target.IsValid():
@@ -413,14 +414,18 @@ class Tracer:
         return None
 
     def _caller_is_noise(self, frame: lldb.SBFrame) -> bool:
-        if not self._exec_name:
+        if not self._exec_name or self.caller_depth <= 0:
             return False
         thread = frame.GetThread()
-        f = thread.GetFrameAtIndex(1)
-        if not f.IsValid():
-            return True
-        module = f.GetModule()
-        if not module.IsValid():
-            return True
-        modname = module.GetFileSpec().GetFilename() or ""
-        return modname != self._exec_name
+        limit = min(1 + self.caller_depth, thread.GetNumFrames())
+        for i in range(1, limit):
+            f = thread.GetFrameAtIndex(i)
+            if not f.IsValid():
+                break
+            module = f.GetModule()
+            if not module.IsValid():
+                continue
+            modname = module.GetFileSpec().GetFilename() or ""
+            if modname == self._exec_name:
+                return False
+        return True
