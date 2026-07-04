@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Run lldb_wrapper against Apple's system Python so `import lldb` resolves
-# against /Library/Developer/CommandLineTools/.../LLDB.framework.
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
-export PYTHONPATH="$(/usr/bin/lldb -P)${PYTHONPATH:+:$PYTHONPATH}"
+VENDOR="$DIR/vendor"
+
+export PYTHONPATH="$(/usr/bin/lldb -P):$DIR:$VENDOR${PYTHONPATH:+:$PYTHONPATH}"
+
+if ! /usr/bin/python3 -c "import textual" 2>/dev/null; then
+    echo "First-run setup: fetching textual into ./vendor..."
+    /usr/bin/python3 -m pip install --quiet --target "$VENDOR" 'textual>=8,<9'
+fi
+
 cd "$DIR"
 exec /usr/bin/python3 -m lldb_wrapper "$@"

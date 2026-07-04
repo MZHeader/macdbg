@@ -6,19 +6,15 @@ The disasm pane keeps the current instruction centered on every step. The regist
 
 ## Requirements
 
-macOS with Xcode Command Line Tools installed, so `/usr/bin/lldb` is present. The Python bindings ship with the CLT at `$(lldb -P)`. The wrapper uses the system Python (`/usr/bin/python3`, 3.9) because that's what Apple's `lldb` module was built against.
-
-Install Textual once into the system Python:
-
-```sh
-/usr/bin/python3 -m pip install --user textual
-```
+macOS with Xcode Command Line Tools installed, so `/usr/bin/lldb` is present. The wrapper uses the system Python (`/usr/bin/python3`, 3.9) because that's what Apple's `lldb` module was built against.
 
 ## Run
 
 ```sh
 ./run.sh /path/to/your/binary
 ```
+
+On first launch `run.sh` fetches Textual into a local `./vendor` directory. No system-wide install and nothing you need to activate.
 
 Point it at a binary you compiled yourself, or any non-signed Homebrew binary. System binaries under `/bin`, `/usr/bin`, and other SIP-protected paths are blocked from being debugged and will fail to launch.
 
