@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from typing import Dict, List, Optional
 
 from textual.app import App, ComposeResult
@@ -101,6 +103,8 @@ class WrapperApp(App):
         self._mem_follow: Optional[int] = None
         self.tracer = Tracer()
         self._trace_count = 0
+        self._output_stop = threading.Event()
+        self._output_thread: Optional[threading.Thread] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -142,6 +146,10 @@ class WrapperApp(App):
             on_output=lambda e: self.call_from_thread(self._on_output_event, e),
         )
         self.pump.start()
+        self._output_thread = threading.Thread(
+            target=self._pump_lldb_output, name="lldb-output", daemon=True,
+        )
+        self._output_thread.start()
         if self.program:
             try:
                 self.dbg.create_target(self.program)
@@ -153,10 +161,19 @@ class WrapperApp(App):
     def on_unmount(self) -> None:
         if self.pump:
             self.pump.stop()
+        self._output_stop.set()
         try:
             self.dbg.destroy()
         except Exception:
             pass
+
+    def _pump_lldb_output(self) -> None:
+        while not self._output_stop.is_set():
+            text = self.dbg.read_output()
+            if text:
+                self.call_from_thread(self.console_pane.write, text)
+            else:
+                time.sleep(0.05)
 
     def _on_stop_event(self, e: StopEvent) -> None:
         if e.state == lldb.eStateStopped:

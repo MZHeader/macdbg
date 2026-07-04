@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 import lldb
@@ -13,8 +14,22 @@ class Debugger:
         self.target: Optional[lldb.SBTarget] = None
         self.process: Optional[lldb.SBProcess] = None
         self.listener: lldb.SBListener = self.dbg.GetListener()
+
+        self._out_r_fd, self._out_w_fd = os.pipe()
+        os.set_blocking(self._out_r_fd, False)
+        self._out_w_file = os.fdopen(self._out_w_fd, "w", buffering=1)
+        self.dbg.SetOutputFileHandle(self._out_w_file, False)
+        self.dbg.SetErrorFileHandle(self._out_w_file, False)
+
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("settings set target.disable-aslr true", ret, False)
+
+    def read_output(self, max_bytes: int = 4096) -> str:
+        try:
+            data = os.read(self._out_r_fd, max_bytes)
+        except (BlockingIOError, OSError):
+            return ""
+        return data.decode("utf-8", errors="replace") if data else ""
 
     def create_target(self, path: str) -> lldb.SBTarget:
         err = lldb.SBError()
