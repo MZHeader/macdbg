@@ -1,46 +1,50 @@
 # macdbg
 
-A Textual TUI for Apple's system LLDB. Gives you a multi-pane view of the running process instead of typing `register read`, `disassemble`, and `memory read` on every stop.
+A Textual TUI for Apple's system LLDB. Gives you a multi-pane view of the running process.
 
-## What's in each pane
+![Main view](docs/img/main.png)
 
-**Disassembly.** The current instruction is centered every time the process stops. Right-click a row to toggle a breakpoint, run-to-cursor, follow the operand address into the memory pane, or copy the address.
+## Edit registers and memory in place
 
-**Registers.** Each value gets annotated with what it points at. The priority is: symbol lookup (`main+0x24`, `dyld`_main_thread`), then a printable string with a NUL terminator or a run of at least 12 printable characters, then a one-hop pointer chase to another symbol or string, then a raw 8-byte peek if the address falls inside a loaded module. Nothing shows for values that aren't confidently interpretable, which keeps random ints from being decorated with garbage. Right-click a row to follow the value in memory, set a breakpoint at that address, edit the value (opens a prompt prefilled with the current value so you can see what you're overwriting), copy the hex, or copy the decoded annotation.
+Right-click any register row and pick **Edit value**. The prompt is prefilled with the current value so you can see what you're overwriting, and Ctrl+U clears if you want to replace it all.
 
-**Stack and Memory.** Hex dumps, 16 bytes per row, native DataTable scroll. Right-click any row to follow the qword at that address, set a watchpoint on it, edit the row's bytes (prompt is prefilled with the current 16 bytes as space-separated hex), or copy the address. Edits go through `SBProcess.WriteMemory` and verify by reading back, so a failed write is reported instead of silently ignored.
+![Edit register](docs/img/edit-register.png)
 
-**Breakpoints.** Shows id, address, symbol, number of attached commands, condition, and enabled state. Right-click a row for four actions: Edit commands opens a full-screen editor for the command list (Ctrl+S saves, Esc cancels); Set condition takes an lldb expression; Toggle enabled flips the ✓ / × column; Delete removes the bp. Tracer breakpoints and anti-debug internal breakpoints are excluded from this pane so it doesn't fill with plumbing.
+Right-click any memory or stack row and pick **Edit bytes**. Same idea, prefilled with the current 16 bytes as space-separated hex.
 
-**Threads and Modules.** Live view of the process's threads and loaded images. Auto-populated on every stop, sorted by thread id and module load address respectively.
+![Edit memory](docs/img/edit-memory.png)
 
-**Trace.** Toggle with Ctrl+T. Sets pending breakpoints on file, process, and network entry points in libSystem. Each hit is logged with parsed arguments and the process auto-continues, so tracing does not stop execution.
+## Breakpoint scripting
 
-Coverage:
+The Breakpoints tab shows id, address, symbol, attached-command count, condition, and enabled state. Right-click any breakpoint row → **Edit commands** and you get a full-screen editor for the lldb command list. Ctrl+S saves and Esc cancels. One lldb command per line, exactly as if you'd used the interactive `breakpoint command add` form without the multi-line prompt.
 
-- File: `open`, `openat`, `close`, `read`, `write`, `pread`, `pwrite`, `fopen`, `fread`, `fwrite`, `fclose`, `stat`, `lstat`, `fstat`, `access`, `unlink`, `rename`, `chmod`, `mkdir`, `rmdir`, `dup`, `dup2`, `mmap`, plus the `$NOCANCEL` and `$INODE64` variants that libc uses under the hood.
-- Process: `popen`, `pclose`, `system`, `execve`, `execvp`, `posix_spawn`, `posix_spawnp`, `fork`, `vfork`, `kill`, `dlopen`, `dlsym`.
-- Network: `socket`, `connect`, `bind`, `listen`, `accept`, `send`, `recv`, `sendto`, `recvfrom`, `shutdown`, `setsockopt`, `getaddrinfo`, `gethostbyname`, `gethostbyname2`.
+![Breakpoint commands](docs/img/breakpoint-commands.png)
 
-Hits are filtered by caller depth. The default keeps a hit if user code appears in the top 5 callstack frames, which catches indirect dispatch through GCD blocks, `objc_msgSend`, `libcurl`, and CFNetwork without letting internal DNS resolution or CoreGraphics chatter through. Cycle strict (1) / balanced (5) / wide (32) / off (0) with Ctrl+Y. Ctrl+K clears the tab.
+## Syscall and network tracer
 
-**Console.** Bottom right. Type `:` to focus. Anything you enter goes into `SBCommandInterpreter.HandleCommand`, so every lldb command is available, including breakpoint scripts, watchpoints, `expression`, `image dump`, and so on. Output from auto-continue breakpoint scripts is captured through a pipe and printed here too, so `p (const char*)$x0` on a hit will show the string in the console rather than disappearing into the debugger's default output stream.
+Feeling lazy? Ctrl+T arms pending breakpoints on file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
 
-## Anti-anti-debug (Ctrl+D)
+![Trace tab](docs/img/trace.png)
 
-A menu of independent toggles, all off by default:
+## Anti-anti-debug
 
-- **PT_DENY_ATTACH bypass (symbol hook).** Sets a breakpoint on `ptrace`. When it fires with `x0 == PT_DENY_ATTACH`, we run `thread return 0` so the syscall never reaches the kernel and the process survives.
-- **Direct-syscall ptrace scan.** Walks the target's `__text` for every `svc #0x80` and sets a breakpoint at each site. At hit-time, checks `x16 == 26 && x0 == 31`. If both match, patches `x0 = 0` and advances `pc` past the svc. Catches inline-asm ptrace calls that skip the libc symbol.
-- **Mach exception port cloak.** Hooks `task_get_exception_ports`, writes 0 to the caller's `*masksCnt` buffer, and thread-returns 0. The sample sees a successful call reporting zero installed exception ports.
-- **Hardware breakpoints for user BPs.** Future `toggle_bp` calls use `-H`, so `__TEXT` bytes aren't patched with `brk`. Defeats integrity checks that hash a function's prologue.
-- **Hardware breakpoints for tracer BPs.** Same idea applied to the tracer's set of libSystem breakpoints. Toggle this before enabling the tracer, not after.
+Ctrl+D opens a menu of independent bypass toggles, all off by default:
 
-Verified end-to-end against a canary (`test/denyfour.c`) that runs all four checks in sequence.
+![Defenses menu](docs/img/debug-menu.png)
+
+- **PT_DENY_ATTACH** bypass breaks on `ptrace`, and if it's called with the deny flag we return `0` without calling the kernel.
+- **Direct-syscall ptrace scan** finds every raw svc `#0x80` in the target's `__text` and checks each one at runtime. If it's a `ptrace` deny call, we skip it. Catches `ptrace` calls that bypass libc.
+- **Mach exception port cloak** intercepts `task_get_exception_ports` and returns zero ports, so the sample thinks nothing is attached.
+- **Hardware BPs for user breakpoints** switches new breakpoints to hardware mode, which doesn't patch code bytes. Beats prologue-hash checks.
+- **Hardware BPs for tracer breakpoints** does the same for tracer breakpoints. Flip it before turning the tracer on.
 
 ## Command palette
 
-Ctrl+P opens a fuzzy palette over every lldb command, with lldb's own help text as the description. Type `bre` to filter for `breakpoint`, `mem rea` for `memory read`, `thread s` for the subcommands under `thread`. Pick a hit and it runs through the console.
+Ctrl+P opens a fuzzy palette over every lldb command, with lldb's own help text as the description.
+
+![Command palette](docs/img/ctrl-p.png)
+
+![Fuzzy search](docs/img/fuzzy-search.png)
 
 ## Requirements
 
@@ -49,12 +53,16 @@ macOS with Xcode Command Line Tools installed, so `/usr/bin/lldb` is present. Th
 ## Run
 
 ```sh
-./run.sh /path/to/your/binary
+./macdbg.sh /path/to/your/binary
 ```
 
-Point it at a binary you compiled yourself, or any non-signed Homebrew binary. System binaries under `/bin`, `/usr/bin`, and other SIP-protected paths are blocked from being debugged and will fail to launch.
+`macdbg.sh` sets `PYTHONPATH=$(lldb -P)` so `import lldb` resolves to the framework build. ASLR is disabled on every launch so addresses stay stable across runs.
 
-`run.sh` sets `PYTHONPATH=$(lldb -P)` so `import lldb` resolves to the framework build. ASLR is disabled on every launch so addresses stay stable across runs.
+## Themes
+
+Lots of themes to choose from :)
+
+![Themes](docs/img/theme.png)
 
 ## Keys
 

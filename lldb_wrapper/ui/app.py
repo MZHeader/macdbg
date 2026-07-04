@@ -57,7 +57,7 @@ try:
     import lldb
 except ImportError as e:
     raise SystemExit(
-        "Could not import lldb. Run via ./run.sh (which sets PYTHONPATH=$(lldb -P))."
+        "Could not import lldb. Run via ./macdbg.sh (which sets PYTHONPATH=$(lldb -P))."
     ) from e
 
 
