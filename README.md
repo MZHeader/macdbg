@@ -113,19 +113,39 @@ Lots of themes to choose from :)
 
 | Key | Action |
 |-----|--------|
+| F2 | Toggle breakpoint at pc |
+| F5 | Disassembly back to pc (after browsing) |
 | F7 | Step in (instruction) |
 | F8 | Step over (instruction) |
 | F9 | Continue |
-| F2 | Toggle breakpoint at pc |
 | Enter (in disasm) | Follow operand address in the memory pane |
 | `:` | Focus the console command bar |
+| Ctrl+B | Interrupt a running process |
+| Ctrl+D | Defenses menu |
+| Ctrl+F | Search process memory (target scope by default; prefix `all:` for libraries) |
 | Ctrl+G | Focus the memory follow-address input |
+| Ctrl+K | Clear the trace tab |
 | Ctrl+P | Command palette |
 | Ctrl+T | Toggle the tracer |
-| Ctrl+K | Clear the trace tab |
 | Ctrl+Y | Cycle trace scope (strict / balanced / wide / off) |
-| Ctrl+D | Defenses menu |
+| Ctrl+\\ | Toggle console auto-scroll |
+| Alt+Left | Memory follow — back one address in history |
 | Ctrl+C | Quit |
 | Right click on a row | Pane-specific context menu |
 
 Whatever you type in the console goes into `SBCommandInterpreter.HandleCommand`. If a command would trigger an interactive Y/N prompt (`run`, `br del`), the wrapper answers it for you before the command reaches lldb.
+
+## Additional Features
+
+- **Memory search** with target-only scope by default (binary + heap + stack); `all:` prefix widens to loaded libraries. Ctrl+F Enter cycles to the next hit.
+- **Per-binary persistence** at `~/.macdbg/<sha256>.json`. Breakpoints (with conditions and command scripts), comments, and bookmarks come back next time you open the same binary.
+- **Disasm comments** — right-click a disasm row → **Add comment**. Persists across sessions and renders as a bold gold `← note` in the disasm line.
+- **Jump arrow gutter** — left-side control flow lines for every branch whose source and target are both visible. At the current pc, the arrow is colored **green if the branch will be taken** and **red if not**, evaluated live from register values and CPSR flags.
+- **Function name markers** — `▼ funcname:` banner rows at function boundaries wherever lldb has symbol info.
+- **Inline dereference hints** — `adrp + add` and `adrp + ldr` pairs get a bright blue `; = 0x…  "resolved string"` or `; load @ 0x…  symbol` comment showing what the address materializes to, right in the disasm line.
+- **Follow in disassembly** — right-click a call/branch operand or a register value → browse that address without moving pc. F5 snaps back.
+- **Call Stack tab** — full backtrace of the selected thread with pc, function, and module.
+- **Attach preserves the target** — quitting after `--attach <pid>` detaches instead of killing.
+- **Rich stop messages** — `[stop] breakpoint #3.1 at 0x100000540 in main`, `[stop] signal 11 at 0x0`, etc., instead of raw state codes. Process exit prints the actual exit code.
+- **Live tab titles** — trace tab shows `[ON, scope: balanced]` and updates as you cycle scope; memory pane title shows the current follow address and `hit N/M` during a search.
+- **`clear-state` console command** — Yes/Cancel modal, drops the per-binary state file and all user breakpoints.
