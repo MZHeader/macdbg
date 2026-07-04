@@ -173,6 +173,9 @@ class Debugger:
             size //= 2
         return b""
 
+    hw_breakpoints: bool = False
+    anti_ptrace_bp_id: int = 0
+
     def toggle_breakpoint_at(self, addr: int) -> Tuple[str, int]:
         assert self.target is not None
         for i in range(self.target.GetNumBreakpoints()):
@@ -183,8 +186,54 @@ class Debugger:
                     bp_id = bp.GetID()
                     self.target.BreakpointDelete(bp_id)
                     return ("removed", bp_id)
+        if self.hw_breakpoints:
+            ret = lldb.SBCommandReturnObject()
+            self.ci.HandleCommand("breakpoint set -H -a {:#x}".format(addr), ret, False)
+            for i in range(self.target.GetNumBreakpoints()):
+                bp = self.target.GetBreakpointAtIndex(i)
+                for j in range(bp.GetNumLocations()):
+                    if bp.GetLocationAtIndex(j).GetLoadAddress() == addr:
+                        return ("added (HW)", bp.GetID())
+            return ("added (HW)", 0)
         bp = self.target.BreakpointCreateByAddress(addr)
         return ("added", bp.GetID())
+
+    def enable_anti_ptrace(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.anti_ptrace_bp_id:
+            return True, "already enabled"
+        bp = self.target.BreakpointCreateByName("ptrace")
+        if not bp.IsValid():
+            return False, "ptrace symbol not found"
+        self.anti_ptrace_bp_id = bp.GetID()
+        return True, "PT_DENY_ATTACH bypass armed (bp #{})".format(bp.GetID())
+
+    def disable_anti_ptrace(self) -> Tuple[bool, str]:
+        if not self.target or not self.anti_ptrace_bp_id:
+            return True, "already disabled"
+        self.target.BreakpointDelete(self.anti_ptrace_bp_id)
+        self.anti_ptrace_bp_id = 0
+        return True, "PT_DENY_ATTACH bypass disabled"
+
+    def handle_anti_ptrace_hit(self, bp_id: int) -> Optional[str]:
+        if bp_id != self.anti_ptrace_bp_id or not self.process:
+            return None
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return None
+        req = frame.FindRegister("x0").GetValueAsUnsigned()
+        PT_DENY_ATTACH = 31
+        if req != PT_DENY_ATTACH:
+            self.process.Continue()
+            return "ptrace(op={}) allowed through".format(req)
+        ret = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("thread return 0", ret, False)
+        self.process.Continue()
+        return "blocked ptrace(PT_DENY_ATTACH) — returned 0 without syscall"
 
     def breakpoints(self, exclude_ids: Optional[set] = None) -> List[Tuple[int, int, str, int, bool, str]]:
         out: List[Tuple[int, int, str, int, bool, str]] = []

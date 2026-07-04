@@ -91,6 +91,7 @@ class WrapperApp(App):
         Binding("ctrl+t", "toggle_trace", "Trace"),
         Binding("ctrl+k", "clear_trace", "Clear Trace"),
         Binding("ctrl+y", "cycle_trace_depth", "Trace Scope"),
+        Binding("ctrl+d", "defenses", "Defenses"),
         Binding("ctrl+c", "quit", "Quit"),
     ]
 
@@ -178,6 +179,8 @@ class WrapperApp(App):
 
     def _on_stop_event(self, e: StopEvent) -> None:
         if e.state == lldb.eStateStopped:
+            if self._handle_anti_debug_hit():
+                return
             if self.tracer.enabled and self._handle_possible_trace_hit():
                 return
             self.console_pane.write("[event] state={} ({})".format(e.description, e.state))
@@ -186,6 +189,26 @@ class WrapperApp(App):
             self.console_pane.write("process exited.")
         else:
             self.console_pane.write("[event] state={} ({})".format(e.description, e.state))
+
+    def _handle_anti_debug_hit(self) -> bool:
+        process = self.dbg.process
+        if not process or not process.IsValid():
+            return False
+        if not self.dbg.anti_ptrace_bp_id:
+            return False
+        thread = process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return False
+        if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
+            return False
+        if thread.GetStopReasonDataCount() < 1:
+            return False
+        bp_id = thread.GetStopReasonDataAtIndex(0)
+        msg = self.dbg.handle_anti_ptrace_hit(bp_id)
+        if msg is None:
+            return False
+        self.console_pane.write("[anti-debug] " + msg)
+        return True
 
     def _handle_possible_trace_hit(self) -> bool:
         process = self.dbg.process
@@ -239,7 +262,7 @@ class WrapperApp(App):
             data = self.dbg.read_memory(follow, 16 * 64)
             self.mem.render_bytes(follow, data)
 
-        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
         self.threads_pane.render_rows(self.dbg.threads())
         self.modules_pane.render_rows(self.dbg.modules())
 
@@ -264,7 +287,7 @@ class WrapperApp(App):
             return
         op, bp_id = self.dbg.toggle_breakpoint_at(pc)
         self.console_pane.write("breakpoint {} #{} @ {:#x}".format(op, bp_id, pc))
-        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     def action_focus_cmd(self) -> None:
         self.console_pane.cmd.focus()
@@ -288,6 +311,37 @@ class WrapperApp(App):
             nxt = cycle[1]
         self.tracer.caller_depth = nxt[0]
         self.console_pane.write("[trace] scope = {}".format(nxt[1]))
+
+    def _hidden_bp_ids(self) -> set:
+        ids = set(self.tracer._bp_to_name)
+        if self.dbg.anti_ptrace_bp_id:
+            ids.add(self.dbg.anti_ptrace_bp_id)
+        return ids
+
+    def action_defenses(self) -> None:
+        deny_on = bool(self.dbg.anti_ptrace_bp_id)
+        hw_on = self.dbg.hw_breakpoints
+        items = [
+            ("{} PT_DENY_ATTACH bypass".format("[on]  disable" if deny_on else "[off] enable"),
+             self._toggle_deny_attach_bypass),
+            ("{} Hardware breakpoints for new BPs".format("[on]  disable" if hw_on else "[off] enable"),
+             self._toggle_hw_bps),
+        ]
+        w, h = self.size
+        self.push_screen(ContextMenu(items, x=max(0, w // 2 - 20), y=max(0, h // 3)))
+
+    def _toggle_deny_attach_bypass(self) -> None:
+        if self.dbg.anti_ptrace_bp_id:
+            _, msg = self.dbg.disable_anti_ptrace()
+        else:
+            _, msg = self.dbg.enable_anti_ptrace()
+        self.console_pane.write("[anti-debug] " + msg)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_hw_bps(self) -> None:
+        self.dbg.hw_breakpoints = not self.dbg.hw_breakpoints
+        self.console_pane.write("[anti-debug] hardware breakpoints for new BPs: {}".format(
+            "ON" if self.dbg.hw_breakpoints else "OFF"))
 
     def action_clear_trace(self) -> None:
         self.trace_pane.clear()
@@ -316,7 +370,7 @@ class WrapperApp(App):
                 self.trace_pane.table.focus()
             except Exception:
                 pass
-        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     def action_mem_scroll(self, direction: int) -> None:
         base = self._mem_follow if self._mem_follow is not None else (self.dbg.pc() or 0)
@@ -451,7 +505,7 @@ class WrapperApp(App):
     def _toggle_bp(self, addr: int) -> None:
         op, bp_id = self.dbg.toggle_breakpoint_at(addr)
         self.console_pane.write("breakpoint {} #{} @ {:#x}".format(op, bp_id, addr))
-        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     def _run_to(self, addr: int) -> None:
         self._run_palette_command("breakpoint set -o true -a {:#x}".format(addr))
@@ -498,7 +552,7 @@ class WrapperApp(App):
                 self.console_pane.write("bp #{}: set {} command(s)".format(bp_id, len(lines)))
             else:
                 self.console_pane.write("bp #{}: could not set commands".format(bp_id), error=True)
-            self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+            self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
         self.run_worker(_run(), exclusive=True)
 
     def _prompt_edit_bp_condition(self, bp_id: int) -> None:
@@ -516,7 +570,7 @@ class WrapperApp(App):
                 return
             self.dbg.set_bp_condition(bp_id, val.strip())
             self.console_pane.write("bp #{}: condition = {!r}".format(bp_id, val.strip()))
-            self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+            self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
         self.run_worker(_run(), exclusive=True)
 
     def _toggle_bp_enabled(self, bp_id: int) -> None:
@@ -524,13 +578,13 @@ class WrapperApp(App):
         enabled = next((r[4] for r in rows if r[0] == bp_id), True)
         self.dbg.set_bp_enabled(bp_id, not enabled)
         self.console_pane.write("bp #{}: {}".format(bp_id, "disabled" if enabled else "enabled"))
-        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     def _delete_bp(self, bp_id: int) -> None:
         if self.dbg.target:
             self.dbg.target.BreakpointDelete(bp_id)
         self.console_pane.write("bp #{} deleted".format(bp_id))
-        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=set(self.tracer._bp_to_name)))
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     def _prompt_edit_reg(self, name: str, current: str) -> None:
         async def _run() -> None:

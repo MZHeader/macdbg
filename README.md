@@ -36,6 +36,7 @@ Point it at a binary you compiled yourself, or any non-signed Homebrew binary. S
 | Ctrl+P | Command palette (fuzzy over lldb commands, subcommands too) |
 | Ctrl+T | Toggle the tracer (auto BPs on libc I/O and network calls) |
 | Ctrl+K | Clear the trace tab |
+| Ctrl+D | Defenses menu (PT_DENY_ATTACH bypass, hardware BP mode) |
 | Ctrl+C | Quit |
 | Right click on a row | Context menu (goto, breakpoint, edit, copy) |
 
