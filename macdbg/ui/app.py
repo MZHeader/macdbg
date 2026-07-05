@@ -280,6 +280,11 @@ class WrapperApp(App):
 
     def _on_stop_event(self, e: StopEvent) -> None:
         if e.state == lldb.eStateStopped:
+            # In a multithreaded target lldb often leaves a parked thread
+            # selected, so a breakpoint hit on a worker looks like a reason-less
+            # stop and the handlers below (which read the selected thread) miss
+            # it. Pin the selection to the thread that actually stopped first.
+            self.dbg.select_stopped_thread()
             if self._handle_anti_debug_hit():
                 return
             if self.tracer.enabled and self._handle_possible_trace_hit():
