@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import struct
+import time
 from typing import Dict, List, Optional, Tuple
 
 import lldb
 
-from .state import BinaryState, StoredBP, Patch, load_for
+from .state import BinaryState, StoredBP, Patch, load_for, STATE_DIR
 
 
 def _looks_like_string(span: bytes, wanted: set) -> bool:
@@ -703,9 +704,32 @@ class Debugger:
         self.exec_bp_ids = {}
         return True, "exec sandbox disabled"
 
-    def peek_exec_hit(self, bp_id: int) -> Optional[Tuple[str, str]]:
-        """If stopped at an exec BP, return (symbol, command) without continuing.
-        Caller decides allow or block."""
+    def _read_full_cstr(self, addr: int, cap: int = 1 << 20) -> str:
+        """Whole C string at addr, up to cap bytes. Unlike the tracer's 256-byte
+        preview this keeps everything, so a dropper's inline script survives."""
+        if not addr or not self.process:
+            return ""
+        err = lldb.SBError()
+        s = self.process.ReadCStringFromMemory(addr, cap, err)
+        return s if (err.Success() and s) else ""
+
+    def _read_argv(self, addr: int, max_args: int = 8192) -> List[str]:
+        """Walk a NULL-terminated char** and read each argument in full. This is
+        where osascript -e <script> or sh -c <script> hides the real payload."""
+        if not addr or not self.process:
+            return []
+        out: List[str] = []
+        err = lldb.SBError()
+        for i in range(max_args):
+            slot = self.process.ReadPointerFromMemory(addr + i * 8, err)
+            if not err.Success() or slot == 0:
+                break
+            out.append(self._read_full_cstr(slot))
+        return out
+
+    def _capture_exec(self, bp_id: int) -> Optional[dict]:
+        """Full argument capture for the exec BP we're paused on. Reads the whole
+        command string and, for exec/posix_spawn, the entire argv vector."""
         if not self.exec_bp_ids or bp_id not in self.exec_bp_ids or not self.process:
             return None
         name = self.exec_bp_ids[bp_id]
@@ -713,16 +737,79 @@ class Debugger:
         if not thread or not thread.IsValid():
             return None
         frame = thread.GetFrameAtIndex(0)
+
+        def reg(n: str) -> int:
+            r = frame.FindRegister(n)
+            return r.GetValueAsUnsigned() if r.IsValid() else 0
+
         if name in ("system", "popen"):
-            cmd_ptr = frame.FindRegister("x0").GetValueAsUnsigned()
-        elif name.startswith("posix_spawn"):
-            cmd_ptr = frame.FindRegister("x1").GetValueAsUnsigned()
-        else:
-            cmd_ptr = frame.FindRegister("x0").GetValueAsUnsigned()
-        err = lldb.SBError()
-        cmd = self.process.ReadCStringFromMemory(cmd_ptr, 512, err) if cmd_ptr else ""
-        cmd = cmd if err.Success() else "<unreadable>"
-        return name, cmd
+            return {"sym": name, "path": None,
+                    "cmd": self._read_full_cstr(reg("x0")), "argv": None}
+        if name in ("execve", "execvp"):
+            return {"sym": name, "path": self._read_full_cstr(reg("x0")),
+                    "cmd": None, "argv": self._read_argv(reg("x1"))}
+        if name.startswith("posix_spawn"):
+            return {"sym": name, "path": self._read_full_cstr(reg("x1")),
+                    "cmd": None, "argv": self._read_argv(reg("x4"))}
+        return {"sym": name, "path": self._read_full_cstr(reg("x0")),
+                "cmd": None, "argv": None}
+
+    @staticmethod
+    def _exec_preview(cap: dict) -> str:
+        if cap["cmd"] is not None:
+            return cap["cmd"] or "<unreadable>"
+        parts = [cap["path"] or "<unreadable>"]
+        argv = cap["argv"] or []
+        rest = argv[1:] if (argv and argv[0] == cap["path"]) else argv
+        if rest:
+            parts.append(" ".join(rest))
+        return " ".join(parts)
+
+    @staticmethod
+    def exec_payload_len(cap: dict) -> int:
+        if cap["cmd"] is not None:
+            return len(cap["cmd"])
+        return len(cap["path"] or "") + sum(len(a) for a in (cap["argv"] or []))
+
+    def peek_exec_hit(self, bp_id: int) -> Optional[Tuple[str, str]]:
+        """If stopped at an exec BP, return (symbol, preview) without continuing.
+        The preview now includes argv, so callers see the start of the actual
+        payload rather than just the interpreter path. Caller decides what next."""
+        cap = self._capture_exec(bp_id)
+        if cap is None:
+            return None
+        return cap["sym"], self._exec_preview(cap)
+
+    def dump_exec_payload(self, bp_id: int) -> Optional[Tuple[str, int]]:
+        """Write the full command / argv for the exec we're paused on to
+        ~/.macdbg/dumps/ and return (path, bytes). None if not on an exec BP."""
+        cap = self._capture_exec(bp_id)
+        if cap is None:
+            return None
+        lines = ["symbol: {}".format(cap["sym"])]
+        if cap["path"] is not None:
+            lines.append("path: {}".format(cap["path"]))
+        if cap["cmd"] is not None:
+            lines.append("command:")
+            lines.append(cap["cmd"])
+        if cap["argv"] is not None:
+            lines.append("argv ({} entries):".format(len(cap["argv"])))
+            for i, a in enumerate(cap["argv"]):
+                lines.append("  [{}] {}".format(i, a))
+        body = "\n".join(lines) + "\n"
+        dumps = os.path.join(STATE_DIR, "dumps")
+        os.makedirs(dumps, exist_ok=True)
+        pid = self.process.GetProcessID() if self.process else 0
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(dumps, "{}-pid{}-{}.txt".format(stamp, pid, cap["sym"]))
+        n = 0
+        while os.path.exists(path):
+            n += 1
+            path = os.path.join(
+                dumps, "{}-pid{}-{}-{}.txt".format(stamp, pid, cap["sym"], n))
+        with open(path, "w") as f:
+            f.write(body)
+        return path, len(body)
 
     def resolve_exec(self, decision: str = "block", name: str = "") -> None:
         if not self.process:
@@ -743,15 +830,30 @@ class Debugger:
         # success, so 0 is the best available for those.
         return 0
 
+    EXEC_LARGE_PAYLOAD = 200
+
+    def autodump_large_exec(self, bp_id: int) -> Optional[Tuple[str, int]]:
+        """Dump the full payload only when it's too big to fit the preview, so a
+        20kb dropper script is never silently lost whatever the caller decides."""
+        cap = self._capture_exec(bp_id)
+        if cap is None or self.exec_payload_len(cap) <= self.EXEC_LARGE_PAYLOAD:
+            return None
+        return self.dump_exec_payload(bp_id)
+
     def handle_exec_hit(self, bp_id: int) -> Optional[str]:
-        peeked = self.peek_exec_hit(bp_id)
-        if peeked is None:
+        cap = self._capture_exec(bp_id)
+        if cap is None:
             return None
         if self.exec_interactive:
             return None
-        name, cmd = peeked
+        name = cap["sym"]
+        note = ""
+        dumped = self.autodump_large_exec(bp_id)
+        if dumped:
+            note = " — full payload ({} B) → {}".format(dumped[1], dumped[0])
         self.resolve_exec("block", name)
-        return 'blocked {}("{}") — returned -1'.format(name, cmd[:120])
+        return 'blocked {}("{}") — returned -1{}'.format(
+            name, self._exec_preview(cap)[:120], note)
 
     def handle_anti_ptrace_hit(self, bp_id: int) -> Optional[str]:
         if bp_id != self.anti_ptrace_bp_id or not self.process:

@@ -388,7 +388,12 @@ class WrapperApp(App):
                     if caller:
                         self.console_pane.write(
                             "[anti-debug] {} called from {:#x}".format(name, caller))
-                    self._prompt_exec_decision(name, cmd)
+                    dumped = self.dbg.autodump_large_exec(bp_id)
+                    if dumped:
+                        self.console_pane.write(
+                            "[anti-debug] full payload ({} B) → {}".format(
+                                dumped[1], dumped[0]))
+                    self._prompt_exec_decision(name, cmd, bp_id)
                     return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_anti_mach_hit,
@@ -791,7 +796,19 @@ class WrapperApp(App):
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
-    def _prompt_exec_decision(self, name: str, cmd: str) -> None:
+    def _dump_exec_payload(self, bp_id: Optional[int]) -> None:
+        if bp_id is None:
+            return
+        dumped = self.dbg.dump_exec_payload(bp_id)
+        if dumped:
+            self.console_pane.write(
+                "[anti-debug] full payload ({} B) → {}".format(dumped[1], dumped[0]))
+        else:
+            self.console_pane.write(
+                "[anti-debug] nothing to dump (not on an exec call)", error=True)
+
+    def _prompt_exec_decision(self, name: str, cmd: str,
+                              bp_id: Optional[int] = None) -> None:
         def allow():
             self.dbg.resolve_exec("allow", name)
             self.console_pane.write('[anti-debug] ALLOWED {}("{}")'.format(name, cmd[:120]))
@@ -806,6 +823,12 @@ class WrapperApp(App):
             self.dbg.resolve_exec("block", name)
             self.console_pane.write('[anti-debug] blocked {}("{}") — returned -1'.format(name, cmd[:120]))
 
+        def dump():
+            # Capture then re-open the prompt so the payload is saved without
+            # yet deciding whether the call runs.
+            self._dump_exec_payload(bp_id)
+            self._prompt_exec_decision(name, cmd, bp_id)
+
         def default_block():
             self.dbg.resolve_exec("block", name)
             self.console_pane.write(
@@ -817,9 +840,10 @@ class WrapperApp(App):
             ("Allow  (let it run for real)",                     allow),
             ("Fake success  (do not run, return success)",       fake),
             ("Block  (do not run, return -1/failure)",           block),
+            ("Dump payload to file  (then choose)",              dump),
         ]
         self.console_pane.write(
-            "[anti-debug] {}? paused — Allow / Fake success / Block (Esc = Block)".format(title))
+            "[anti-debug] {}? paused — Allow / Fake success / Block / Dump (Esc = Block)".format(title))
         w, h = self.size
         self.push_screen(ContextMenu(
             items,
