@@ -1,12 +1,7 @@
-// DYLD interposer for whole-process-tree syscall tracing.
-//
-// lldb on macOS cannot follow a fork into the child (no PTRACE_TRACEFORK, and an
-// attached debugger's breakpoints never fire in a forked child). DYLD_INSERT_
-// LIBRARIES is inherited across fork and re-applied by dyld on exec into any
-// non-restricted binary, so an interposed dylib rides along into every child of
-// the tree that isn't a SIP-protected system binary. Each intercepted call is
-// written, pid-tagged, to the path in MACDBG_TRACE_OUT, which macdbg tails and
-// merges into the trace pane.
+// DYLD interposer for tracing the whole fork tree, which lldb can't follow on
+// macOS. DYLD_INSERT_LIBRARIES is inherited across fork, so this rides into
+// every child that isn't a SIP-protected binary and writes each call, pid-
+// tagged, to MACDBG_TRACE_OUT for macdbg to tail.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,8 +29,8 @@ static int out_fd(void) {
     return trace_fd;
 }
 
-// One record per line. Buffer previews are hex so binary C2 traffic survives the
-// text channel; macdbg decodes and formats them like its own tracer rows.
+// One record per line. Buffers are hex so binary traffic survives the text
+// channel; macdbg decodes them on the far side.
 static void emit(const char *rec) {
     int fd = out_fd();
     if (fd < 0) return;

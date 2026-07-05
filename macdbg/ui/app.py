@@ -313,8 +313,7 @@ class WrapperApp(App):
         return "<{}B: {}{}>".format(len(b), b[:24].hex(), "…" if len(b) > 24 else "")
 
     def _format_interpose(self, fields: List[str]) -> Optional[tuple]:
-        # pid<TAB>fn<TAB>...  — the root pid is the process lldb already traces,
-        # so skip it here and only surface the children lldb can't reach.
+        # Skip the root pid; lldb already traces it. Only surface the children.
         if len(fields) < 2:
             return None
         try:
@@ -430,9 +429,8 @@ class WrapperApp(App):
         return "[stop] at {:#x}{} (reason={})".format(pc, where, reason)
 
     def _exec_caller_site(self) -> Optional[int]:
-        # First backtrace frame that lives in the target binary — the sample's
-        # own code that made the call. Its pc is the return address, so the bl
-        # sits just above it in the disasm.
+        # First backtrace frame inside the target binary: the sample's own call
+        # site. Its pc is the return address, so the bl sits just above it.
         thread = self.dbg._thread()
         if thread is None or not self.dbg.target:
             return None
@@ -448,10 +446,9 @@ class WrapperApp(App):
 
     @staticmethod
     def _stop_bp_ids(thread) -> List[int]:
-        # A breakpoint stop reports (bp_id, loc_id) pairs. When a symbol carries
-        # more than one breakpoint — the tracer and the exec sandbox both hook
-        # system/posix_spawn/… — every id lands here, so anti-debug handling must
-        # look at all of them rather than trusting index 0.
+        # A breakpoint stop reports (bp_id, loc_id) pairs. A symbol can carry
+        # more than one breakpoint (the tracer and exec sandbox both hook
+        # system/posix_spawn), so check every id, not just index 0.
         ids: List[int] = []
         n = thread.GetStopReasonDataCount()
         i = 0

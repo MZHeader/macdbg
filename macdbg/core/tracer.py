@@ -361,10 +361,8 @@ def _eval_str(frame, expr: str) -> Optional[str]:
 
 
 def _f_task_resume(frame, p):
-    # -[NSURLSessionTask resume] fires once per request, covering the default
-    # GET that never calls setHTTPMethod:. The method lives on the request
-    # object, so read it (and the request URL) via the runtime. Returns None if
-    # the eval fails so a bad hit produces no row.
+    # resume fires once per request, so it catches the default GET too. Read the
+    # method and URL off the request via the runtime; None on eval failure.
     task = _reg(frame, "x0")
     if not task:
         return None
@@ -389,10 +387,7 @@ def _f_cfurl_bytes(frame, p):
 
 
 def _f_tls_write(frame, p):
-    # The plaintext side of TLS: SSL_write / SSLWrite hand the cleartext request
-    # to the library, which encrypts before it reaches send(). Buffer is x1,
-    # length x2 for all of them, so the Telegram URL and bot token show here
-    # even though the socket only ever carries ciphertext.
+    # Plaintext side of TLS, before encryption; buffer x1, length x2.
     name = (frame.GetFunctionName() or "SSL_write").lstrip("_")
     buf = _reg(frame, "x1")
     n = _reg(frame, "x2")
@@ -401,10 +396,8 @@ def _f_tls_write(frame, p):
 
 
 def _f_aead_seal(frame, p):
-    # BoringSSL / aws-lc AEAD seal, the layer rustls encrypts through when it has
-    # no C SSL_write symbol. Signature is stable: plaintext is the 7th/8th args
-    # (in = x6, in_len = x7). The sealed record is the HTTP bytes plus a trailing
-    # content-type byte, so the URL still reads out.
+    # BoringSSL/aws-lc AEAD seal (rustls path when there's no SSL_write).
+    # Plaintext is the in/in_len args: x6, x7.
     name = (frame.GetFunctionName() or "EVP_AEAD_CTX_seal").lstrip("_")
     buf = _reg(frame, "x6")
     n = _reg(frame, "x7")
@@ -413,22 +406,17 @@ def _f_aead_seal(frame, p):
 
 
 def _f_rustls_write(frame, p):
-    # rustls has no C SSL_write; the app hands its plaintext to
-    # <rustls::conn::connection::Writer as std::io::Write>::write, a clean
-    # &[u8] in x1/x2. The symbol carries a per-build hash, so it is matched by
-    # regex rather than exact name, and vanishes entirely if the binary is
-    # stripped.
+    # rustls Writer::write, plaintext &[u8] in x1/x2. Matched by regex since the
+    # symbol has a per-build hash; gone entirely if the binary is stripped.
     buf = _reg(frame, "x1")
     n = _reg(frame, "x2")
     data = _read_mem(p, buf, n, 1024)
     return "rustls Writer::write({} B) {}".format(n, _fmt_text(data))
 
 
-# (regex pattern, category, formatter) for symbols whose names are not stable
-# enough to list exactly — mangled Rust, versioned C symbols, and the like.
-# Anchor hard: the "rustls..conn" prefix exists only in a statically linked
-# rustls, so no other crate or system library can collide, and "::write::h"
-# ties it to the write method alone (not flush/write_all/write_vectored).
+# (pattern, category, formatter) for symbols with per-build hashes. The
+# "rustls..conn" prefix only exists in statically linked rustls so nothing else
+# collides; "::write::h" matches write, not flush/write_all/write_vectored.
 REGEX_SIGS: List[Tuple[str, str, Callable]] = [
     (r"rustls..conn.*Writer.*::write::h", NET, _f_rustls_write),
 ]

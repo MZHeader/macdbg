@@ -185,10 +185,9 @@ class Debugger:
         # /usr/sbin like system_profiler. Inherit our environment, minus the
         # PYTHONPATH macdbg.sh injected for its own use.
         env = ["{}={}".format(k, v) for k, v in os.environ.items() if k != "PYTHONPATH"]
-        # Whole-tree syscall tracing: an interposer dylib rides DYLD_INSERT_
-        # LIBRARIES into every child of the fork tree and reports to a temp file
-        # macdbg tails. This is how children get traced at all, since lldb can't
-        # follow a fork on macOS.
+        # The interposer rides DYLD_INSERT_LIBRARIES into every child of the fork
+        # tree and reports to a temp file macdbg tails, so children get traced
+        # even though lldb can't follow a fork on macOS.
         if self.interpose_enabled:
             env += self._interpose_env()
         else:
