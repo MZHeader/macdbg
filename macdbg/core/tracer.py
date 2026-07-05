@@ -332,40 +332,32 @@ def _f_nw_connection_receive(frame, p):
     return "nw_connection_receive()"
 
 
-_HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "HEAD", "PATCH",
-                 "OPTIONS", "CONNECT", "TRACE"}
-
-
-def _read_const_nsstring(process, obj: int) -> Optional[str]:
-    """Read a __CFConstantString's text with plain memory reads (char* at
-    obj+0x10, length at obj+0x18). None for tagged pointers or anything that
-    isn't a short ASCII literal."""
-    if not obj or obj >> 63:
+def _eval_str(frame, expr: str) -> Optional[str]:
+    try:
+        v = frame.EvaluateExpression(expr)
+    except Exception:
         return None
-    err = lldb.SBError()
-    hdr = process.ReadMemory(obj + 0x10, 16, err)
-    if not err.Success() or len(hdr) < 16:
+    if not v or not v.IsValid() or not v.GetError().Success():
         return None
-    ptr = int.from_bytes(hdr[:8], "little")
-    n = int.from_bytes(hdr[8:16], "little")
-    if not ptr or n <= 0 or n > 64:
-        return None
-    err2 = lldb.SBError()
-    data = process.ReadMemory(ptr, min(n, 32), err2)
-    if not err2.Success() or not data:
-        return None
-    s = data.split(b"\x00")[0].decode("ascii", "replace")
-    if not s or not all(32 <= ord(c) < 127 for c in s):
+    s = v.GetObjectDescription()
+    if not s or s in ("<nil>", "nil", "<null>", "(null)"):
         return None
     return s
 
 
-def _f_set_http_method(frame, p):
-    for reg in ("x2", "x1"):
-        m = _read_const_nsstring(p, _reg(frame, reg))
-        if m and (m.upper() in _HTTP_METHODS or (m.isalpha() and len(m) <= 16)):
-            return 'HTTP method "{}"'.format(m)
-    return None
+def _f_task_resume(frame, p):
+    # -[NSURLSessionTask resume] fires once per request, covering the default
+    # GET that never calls setHTTPMethod:. The method lives on the request
+    # object, so read it (and the request URL) via the runtime. Returns None if
+    # the eval fails so a bad hit produces no row.
+    task = _reg(frame, "x0")
+    if not task:
+        return None
+    method = _eval_str(frame, "(id)[(id)[(id)%d currentRequest] HTTPMethod]" % task)
+    if not method:
+        return None
+    url = _eval_str(frame, "(id)[[(id)[(id)%d currentRequest] URL] absoluteString]" % task)
+    return "{} {}".format(method, url[:200]) if url else 'HTTP method "{}"'.format(method)
 
 
 def _f_cfurl_bytes(frame, p):
@@ -448,7 +440,7 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "nw_connection_send":      (NET, _f_nw_connection_send),
     "nw_connection_receive":   (NET, _f_nw_connection_receive),
     "CFURLCreateWithBytes":    (NET, _f_cfurl_bytes),
-    "objc_msgSend$setHTTPMethod:": (NET, _f_set_http_method),
+    "-[NSURLSessionTask resume]": (NET, _f_task_resume),
     "shutdown":           (NET,  _f_shutdown),
     "setsockopt":         (NET,  _f_setsockopt),
     "getaddrinfo":        (NET,  _f_getaddrinfo),
