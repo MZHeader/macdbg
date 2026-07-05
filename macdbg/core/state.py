@@ -27,6 +27,14 @@ class Patch:
 
 
 @dataclass
+class Watch:
+    slot: int
+    addr: int
+    length: int = 32
+    label: str = ""
+
+
+@dataclass
 class BinaryState:
     sha256: str
     binary_path: str
@@ -34,6 +42,7 @@ class BinaryState:
     bookmarks: Dict[int, str] = field(default_factory=dict)
     breakpoints: List[StoredBP] = field(default_factory=list)
     patches: List[Patch] = field(default_factory=list)
+    watches: List[Watch] = field(default_factory=list)
 
     def file_path(self) -> str:
         return os.path.join(STATE_DIR, "{}.json".format(self.sha256))
@@ -61,6 +70,13 @@ class BinaryState:
                      "orig": p.orig.hex(),
                      "new": p.new.hex()}
                     for p in self.patches
+                ],
+                "watches": [
+                    {"slot": w.slot,
+                     "addr": "{:#x}".format(w.addr),
+                     "length": w.length,
+                     "label": w.label}
+                    for w in self.watches
                 ],
             }
             tmp = self.file_path() + ".tmp"
@@ -118,6 +134,16 @@ def load_for(binary_path: str) -> BinaryState:
                 addr=int(p["addr"], 16),
                 orig=bytes.fromhex(p.get("orig", "")),
                 new=bytes.fromhex(p.get("new", "")),
+            ))
+        except (KeyError, ValueError):
+            continue
+    for w in d.get("watches") or []:
+        try:
+            state.watches.append(Watch(
+                slot=int(w["slot"]),
+                addr=int(w["addr"], 16),
+                length=int(w.get("length", 32)),
+                label=str(w.get("label", "")),
             ))
         except (KeyError, ValueError):
             continue

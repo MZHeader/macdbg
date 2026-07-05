@@ -521,6 +521,49 @@ class ConsolePane(Vertical):
             self.log_view.write(Text(line, style=style))
 
 
+class WatchPane(HexPane):
+    """A pinned mini-hexdump. Address does not move on step; only content
+    refreshes. Right-click → Follow in Watch N binds a target here."""
+
+    def __init__(self, slot: int, **kw):
+        super().__init__(title="Watch {}".format(slot), **kw)
+        self._slot = slot
+        self._binding: Optional[Tuple[int, int, str]] = None
+
+    def compose(self):
+        self.title_widget = Static(
+            "Watch {}  (empty)".format(self._slot), classes="title")
+        yield self.title_widget
+        self.table = RightClickTable(cursor_type="row", zebra_stripes=False, show_header=False)
+        yield self.table
+
+    @property
+    def slot(self) -> int:
+        return self._slot
+
+    def binding(self) -> Optional[Tuple[int, int, str]]:
+        return self._binding
+
+    def set_binding(self, addr: int, length: int, label: str = "") -> None:
+        self._binding = (addr, length, label)
+        self._update_title()
+
+    def clear_binding(self) -> None:
+        self._binding = None
+        self.table.clear()
+        self._update_title()
+
+    def _update_title(self) -> None:
+        if self._binding is None:
+            self.title_widget.update("Watch {}  (empty)".format(self._slot))
+            return
+        addr, length, label = self._binding
+        head = "Watch {}  {:#x}  ({} bytes)".format(self._slot, addr, length)
+        if label:
+            head += "  — " + label
+        self.title_widget.update(head)
+
+
 class MemoryPane(HexPane):
     DEFAULT_CSS = HexPane.DEFAULT_CSS + """
     MemoryPane > Input { dock: top; }

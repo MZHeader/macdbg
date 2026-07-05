@@ -31,7 +31,9 @@ from .panes import (
     StringsPane,
     ThreadsPane,
     TracePane,
+    WatchPane,
 )
+from ..core.state import Watch
 
 
 def _parse_bytes(s: str) -> Optional[bytes]:
@@ -154,6 +156,7 @@ class WrapperApp(App):
         self.backtrace_pane = BacktracePane()
         self.strings_pane = StringsPane()
         self.patches_pane = PatchesPane()
+        self.watch_panes = [WatchPane(slot=i) for i in (1, 2, 3)]
         self.console_pane = ConsolePane()
 
         with Horizontal(id="top"):
@@ -165,6 +168,9 @@ class WrapperApp(App):
                         yield self.mem
                     with TabPane("Stack", id="tab_stack"):
                         yield self.stack
+                    for i, wp in enumerate(self.watch_panes, start=1):
+                        with TabPane("Watch {}".format(i), id="tab_watch_{}".format(i)):
+                            yield wp
         with Horizontal(id="bot"):
             with TabbedContent(id="tabs"):
                 with TabPane("Breakpoints", id="tab_bps"):
@@ -214,13 +220,17 @@ class WrapperApp(App):
                 self.console_pane.write("launched {}".format(self.program))
                 if self.dbg.state:
                     self.console_pane.write(
-                        "[state] loaded sha={}… ({} bp(s), {} comment(s), {} bookmark(s), {} patch(es))".format(
+                        "[state] loaded sha={}… ({} bp(s), {} comment(s), {} bookmark(s), {} patch(es), {} watch(es))".format(
                             self.dbg.state.sha256[:12], restored,
                             len(self.dbg.state.comments),
                             len(self.dbg.state.bookmarks),
                             len(self.dbg.state.patches),
+                            len(self.dbg.state.watches),
                         )
                     )
+                    for w in self.dbg.state.watches:
+                        if 1 <= w.slot <= 3:
+                            self.watch_panes[w.slot - 1].set_binding(w.addr, w.length, w.label)
                 try:
                     self._strings_bin = self.dbg.extract_strings(min_len=5)
                     self._render_strings()
@@ -424,6 +434,19 @@ class WrapperApp(App):
         self.backtrace_pane.render_rows(self.dbg.backtrace())
         if self.dbg.state:
             self.patches_pane.render_rows(self.dbg.state.patches)
+        self._refresh_watches()
+
+    def _refresh_watches(self) -> None:
+        for wp in self.watch_panes:
+            b = wp.binding()
+            if b is None:
+                continue
+            addr, length, _label = b
+            data = self.dbg.read_memory(addr, length)
+            if not data:
+                wp.table.clear()
+                continue
+            wp.render_bytes(addr, data, focus_addr=None, preserve_scroll=True)
 
     def action_step_in(self) -> None:
         self.dbg.step_in()
@@ -795,6 +818,74 @@ class WrapperApp(App):
             if event.table is pane.table:
                 self._open_menu_for(pane_name, event.row, event.screen_x, event.screen_y)
                 return
+        for wp in self.watch_panes:
+            if event.table is wp.table:
+                self._open_watch_menu(wp, event.screen_x, event.screen_y)
+                return
+
+    def _watch_follow_items(self, addr: int, length: int = 32, label: str = ""):
+        return [
+            ("Follow in Watch {}".format(i),
+             (lambda s=i, a=addr, ln=length, lb=label: self._follow_watch(s, a, ln, lb)))
+            for i in (1, 2, 3)
+        ]
+
+    def _open_watch_menu(self, wp: "WatchPane", x: int, y: int) -> None:
+        b = wp.binding()
+        if b is None:
+            self.console_pane.write(
+                "[watch {}] empty — right-click a value elsewhere → Follow in Watch {}".format(
+                    wp.slot, wp.slot))
+            return
+        addr, length, _label = b
+        items = [
+            ("Change length…",   lambda: self._prompt_watch_length(wp.slot)),
+            ("Set label…",       lambda: self._prompt_watch_label(wp.slot)),
+            ("Follow in Memory", lambda: self._follow_memory(addr, focus_len=length)),
+            ("Clear watch",      lambda: self._clear_watch(wp.slot)),
+            ("Copy address",     lambda: self._copy("{:#x}".format(addr))),
+        ]
+        self.push_screen(ContextMenu(items, x=max(0, x), y=max(0, y)))
+
+    def _prompt_watch_length(self, slot: int) -> None:
+        wp = self.watch_panes[slot - 1]
+        b = wp.binding()
+        if b is None:
+            return
+        addr, length, label = b
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Watch {} length in bytes (decimal or 0x…)".format(slot),
+                initial=str(length),
+            ))
+            if val is None:
+                return
+            try:
+                n = int(val.strip(), 0)
+            except ValueError:
+                self.console_pane.write("[watch {}] bad length {!r}".format(slot, val), error=True)
+                return
+            if n <= 0 or n > 4096:
+                self.console_pane.write("[watch {}] length must be 1..4096".format(slot), error=True)
+                return
+            self._follow_watch(slot, addr, n, label)
+        self.run_worker(_run(), exclusive=True)
+
+    def _prompt_watch_label(self, slot: int) -> None:
+        wp = self.watch_panes[slot - 1]
+        b = wp.binding()
+        if b is None:
+            return
+        addr, length, label = b
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Watch {} label (empty to clear)".format(slot),
+                initial=label,
+            ))
+            if val is None:
+                return
+            self._follow_watch(slot, addr, length, val.strip())
+        self.run_worker(_run(), exclusive=True)
 
     def _open_menu_for(self, pane: str, row: int, x: int, y: int) -> None:
         items = []
@@ -810,6 +901,8 @@ class WrapperApp(App):
                 ("Edit value…",             lambda: self._prompt_edit_reg(reg_row.name, reg_row.value)),
                 ("Copy value",              lambda: self._copy(reg_row.value)),
             ]
+            if addr:
+                items.extend(self._watch_follow_items(addr, length=32, label=reg_row.name))
             if reg_row.annotation:
                 ann = reg_row.annotation
                 if ann.startswith('"') and ann.endswith('"'):
@@ -831,6 +924,7 @@ class WrapperApp(App):
                  lambda: self._prompt_edit_comment(drow.addr)),
                 ("Copy address",                   lambda: self._copy("{:#x}".format(drow.addr))),
             ]
+            items.extend(self._watch_follow_items(target, length=32))
         elif pane == "trace":
             items = [
                 ("Filter and verbosity…",   lambda: self._open_trace_filter(x, y)),
@@ -866,6 +960,7 @@ class WrapperApp(App):
                     ("Copy string",                   lambda: self._copy(s)),
                     ("Rescan heap/stack for strings", self._rescan_strings),
                 ]
+                items.extend(self._watch_follow_items(addr, length=max(32, min(len(s), 128)), label=s[:16]))
         elif pane == "patches":
             p = self.patches_pane.patch_at(row)
             if p is None:
@@ -886,6 +981,7 @@ class WrapperApp(App):
                 ("Edit ASCII at this row…",       lambda: self._prompt_edit_ascii(base)),
                 ("Copy address",                  lambda: self._copy("{:#x}".format(base))),
             ]
+            items.extend(self._watch_follow_items(base, length=32))
         if items:
             self.push_screen(ContextMenu(items, x=max(0, x), y=max(0, y)))
 
@@ -1234,6 +1330,41 @@ class WrapperApp(App):
 
     def _centered_read(self, addr: int, before_rows: int = 32, total_rows: int = 64):
         return self.dbg.read_around(addr, before=before_rows * 16, total=total_rows * 16)
+
+    def _follow_watch(self, slot: int, addr: int, length: int = 32, label: str = "") -> None:
+        if not (1 <= slot <= 3):
+            return
+        wp = self.watch_panes[slot - 1]
+        wp.set_binding(addr, length, label)
+        data = self.dbg.read_memory(addr, length)
+        if data:
+            wp.render_bytes(addr, data, focus_addr=None, preserve_scroll=False)
+        self._persist_watches()
+        try:
+            self.query_one("#mem_tabs", TabbedContent).active = "tab_watch_{}".format(slot)
+        except Exception:
+            pass
+        self.console_pane.write("[watch {}] pinned {:#x} ({} bytes)".format(slot, addr, length))
+
+    def _clear_watch(self, slot: int) -> None:
+        if not (1 <= slot <= 3):
+            return
+        self.watch_panes[slot - 1].clear_binding()
+        self._persist_watches()
+        self.console_pane.write("[watch {}] cleared".format(slot))
+
+    def _persist_watches(self) -> None:
+        if not self.dbg.state:
+            return
+        self.dbg.state.watches = []
+        for wp in self.watch_panes:
+            b = wp.binding()
+            if b is None:
+                continue
+            addr, length, label = b
+            self.dbg.state.watches.append(
+                Watch(slot=wp.slot, addr=addr, length=length, label=label))
+        self.dbg.state.save()
 
     def _follow_memory(self, addr: int, focus_len: int = 1) -> None:
         self._mem_follow = addr
