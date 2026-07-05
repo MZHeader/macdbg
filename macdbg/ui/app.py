@@ -351,6 +351,7 @@ class WrapperApp(App):
             peeked = self.dbg.peek_exec_hit(bp_id)
             if peeked is not None:
                 name, cmd = peeked
+                self._refresh_all()
                 self._prompt_exec_decision(name, cmd)
                 return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
