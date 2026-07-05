@@ -28,6 +28,8 @@ cd macdbg
 
 Feeling lazy? Ctrl+T arms breakpoints on file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
 
+The tracer also hooks the plaintext side of TLS (`SSL_write`, `SSL_write_ex`, `SSLWrite`), so for a sample that rolls its own TLS over raw sockets the socket `send`/`recv` only carry ciphertext, but the cleartext request — the full URL, headers, and body — shows up at the write call before encryption. This is how you recover a C2 endpoint like `api.telegram.org/bot<token>/sendMessage` that never appears on the wire in the clear. These resolve only if the sample links the TLS library dynamically; a statically linked, stripped TLS stack (common with Go and Rust) won't expose the symbols.
+
 ![Trace tab](docs/img/trace.png)
 
 ## Anti-anti-debug

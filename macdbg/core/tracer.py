@@ -46,6 +46,21 @@ def _fmt_bytes(b: bytes) -> str:
     return "<{}B: {}{}>".format(len(b), b[:24].hex(), "…" if len(b) > 24 else "")
 
 
+def _read_mem(process: lldb.SBProcess, addr: int, n: int, cap: int) -> bytes:
+    if not addr or n <= 0:
+        return b""
+    err = lldb.SBError()
+    data = process.ReadMemory(addr, min(n, cap), err)
+    return data if err.Success() else b""
+
+
+def _fmt_text(b: bytes, limit: int = 256) -> str:
+    if not b:
+        return '""'
+    s = "".join(chr(c) if 32 <= c < 127 else "." for c in b)
+    return '"{}{}"'.format(s[:limit], "…" if len(b) > limit else "")
+
+
 def _reg(frame: lldb.SBFrame, name: str) -> int:
     r = frame.FindRegister(name)
     return r.GetValueAsUnsigned() if r.IsValid() else 0
@@ -373,6 +388,18 @@ def _f_cfurl_bytes(frame, p):
     return 'URL "{}"'.format(url[:200])
 
 
+def _f_tls_write(frame, p):
+    # The plaintext side of TLS: SSL_write / SSLWrite hand the cleartext request
+    # to the library, which encrypts before it reaches send(). Buffer is x1,
+    # length x2 for all of them, so the Telegram URL and bot token show here
+    # even though the socket only ever carries ciphertext.
+    name = (frame.GetFunctionName() or "SSL_write").lstrip("_")
+    buf = _reg(frame, "x1")
+    n = _reg(frame, "x2")
+    data = _read_mem(p, buf, n, 1024)
+    return "{}({} B) {}".format(name, n, _fmt_text(data))
+
+
 SIGS: Dict[str, Tuple[str, Callable]] = {
     "open":               (FILE, _f_open),
     "open$NOCANCEL":      (FILE, _f_open),
@@ -441,6 +468,10 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "nw_connection_receive":   (NET, _f_nw_connection_receive),
     "CFURLCreateWithBytes":    (NET, _f_cfurl_bytes),
     "-[NSURLSessionTask resume]": (NET, _f_task_resume),
+    "SSL_write":          (NET,  _f_tls_write),
+    "SSL_write_ex":       (NET,  _f_tls_write),
+    "SSLWrite":           (NET,  _f_tls_write),
+    "BoringSSL_SSL_write": (NET, _f_tls_write),
     "shutdown":           (NET,  _f_shutdown),
     "setsockopt":         (NET,  _f_setsockopt),
     "getaddrinfo":        (NET,  _f_getaddrinfo),
