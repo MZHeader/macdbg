@@ -98,11 +98,12 @@ class DisasmPane(Vertical):
             return self._rows[i]
         return None
 
-    def render_rows(self, rows: List[DisasmRow]) -> None:
+    def render_rows(self, rows: List[DisasmRow], center_addr: Optional[int] = None) -> None:
         self._rows = list(rows)
         self._display_to_row = {}
         self.table.clear()
         pc_row_key = None
+        center_row_key = None
         new_keys = []
         display_idx = 0
         for row_idx, r in enumerate(rows):
@@ -135,7 +136,9 @@ class DisasmPane(Vertical):
             display_idx += 1
             if r.is_pc:
                 pc_row_key = key
-        _settle_and_center(self.table, pc_row_key, new_keys)
+            if center_addr is not None and r.addr == center_addr:
+                center_row_key = key
+        _settle_and_center(self.table, pc_row_key or center_row_key, new_keys)
 
 
 class RegistersPane(Vertical):

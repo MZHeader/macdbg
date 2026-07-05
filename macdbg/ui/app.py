@@ -335,6 +335,23 @@ class WrapperApp(App):
             return "[stop] trace at {:#x}{}".format(pc, where)
         return "[stop] at {:#x}{} (reason={})".format(pc, where, reason)
 
+    def _exec_caller_site(self) -> Optional[int]:
+        # First backtrace frame that lives in the target binary — the sample's
+        # own code that made the call. Its pc is the return address, so the bl
+        # sits just above it in the disasm.
+        thread = self.dbg._thread()
+        if thread is None or not self.dbg.target:
+            return None
+        exec_name = self.dbg.target.GetExecutable().GetFilename() or ""
+        for i in range(1, thread.GetNumFrames()):
+            f = thread.GetFrameAtIndex(i)
+            if not f.IsValid():
+                break
+            m = f.GetModule()
+            if m.IsValid() and (m.GetFileSpec().GetFilename() or "") == exec_name:
+                return f.GetPC()
+        return None
+
     def _handle_anti_debug_hit(self) -> bool:
         process = self.dbg.process
         if not process or not process.IsValid():
@@ -351,7 +368,11 @@ class WrapperApp(App):
             peeked = self.dbg.peek_exec_hit(bp_id)
             if peeked is not None:
                 name, cmd = peeked
-                self._refresh_all()
+                caller = self._exec_caller_site()
+                self._refresh_all(disasm_center=caller)
+                if caller:
+                    self.console_pane.write(
+                        "[anti-debug] {} called from {:#x}".format(name, caller))
                 self._prompt_exec_decision(name, cmd)
                 return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
@@ -391,19 +412,20 @@ class WrapperApp(App):
     def _on_output_event(self, e: OutputEvent) -> None:
         self.console_pane.write(e.text, error=e.is_error)
 
-    def _refresh_all(self) -> None:
+    def _refresh_all(self, disasm_center: Optional[int] = None) -> None:
         with self.batch_update():
-            self._do_refresh_all()
+            self._do_refresh_all(disasm_center)
 
-    def _do_refresh_all(self) -> None:
+    def _do_refresh_all(self, disasm_center: Optional[int] = None) -> None:
         frame = self.dbg.frame()
         pc = self.dbg.pc() or 0
         sp = self.dbg.sp() or 0
 
+        center = disasm_center if disasm_center is not None else self._disasm_follow
         if self.dbg.target:
             rows = disasm_around(self.dbg.target, pc, count=512,
                                  read_mem=self.dbg.read_memory,
-                                 center=self._disasm_follow,
+                                 center=center,
                                  frame=frame)
             comments = self.dbg.state.comments if self.dbg.state else {}
             if comments:
@@ -411,7 +433,7 @@ class WrapperApp(App):
                     c = comments.get(r.addr)
                     if c:
                         r.user_comment = c
-            self.disasm.render_rows(rows)
+            self.disasm.render_rows(rows, center_addr=center)
 
         self._annot_cache.clear()
         reg_rows = collect_regs(
