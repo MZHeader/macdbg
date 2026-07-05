@@ -372,6 +372,10 @@ class WrapperApp(App):
     def _add_interpose_row(self, category: str, call: str) -> None:
         self._trace_count += 1
         self.trace_pane.add_hit(self._trace_count, category, call)
+        # These rows stream in from a file reader with no process stop to drive
+        # the render loop, so nudge a repaint or they don't appear until the next
+        # UI event.
+        self.trace_pane.table.refresh()
 
     def _on_stop_event(self, e: StopEvent) -> None:
         if e.state == lldb.eStateStopped:
@@ -693,6 +697,15 @@ class WrapperApp(App):
         else:
             self.console_pane.write("[fork-trace] whole-tree syscall tracing OFF — relaunching")
         self.action_restart()
+        if self.dbg.interpose_enabled:
+            # Show the trace tab like Ctrl+T does, so rows the interposer streams
+            # in are actually on screen (its rows arrive with no process stop to
+            # drive the repaint).
+            try:
+                self.query_one("#tabs", TabbedContent).active = "tab_trace"
+                self.trace_pane.table.focus()
+            except Exception:
+                pass
 
     def action_toggle_bp(self) -> None:
         pc = self.dbg.pc()
