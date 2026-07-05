@@ -395,11 +395,6 @@ class WrapperApp(App):
                     if caller:
                         self.console_pane.write(
                             "[anti-debug] {} called from {:#x}".format(name, caller))
-                    dumped = self.dbg.autodump_large_exec(exec_bp)
-                    if dumped:
-                        self.console_pane.write(
-                            "[anti-debug] full payload ({} B) → {}".format(
-                                dumped[1], dumped[0]))
                     self._prompt_exec_decision(name, cmd, exec_bp)
                     return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
