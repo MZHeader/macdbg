@@ -433,7 +433,7 @@ class WrapperApp(App):
         if bp_id is None:
             return False
         frame = thread.GetFrameAtIndex(0)
-        hit = self.tracer.hit_from(frame, process)
+        hit = self.tracer.hit_from(frame, process, bp_id=bp_id)
         if hit is not None:
             self._trace_count += 1
             self.trace_pane.add_hit(self._trace_count, hit.category, hit.call)

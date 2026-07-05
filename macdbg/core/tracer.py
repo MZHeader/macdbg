@@ -412,6 +412,25 @@ def _f_aead_seal(frame, p):
     return "{}({} B) {}".format(name, n, _fmt_text(data))
 
 
+def _f_rustls_write(frame, p):
+    # rustls has no C SSL_write; the app hands its plaintext to
+    # <rustls::conn::connection::Writer as std::io::Write>::write, a clean
+    # &[u8] in x1/x2. The symbol carries a per-build hash, so it is matched by
+    # regex rather than exact name, and vanishes entirely if the binary is
+    # stripped.
+    buf = _reg(frame, "x1")
+    n = _reg(frame, "x2")
+    data = _read_mem(p, buf, n, 1024)
+    return "rustls Writer::write({} B) {}".format(n, _fmt_text(data))
+
+
+# (regex pattern, category, formatter) for symbols whose names are not stable
+# enough to list exactly — mangled Rust, versioned C symbols, and the like.
+REGEX_SIGS: List[Tuple[str, str, Callable]] = [
+    (r"connection..Writer.*::write::h", NET, _f_rustls_write),
+]
+
+
 SIGS: Dict[str, Tuple[str, Callable]] = {
     "open":               (FILE, _f_open),
     "open$NOCANCEL":      (FILE, _f_open),
@@ -502,6 +521,7 @@ class Tracer:
     def __init__(self) -> None:
         self._bp_ids: List[int] = []
         self._bp_to_name: Dict[int, str] = {}
+        self._regex_bps: Dict[int, Tuple[str, Callable]] = {}
         self.enabled = False
         self._exec_name: str = ""
         self.caller_depth: int = 5
@@ -528,6 +548,15 @@ class Tracer:
             self._bp_to_name[bp.GetID()] = name
             if bp.GetNumLocations() > 0:
                 resolved_now += 1
+        for pattern, cat, fmt in REGEX_SIGS:
+            rbp = target.BreakpointCreateByRegex(pattern)
+            if not rbp.IsValid():
+                continue
+            self._bp_ids.append(rbp.GetID())
+            self._bp_to_name[rbp.GetID()] = pattern
+            self._regex_bps[rbp.GetID()] = (cat, fmt)
+            if rbp.GetNumLocations() > 0:
+                resolved_now += 1
         self.enabled = True
         return (len(self._bp_ids), resolved_now)
 
@@ -535,12 +564,14 @@ class Tracer:
         if not target or not target.IsValid():
             self._bp_ids.clear()
             self._bp_to_name.clear()
+            self._regex_bps.clear()
             self.enabled = False
             return
         for bp_id in self._bp_ids:
             target.BreakpointDelete(bp_id)
         self._bp_ids.clear()
         self._bp_to_name.clear()
+        self._regex_bps.clear()
         self.enabled = False
 
     def is_trace_bp(self, bp_id: int) -> bool:
@@ -551,9 +582,19 @@ class Tracer:
         frame: lldb.SBFrame,
         process: lldb.SBProcess,
         user_only: bool = True,
+        bp_id: Optional[int] = None,
     ) -> Optional[TraceHit]:
         if not frame or not frame.IsValid():
             return None
+        if bp_id is not None and bp_id in self._regex_bps:
+            cat, fmt = self._regex_bps[bp_id]
+            if user_only and cat != NET and self._caller_is_noise(frame):
+                return None
+            try:
+                call = fmt(frame, process)
+            except Exception as e:
+                call = "regex hook [formatter error: {}]".format(e)
+            return TraceHit(category=cat, call=call) if call is not None else None
         name = frame.GetFunctionName() or ""
         for candidate in (name, name.lstrip("_")):
             if candidate in SIGS:
