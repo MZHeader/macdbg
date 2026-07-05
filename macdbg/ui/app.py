@@ -755,26 +755,33 @@ class WrapperApp(App):
 
     def _prompt_exec_decision(self, name: str, cmd: str) -> None:
         def allow():
-            self.dbg.resolve_exec(block=False)
+            self.dbg.resolve_exec("allow", name)
             self.console_pane.write('[anti-debug] ALLOWED {}("{}")'.format(name, cmd[:120]))
 
+        def fake():
+            self.dbg.resolve_exec("fake", name)
+            self.console_pane.write(
+                '[anti-debug] faked success for {}("{}") — did not run, returned success'.format(
+                    name, cmd[:120]))
+
         def block():
-            self.dbg.resolve_exec(block=True)
+            self.dbg.resolve_exec("block", name)
             self.console_pane.write('[anti-debug] blocked {}("{}") — returned -1'.format(name, cmd[:120]))
 
         def default_block():
-            self.dbg.resolve_exec(block=True)
+            self.dbg.resolve_exec("block", name)
             self.console_pane.write(
                 '[anti-debug] dismissed without choice — blocked {}("{}") — returned -1'.format(
                     name, cmd[:120]))
 
         title = 'Outbound {}: "{}"'.format(name, cmd[:80])
         items = [
-            ("Allow  (let it run and return normally)", allow),
-            ("Block  (return -1, do not run)",          block),
+            ("Allow  (let it run for real)",                     allow),
+            ("Fake success  (do not run, return success)",       fake),
+            ("Block  (do not run, return -1/failure)",           block),
         ]
         self.console_pane.write(
-            "[anti-debug] {}? paused — choose Allow or Block (Esc = Block)".format(title))
+            "[anti-debug] {}? paused — Allow / Fake success / Block (Esc = Block)".format(title))
         w, h = self.size
         self.push_screen(ContextMenu(
             items,

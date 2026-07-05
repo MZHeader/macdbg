@@ -724,13 +724,24 @@ class Debugger:
         cmd = cmd if err.Success() else "<unreadable>"
         return name, cmd
 
-    def resolve_exec(self, block: bool) -> None:
+    def resolve_exec(self, decision: str = "block", name: str = "") -> None:
         if not self.process:
             return
-        if block:
-            ret = lldb.SBCommandReturnObject()
+        ret = lldb.SBCommandReturnObject()
+        if decision == "block":
             self.ci.HandleCommand("thread return -1", ret, False)
+        elif decision == "fake":
+            self.ci.HandleCommand(
+                "thread return {}".format(self._exec_success_value(name)), ret, False)
         self.process.Continue()
+
+    @staticmethod
+    def _exec_success_value(name: str) -> int:
+        # What each call returns on success: system(3) and posix_spawn(2) return
+        # 0, so a sample that checks only the return code believes the command
+        # ran. popen returns an unfakeable FILE* and execve does not return on
+        # success, so 0 is the best available for those.
+        return 0
 
     def handle_exec_hit(self, bp_id: int) -> Optional[str]:
         peeked = self.peek_exec_hit(bp_id)
@@ -739,7 +750,7 @@ class Debugger:
         if self.exec_interactive:
             return None
         name, cmd = peeked
-        self.resolve_exec(block=True)
+        self.resolve_exec("block", name)
         return 'blocked {}("{}") — returned -1'.format(name, cmd[:120])
 
     def handle_anti_ptrace_hit(self, bp_id: int) -> Optional[str]:

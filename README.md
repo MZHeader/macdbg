@@ -42,7 +42,7 @@ Ctrl+D opens a menu of independent bypass toggles, all off by default:
 - **Hardware BPs for user breakpoints** stops user breakpoints from patching bytes in `__TEXT`, which beats prologue-hash checks.
 - **Hardware BPs for tracer breakpoints** does the same for tracer BPs. Flip it before enabling the tracer.
 - **Fork identity mode** makes `fork` return `0` and `setsid` return a positive fake sid, so the parent runs the child code path in-process and no debugger reattach is needed.
-- **Outbound exec sandbox** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`. Auto-block returns `-1` to every call; interactive halts on each and prompts Allow or Block.
+- **Outbound exec sandbox** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`. Auto-block returns `-1` to every call; interactive halts on each and prompts Allow, Fake success (block the call but return a success value, so a sample that checks the result keeps running instead of detecting the block), or Block.
 
 ### What The Fork Bypass Defeats
 
