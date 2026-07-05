@@ -12,7 +12,7 @@ For reverse engineers debugging macOS binaries who aren't very good at rememberi
 
 - macOS with the Xcode Command Line Tools installed (`xcode-select --install`) — this provides `/usr/bin/lldb` and `/usr/bin/python3`, both of which macdbg uses directly.
 
-There is nothing to `pip install`: LLDB's Python bindings come from the system LLDB (they are not on PyPI) and the UI dependencies (textual, rich, and friends) are vendored under [`vendor/`](vendor), so a clone is self-contained.
+There is nothing to `pip install`: LLDB's Python bindings come from the system LLDB (they are not on PyPI) and the UI dependencies (textual, rich, and friends) are vendored under [`vendor/`](vendor), so a clone is self-contained. The one native component, the fork-tree tracer's interposer, ships as a prebuilt universal (arm64 + x86_64) dylib in [`macdbg/native/`](macdbg/native), so a stock offline box needs no compiler; the source sits beside it and is only recompiled if the prebuilt is missing or doesn't cover the host architecture.
 
 ## Install
 

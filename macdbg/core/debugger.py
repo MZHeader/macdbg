@@ -120,15 +120,17 @@ class Debugger:
         return self.state.save()
 
     def interpose_dylib(self) -> str:
-        """Path to the DYLD interposer, compiled on first use so a clone works
-        without a build step. Returns '' if it can't be produced."""
+        """Path to the DYLD interposer. A prebuilt universal (arm64+x86_64) dylib
+        ships in the repo so a stock box with no toolchain and no network works
+        out of the box; it's only recompiled from source if the prebuilt is
+        missing or doesn't cover this machine's architecture. Returns '' if
+        neither is usable."""
         here = os.path.dirname(os.path.abspath(__file__))
         native = os.path.join(os.path.dirname(here), "native")
         dylib = os.path.join(native, "interpose.dylib")
         src = os.path.join(native, "interpose.c")
-        if os.path.exists(dylib):
-            if not os.path.exists(src) or os.path.getmtime(dylib) >= os.path.getmtime(src):
-                return dylib
+        if os.path.exists(dylib) and self._dylib_covers_host(dylib):
+            return dylib
         if not os.path.exists(src):
             return dylib if os.path.exists(dylib) else ""
         import subprocess
@@ -140,6 +142,22 @@ class Debugger:
         except Exception:
             return dylib if os.path.exists(dylib) else ""
         return dylib
+
+    @staticmethod
+    def _dylib_covers_host(dylib: str) -> bool:
+        # The bundled dylib is universal, but a machine could be an arch neither
+        # slice covers; if lipo can't confirm the host arch is present, fall back
+        # to recompiling.
+        import platform
+        import subprocess
+        host = platform.machine()
+        try:
+            out = subprocess.run(
+                ["lipo", "-archs", dylib], capture_output=True, text=True, check=True
+            ).stdout
+        except Exception:
+            return True
+        return host in out.split()
 
     def _interpose_env(self) -> List[str]:
         dylib = self.interpose_dylib()
