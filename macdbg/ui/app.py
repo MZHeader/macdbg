@@ -852,6 +852,8 @@ class WrapperApp(App):
                     name, cmd[:120]))
 
         title = 'Outbound {}: "{}"'.format(name, cmd[:80])
+        preview = cmd if len(cmd) <= 240 else cmd[:240] + " …"
+        header = "Outbound {}:\n{}".format(name, preview)
         items = [
             ("Allow  (let it run for real)",                     allow),
             ("Fake success  (do not run, return success)",       fake),
@@ -866,6 +868,7 @@ class WrapperApp(App):
             x=max(0, w // 2 - 25),
             y=max(0, h // 3),
             on_dismiss=default_block,
+            header=header,
         ))
 
     def _toggle_exec_sandbox(self) -> None:

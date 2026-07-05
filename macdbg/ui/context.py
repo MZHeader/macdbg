@@ -21,6 +21,22 @@ class ContextMenu(ModalScreen):
         padding: 0;
         scrollbar-size: 0 0;
     }
+    ContextMenu > #menu_box {
+        background: $panel;
+        border: round $accent;
+        padding: 0;
+    }
+    ContextMenu #menu_header {
+        padding: 0 1;
+        color: $text-muted;
+        border-bottom: solid $accent;
+    }
+    ContextMenu > #menu_box > OptionList#menu_list {
+        background: $panel;
+        border: none;
+        padding: 0;
+        scrollbar-size: 0 0;
+    }
     ContextMenu OptionList > .option-list--option {
         padding: 0 2;
     }
@@ -36,29 +52,60 @@ class ContextMenu(ModalScreen):
         x: int = 0,
         y: int = 0,
         on_dismiss: Optional[Callable[[], None]] = None,
+        header: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._items = items
         self._x, self._y = x, y
         self._on_dismiss = on_dismiss
         self._picked = False
+        self._header = header
 
     def compose(self) -> ComposeResult:
         opts = [Option(" " + label + " ", id=str(i)) for i, (label, _) in enumerate(self._items)]
-        yield OptionList(*opts, id="menu_list")
+        if self._header:
+            with Vertical(id="menu_box"):
+                yield Label(self._header, id="menu_header")
+                yield OptionList(*opts, id="menu_list")
+        else:
+            yield OptionList(*opts, id="menu_list")
 
     def on_mount(self) -> None:
         menu = self.query_one("#menu_list", OptionList)
         longest = max(len(lbl) for lbl, _ in self._items)
-        width = longest + 10
-        height = len(self._items) + 2
         screen_w, screen_h = self.app.size
-        x = min(self._x, max(0, screen_w - width))
-        y = min(self._y, max(0, screen_h - height))
-        menu.styles.offset = (x, y)
-        menu.styles.width = width
-        menu.styles.height = height
+        if self._header:
+            box = self.query_one("#menu_box", Vertical)
+            width = min(max(longest + 10, 48), max(20, screen_w - 2))
+            header = self.query_one("#menu_header", Label)
+            header.styles.width = width - 2
+            header_lines = self._wrapped_line_count(self._header, width - 2)
+            height = len(self._items) + header_lines + 3
+            menu.styles.height = len(self._items)
+            menu.styles.width = width - 2
+            x = min(self._x, max(0, screen_w - width))
+            y = min(self._y, max(0, screen_h - height))
+            box.styles.offset = (x, y)
+            box.styles.width = width
+            box.styles.height = height
+        else:
+            width = longest + 10
+            height = len(self._items) + 2
+            x = min(self._x, max(0, screen_w - width))
+            y = min(self._y, max(0, screen_h - height))
+            menu.styles.offset = (x, y)
+            menu.styles.width = width
+            menu.styles.height = height
         menu.focus()
+
+    @staticmethod
+    def _wrapped_line_count(text: str, width: int) -> int:
+        if width <= 0:
+            return 1
+        n = 0
+        for line in text.split("\n"):
+            n += max(1, -(-len(line) // width))
+        return n
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         idx = int(event.option.id or "0")
