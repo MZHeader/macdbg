@@ -10,6 +10,19 @@ from typing import Dict, List, Optional
 STATE_DIR = os.path.expanduser("~/.macdbg")
 
 
+def _safe_name(name: str) -> str:
+    return "".join(
+        c if (c.isalnum() or c in "-._") else "_" for c in (name or "")
+    ) or "unknown"
+
+
+def sample_dir(binary_path: str, sha: str) -> str:
+    """Per-sample directory, named for readability but suffixed with a slice of
+    the sha so two different binaries that share a name never collide."""
+    base = _safe_name(os.path.basename(binary_path or ""))
+    return os.path.join(STATE_DIR, "{}-{}".format(base, sha[:12]))
+
+
 @dataclass
 class StoredBP:
     addr: int
@@ -44,12 +57,18 @@ class BinaryState:
     patches: List[Patch] = field(default_factory=list)
     watches: List[Watch] = field(default_factory=list)
 
+    def dir(self) -> str:
+        return sample_dir(self.binary_path, self.sha256)
+
     def file_path(self) -> str:
-        return os.path.join(STATE_DIR, "{}.json".format(self.sha256))
+        return os.path.join(self.dir(), "state.json")
+
+    def dumps_dir(self) -> str:
+        return os.path.join(self.dir(), "dumps")
 
     def save(self) -> Optional[str]:
         try:
-            os.makedirs(STATE_DIR, exist_ok=True)
+            os.makedirs(self.dir(), exist_ok=True)
             payload = {
                 "sha256": self.sha256,
                 "binary_path": self.binary_path,
@@ -96,9 +115,38 @@ def sha256_of(path: str) -> str:
     return h.hexdigest()
 
 
+def _migrate_legacy(state: "BinaryState") -> None:
+    """Fold the old flat ~/.macdbg/<sha>.json and ~/.macdbg/<name>/dumps into the
+    new per-sample directory the first time an old binary is reopened."""
+    if os.path.exists(state.file_path()):
+        return
+    legacy_json = os.path.join(STATE_DIR, "{}.json".format(state.sha256))
+    if os.path.exists(legacy_json):
+        try:
+            os.makedirs(state.dir(), exist_ok=True)
+            os.replace(legacy_json, state.file_path())
+        except OSError:
+            pass
+    old_dumps = os.path.join(
+        STATE_DIR, _safe_name(os.path.basename(state.binary_path or "")), "dumps")
+    new_dumps = state.dumps_dir()
+    if (os.path.isdir(old_dumps) and not os.path.exists(new_dumps)
+            and os.path.abspath(old_dumps) != os.path.abspath(new_dumps)):
+        try:
+            os.makedirs(state.dir(), exist_ok=True)
+            os.replace(old_dumps, new_dumps)
+            try:
+                os.rmdir(os.path.dirname(old_dumps))
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+
 def load_for(binary_path: str) -> BinaryState:
     sha = sha256_of(binary_path)
     state = BinaryState(sha256=sha, binary_path=binary_path)
+    _migrate_legacy(state)
     path = state.file_path()
     if not os.path.exists(path):
         return state

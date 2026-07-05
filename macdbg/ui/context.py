@@ -108,7 +108,7 @@ class ContextMenu(ModalScreen):
             menu.styles.height = height
         menu.focus()
 
-    MAX_HEADER_LINES = 6
+    MAX_HEADER_LINES = 12
 
     @staticmethod
     def _wrapped_line_count(text: str, width: int) -> int:

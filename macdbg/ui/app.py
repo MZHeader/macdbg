@@ -847,7 +847,7 @@ class WrapperApp(App):
                     name, cmd[:120]))
 
         title = 'Outbound {}: "{}"'.format(name, cmd[:80])
-        preview = cmd if len(cmd) <= 240 else cmd[:240] + " …"
+        preview = cmd if len(cmd) <= 600 else cmd[:600] + " …"
         header = "Outbound {}:\n{}".format(name, preview)
         items = [
             ("Allow  (let it run for real)",                     allow),
