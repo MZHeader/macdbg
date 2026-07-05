@@ -122,9 +122,6 @@ class Debugger:
         info.SetLaunchFlags(
             lldb.eLaunchFlagStopAtEntry | lldb.eLaunchFlagDisableASLR
         )
-        # Launch synchronously so we can deterministically hop from dyld's
-        # _dyld_start (where stop-at-entry lands) to the executable's own entry
-        # point before the UI's async event loop takes over.
         was_async = self.dbg.GetAsync()
         self.dbg.SetAsync(False)
         try:
@@ -179,7 +176,7 @@ class Debugger:
         if len(head) < 32:
             return None
         magic = struct.unpack_from("<I", head, 0)[0]
-        if magic != 0xFEEDFACF:  # MH_MAGIC_64, little-endian
+        if magic != 0xFEEDFACF:
             return None
         ncmds = struct.unpack_from("<I", head, 16)[0]
         sizeofcmds = struct.unpack_from("<I", head, 20)[0]

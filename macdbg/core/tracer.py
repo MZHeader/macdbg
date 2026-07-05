@@ -288,13 +288,8 @@ def _f_pclose(frame, p):
     return "pclose(fp={:#x})".format(_reg(frame, "x0"))
 
 
-# --- modern networking stack (Network.framework / NSURLSession / CFNetwork) ---
-# These are what most current macOS software (and malware) actually use; the
-# classic BSD socket(2)/connect(2) path is often never touched directly.
 
 def _f_connectx(frame, p):
-    # int connectx(int s, const sa_endpoints_t *endpoints, ...)
-    # sa_endpoints_t: sae_dstaddr (struct sockaddr *) sits at offset 24 on arm64.
     fd = _reg(frame, "x0")
     eps = _reg(frame, "x1")
     dst = "?"
@@ -318,10 +313,6 @@ def _looks_like_port(s: str) -> bool:
 
 
 def _f_nw_endpoint_create_host(frame, p):
-    # const char *hostname (x0), const char *port (x1). The host reads reliably
-    # at entry and is the key IOC; the port is only shown when it actually looks
-    # like a port (Network.framework also calls this internally with the arg in
-    # a different place, so guard against printing stack garbage).
     host = _read_cstr(p, _reg(frame, "x0"))
     port = _read_cstr(p, _reg(frame, "x1"))
     if _looks_like_port(port):
@@ -329,10 +320,6 @@ def _f_nw_endpoint_create_host(frame, p):
     return 'nw_endpoint_create_host("{}")'.format(host)
 
 
-# nw_connection_t is an opaque object and its argument is not reliably in x0 at
-# the symbol entry, so these are logged as lifecycle markers — the event (and
-# that the sample uses Network.framework) is the signal, paired with the
-# endpoint above and connectx/getaddrinfo for the actual address.
 def _f_nw_connection_start(frame, p):
     return "nw_connection_start()"
 
@@ -354,7 +341,7 @@ def _read_const_nsstring(process, obj: int) -> Optional[str]:
     code. Layout: char *str at obj+0x10, CFIndex length at obj+0x18. Returns
     None for tagged pointers or anything that doesn't look like a short ASCII
     literal, so it degrades to silence rather than garbage."""
-    if not obj or obj >> 63:  # nil or arm64 objc tagged pointer
+    if not obj or obj >> 63:
         return None
     err = lldb.SBError()
     hdr = process.ReadMemory(obj + 0x10, 16, err)
@@ -375,11 +362,6 @@ def _read_const_nsstring(process, obj: int) -> Optional[str]:
 
 
 def _f_set_http_method(frame, p):
-    # objc_msgSend$setHTTPMethod: stub — caller puts self in x0 and the first
-    # real argument in x2 (x1 is reserved for the selector the stub loads). The
-    # method is a constant NSString, read without running any inferior code.
-    # Returns None (suppressing the hit) when it isn't a recognizable method, so
-    # internal framework calls don't create noise.
     for reg in ("x2", "x1"):
         m = _read_const_nsstring(p, _reg(frame, reg))
         if m and (m.upper() in _HTTP_METHODS or (m.isalpha() and len(m) <= 16)):
@@ -388,10 +370,6 @@ def _f_set_http_method(frame, p):
 
 
 def _f_cfurl_bytes(frame, p):
-    # CFURLCreateWithBytes(alloc, const UInt8 *bytes, CFIndex length, enc, base).
-    # The URL text is raw bytes at x1 with length x2 — the reliable place to
-    # recover the full request URL (path + query) for NSURLSession/CFNetwork,
-    # before TLS, regardless of http/https.
     ptr = _reg(frame, "x1")
     n = _reg(frame, "x2")
     if not ptr or n <= 0 or n > 8192:
@@ -540,10 +518,6 @@ class Tracer:
         for candidate in (name, name.lstrip("_")):
             if candidate in SIGS:
                 cat, fmt = SIGS[candidate]
-                # Network calls in Network.framework/CFNetwork run on internal
-                # dispatch queues with no user frame on the stack, so the
-                # caller-depth filter would always drop them. Network activity is
-                # high-signal for triage — never suppress it.
                 if user_only and cat != NET and self._caller_is_noise(frame):
                     return None
                 try:
@@ -551,8 +525,6 @@ class Tracer:
                 except Exception as e:
                     call = "{}(...) [formatter error: {}]".format(candidate, e)
                 if call is None:
-                    # Formatter opted out (e.g. an internal setHTTPMethod: call
-                    # whose argument isn't a readable method) — suppress the hit.
                     return None
                 return TraceHit(category=cat, call=call)
         return None

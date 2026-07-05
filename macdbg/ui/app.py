@@ -216,9 +216,6 @@ class WrapperApp(App):
             try:
                 self.dbg.create_target(self.program)
                 restored = self.dbg.restore_stored_breakpoints()
-                # SBLaunchInfo takes the inferior's arguments only — lldb sets
-                # argv[0] to the executable itself. Passing the program here too
-                # would duplicate it as argv[1] and shift the real arguments.
                 self.dbg.launch(list(self.program_args))
                 self.console_pane.write("launched {}".format(self.program))
                 if self.dbg.state:
@@ -239,8 +236,6 @@ class WrapperApp(App):
                     self._render_strings()
                 except Exception as e:
                     self.console_pane.write("[strings] extract failed: {}".format(e), error=True)
-                # launch() hops to the executable entry point synchronously, so
-                # no stop event reaches the pump — refresh the panes once here.
                 p = self.dbg.process
                 if p and p.IsValid():
                     st = p.GetState()
@@ -283,10 +278,6 @@ class WrapperApp(App):
 
     def _on_stop_event(self, e: StopEvent) -> None:
         if e.state == lldb.eStateStopped:
-            # In a multithreaded target lldb often leaves a parked thread
-            # selected, so a breakpoint hit on a worker looks like a reason-less
-            # stop and the handlers below (which read the selected thread) miss
-            # it. Pin the selection to the thread that actually stopped first.
             self.dbg.select_stopped_thread()
             if self._handle_anti_debug_hit():
                 return
@@ -1200,7 +1191,6 @@ class WrapperApp(App):
         self.run_worker(_run(), exclusive=True)
 
     async def _run_string_scan(self):
-        # non-blocking wrapper; the scan is bounded and synchronous under the hood.
         return self.dbg.scan_live_strings(min_len=5, budget_bytes=512 * 1024 * 1024)
 
     def _revert_patch(self, index: int) -> None:

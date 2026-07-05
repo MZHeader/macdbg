@@ -18,8 +18,8 @@ class DisasmRow:
     user_comment: str = ""
     inline_hint: str = ""
     gutter: str = "    "
-    gutter_styles: List = None  # populated on demand: [(start, end, style_str)]
-    function_head: str = ""    # non-empty on the first row of each function
+    gutter_styles: List = None
+    function_head: str = ""
 
 
 _INT_RE = re.compile(r"#-?(?:0x[0-9a-fA-F]+|\d+)")
@@ -163,8 +163,6 @@ def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> N
             if mn in ("ldr", "ldrb", "ldrh", "ldrsw") and base == reg:
                 dest = nxt.operands.split(",", 1)[0].strip()
                 if dest[:1].lower() in "dsqvhb" and dest[1:2].isdigit():
-                    # SIMD/FP load (ldr d0/s0/q0/…): the loaded value is a float,
-                    # not a pointer — symbolizing it produces misleading hints.
                     break
                 imm = _parse_imm(nxt.operands) or 0
                 addr = page + imm
@@ -172,9 +170,6 @@ def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> N
                 if preview:
                     nxt.inline_hint = "load @ {:#x}  {}".format(addr, preview)
                 break
-            # The adrp result is clobbered before any add/ldr consumed it
-            # (e.g. a second `adrp xN` or a `mov xN, …` into the same register):
-            # stop so we don't attribute a later, unrelated use to this page.
             if _first_reg(nxt.operands) == reg:
                 break
 
