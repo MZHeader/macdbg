@@ -865,28 +865,35 @@ class WrapperApp(App):
         def tick(on: bool) -> str:
             return "✓" if on else " "
 
+        def header(text):
+            return (text, None)
+
         def build_items():
             return [
-                ("{}  Anti-ptrace: defeat PT_DENY_ATTACH via libc (hook ptrace, return 0)".format(tick(bool(self.dbg.anti_ptrace_bp_id))),
+                header("Anti-debug"),
+                ("{}  Defeat PT_DENY_ATTACH via libc (hook ptrace, return 0)".format(tick(bool(self.dbg.anti_ptrace_bp_id))),
                  self._toggle_deny_attach_bypass),
-                ("{}  Anti-ptrace: defeat inline PT_DENY_ATTACH (scan for svc #0x80, no libc)".format(tick(bool(self.dbg.direct_syscall_bp_ids))),
+                ("{}  Defeat inline PT_DENY_ATTACH (scan for svc #0x80, no libc)".format(tick(bool(self.dbg.direct_syscall_bp_ids))),
                  self._toggle_direct_syscall_scan),
-                ("{}  Anti-debug: cloak Mach exception ports (report none, look unattached)".format(tick(bool(self.dbg.anti_mach_bp_id))),
+                ("{}  Cloak Mach exception ports (report none, look unattached)".format(tick(bool(self.dbg.anti_mach_bp_id))),
                  self._toggle_mach_ports_cloak),
-                ("{}  Stealth BPs: use hardware breakpoints for your breakpoints (no __TEXT patch)".format(tick(self.dbg.hw_breakpoints)),
+                header("Breakpoints"),
+                ("{}  Hardware breakpoints for your breakpoints (no __TEXT patch)".format(tick(self.dbg.hw_breakpoints)),
                  self._toggle_hw_bps),
-                ("{}  Stealth BPs: use hardware breakpoints for the tracer (set before Ctrl+T)".format(tick(self.tracer.hardware)),
+                ("{}  Hardware breakpoints for the tracer (set before Ctrl+T)".format(tick(self.tracer.hardware)),
                  self._toggle_tracer_hw),
-                ("{}  Fork intercept: fake fork/vfork→0 & setsid, run child path in-process".format(tick(self.dbg.fork_mode == "identity")),
+                header("Forks"),
+                ("{}  Intercept: fake fork/vfork→0 & setsid, run child path in-process".format(tick(self.dbg.fork_mode == "identity")),
                  self._toggle_fork_identity),
-                ("{}  Fork intercept: prompt each fork (stay in parent vs enter child)".format(tick(self.dbg.fork_interactive)),
+                ("{}  Intercept: prompt each fork (stay in parent vs enter child)".format(tick(self.dbg.fork_interactive)),
                  self._toggle_fork_interactive),
-                ("{}  Exec sandbox: intercept outbound system/popen/exec/posix_spawn".format(tick(bool(self.dbg.exec_bp_ids))),
-                 self._toggle_exec_sandbox),
-                ("{}  Exec sandbox: prompt each call (Allow / Fake / Block / Dump), else auto-block".format(tick(self.dbg.exec_interactive)),
-                 self._toggle_exec_interactive),
-                ("{}  Fork-tree syscall trace (DYLD interpose; follows children lldb can't; relaunches)".format(tick(self.dbg.interpose_enabled)),
+                ("{}  Trace the whole fork tree (DYLD interpose; follows children lldb can't; relaunches)".format(tick(self.dbg.interpose_enabled)),
                  self._toggle_fork_trace),
+                header("Exec"),
+                ("{}  Sandbox: intercept outbound system/popen/exec/posix_spawn".format(tick(bool(self.dbg.exec_bp_ids))),
+                 self._toggle_exec_sandbox),
+                ("{}  Sandbox: prompt each call (Allow / Fake / Block / Dump), else auto-block".format(tick(self.dbg.exec_interactive)),
+                 self._toggle_exec_interactive),
             ]
         w, h = self.size
         self.push_screen(ToggleMenu(build_items, x=max(0, w // 2 - 25), y=max(0, h // 3)))

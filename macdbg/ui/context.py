@@ -6,6 +6,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
+from rich.text import Text
 from textual.widgets import Input, Label, OptionList, TextArea
 from textual.widgets.option_list import Option
 
@@ -195,12 +196,20 @@ class ToggleMenu(ModalScreen):
         yield OptionList(id="menu_list")
 
     def _repopulate(self) -> None:
+        # An item is a (label, callback) toggle, or (name, None) for a
+        # non-selectable section header rendered as a dim full-width divider.
         ol = self.query_one("#menu_list", OptionList)
         items = self._get_items()
         self._current = items
         ol.clear_options()
-        for i, (label, _) in enumerate(items):
-            ol.add_option(Option(" " + label + " ", id=str(i)))
+        content_w = max((len(lbl) for lbl, cb in items if cb is not None), default=20)
+        for i, (label, callback) in enumerate(items):
+            if callback is None:
+                rule = "── {} ".format(label)
+                rule += "─" * max(0, content_w + 2 - len(rule))
+                ol.add_option(Option(Text(rule, style="dim bold"), disabled=True))
+            else:
+                ol.add_option(Option(" " + label + " ", id=str(i)))
 
     def on_mount(self) -> None:
         self._repopulate()
@@ -215,12 +224,19 @@ class ToggleMenu(ModalScreen):
         menu.styles.offset = (x, y)
         menu.styles.width = width
         menu.styles.height = height
+        first = next((i for i, (_, cb) in enumerate(items) if cb is not None), None)
+        if first is not None:
+            menu.highlighted = first
         menu.focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        idx = int(event.option.id or "0")
+        if event.option.id is None:
+            return
+        idx = int(event.option.id)
         highlighted = event.option_list.highlighted
         _, callback = self._current[idx]
+        if callback is None:
+            return
         callback()
         self._repopulate()
         try:
