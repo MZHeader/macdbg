@@ -345,6 +345,23 @@ def _f_nw_connection_receive(frame, p):
     return "nw_connection_receive()"
 
 
+def _f_cfurl_bytes(frame, p):
+    # CFURLCreateWithBytes(alloc, const UInt8 *bytes, CFIndex length, enc, base).
+    # The URL text is raw bytes at x1 with length x2 — the reliable place to
+    # recover the full request URL (path + query) for NSURLSession/CFNetwork,
+    # before TLS, regardless of http/https.
+    ptr = _reg(frame, "x1")
+    n = _reg(frame, "x2")
+    if not ptr or n <= 0 or n > 8192:
+        return "CFURLCreateWithBytes()"
+    err = lldb.SBError()
+    data = p.ReadMemory(ptr, min(n, 512), err)
+    if not err.Success() or not data:
+        return "CFURLCreateWithBytes()"
+    url = data.decode("utf-8", "replace")
+    return 'URL "{}"'.format(url[:200])
+
+
 SIGS: Dict[str, Tuple[str, Callable]] = {
     "open":               (FILE, _f_open),
     "open$NOCANCEL":      (FILE, _f_open),
@@ -411,6 +428,7 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "nw_connection_start":     (NET, _f_nw_connection_start),
     "nw_connection_send":      (NET, _f_nw_connection_send),
     "nw_connection_receive":   (NET, _f_nw_connection_receive),
+    "CFURLCreateWithBytes":    (NET, _f_cfurl_bytes),
     "shutdown":           (NET,  _f_shutdown),
     "setsockopt":         (NET,  _f_setsockopt),
     "getaddrinfo":        (NET,  _f_getaddrinfo),
