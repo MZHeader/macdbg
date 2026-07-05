@@ -236,6 +236,19 @@ class WrapperApp(App):
                     self._render_strings()
                 except Exception as e:
                     self.console_pane.write("[strings] extract failed: {}".format(e), error=True)
+                # launch() hops to the executable entry point synchronously, so
+                # no stop event reaches the pump — refresh the panes once here.
+                p = self.dbg.process
+                if p and p.IsValid():
+                    st = p.GetState()
+                    if st == lldb.eStateStopped:
+                        self.console_pane.write(
+                            "[entry] stopped at entry point {:#x}".format(self.dbg.pc() or 0))
+                        self._refresh_all()
+                    elif st == lldb.eStateExited:
+                        self.console_pane.write(
+                            self._describe_exit() + " (ran during startup before the entry point)",
+                            error=True)
             except Exception as e:
                 self.console_pane.write("launch failed: {}".format(e), error=True)
         else:

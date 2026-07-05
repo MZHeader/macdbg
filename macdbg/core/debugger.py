@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import struct
 from typing import Dict, List, Optional, Tuple
 
 import lldb
@@ -121,13 +122,102 @@ class Debugger:
         info.SetLaunchFlags(
             lldb.eLaunchFlagStopAtEntry | lldb.eLaunchFlagDisableASLR
         )
-        err = lldb.SBError()
-        self.process = self.target.Launch(info, err)
-        if not err.Success():
-            raise RuntimeError(f"Launch failed: {err.GetCString()}")
-        self._attached = False
+        # Launch synchronously so we can deterministically hop from dyld's
+        # _dyld_start (where stop-at-entry lands) to the executable's own entry
+        # point before the UI's async event loop takes over.
+        was_async = self.dbg.GetAsync()
+        self.dbg.SetAsync(False)
+        try:
+            err = lldb.SBError()
+            self.process = self.target.Launch(info, err)
+            if not err.Success():
+                raise RuntimeError(f"Launch failed: {err.GetCString()}")
+            self._attached = False
+            self._advance_to_entry_point()
+        finally:
+            self.dbg.SetAsync(was_async)
         self._hook_listener(self.process)
         return self.process
+
+    def entry_point_address(self) -> Optional[int]:
+        """The executable's real entry point (LC_MAIN entryoff + image base),
+        i.e. the arm64 equivalent of a PE AddressOfEntryPoint — NOT dyld's
+        _dyld_start. Computed slide-independently from the loaded image base so
+        it is correct regardless of where the executable mapped. Falls back to
+        the start/_start/main symbol, then None if it cannot be determined."""
+        if not self.target or not self.target.IsValid():
+            return None
+        exec_name = self.target.GetExecutable().GetFilename() or ""
+        exec_mod = None
+        for i in range(self.target.GetNumModules()):
+            m = self.target.GetModuleAtIndex(i)
+            if m.GetFileSpec().GetFilename() == exec_name:
+                exec_mod = m
+                break
+        if exec_mod is None:
+            return None
+        hdr = exec_mod.GetObjectFileHeaderAddress().GetLoadAddress(self.target)
+        if hdr not in (0, lldb.LLDB_INVALID_ADDRESS):
+            entryoff = self._read_lc_main_entryoff(hdr)
+            if entryoff is not None:
+                return hdr + entryoff
+        for name in ("start", "_start", "main"):
+            syms = exec_mod.FindSymbols(name)
+            for j in range(syms.GetSize()):
+                sym = syms.GetContextAtIndex(j).GetSymbol()
+                if sym.IsValid():
+                    a = sym.GetStartAddress().GetLoadAddress(self.target)
+                    if a not in (0, lldb.LLDB_INVALID_ADDRESS):
+                        return a
+        return None
+
+    def _read_lc_main_entryoff(self, hdr_addr: int) -> Optional[int]:
+        """Parse the Mach-O load commands at `hdr_addr` (in process memory) for
+        LC_MAIN and return its entryoff. 64-bit little-endian only; returns None
+        for anything else (e.g. legacy LC_UNIXTHREAD binaries)."""
+        head = self.read_memory(hdr_addr, 32)
+        if len(head) < 32:
+            return None
+        magic = struct.unpack_from("<I", head, 0)[0]
+        if magic != 0xFEEDFACF:  # MH_MAGIC_64, little-endian
+            return None
+        ncmds = struct.unpack_from("<I", head, 16)[0]
+        sizeofcmds = struct.unpack_from("<I", head, 20)[0]
+        cmds = self.read_memory(hdr_addr + 32, min(sizeofcmds, 65536))
+        LC_MAIN = 0x80000028
+        off = 0
+        for _ in range(ncmds):
+            if off + 8 > len(cmds):
+                break
+            cmd, cmdsize = struct.unpack_from("<II", cmds, off)
+            if cmdsize == 0:
+                break
+            if cmd == LC_MAIN and off + 16 <= len(cmds):
+                return struct.unpack_from("<Q", cmds, off + 8)[0]
+            off += cmdsize
+        return None
+
+    def _advance_to_entry_point(self) -> None:
+        """From the stop-at-entry position (_dyld_start), run to the
+        executable's own entry point via a one-shot breakpoint. Must be called
+        with the debugger in synchronous mode. A user breakpoint that fires
+        earlier (e.g. a restored BP in a constructor) simply wins — we leave the
+        process there and drop the pending one-shot."""
+        if not self.process or not self.process.IsValid():
+            return
+        if self.process.GetState() != lldb.eStateStopped:
+            return
+        ep = self.entry_point_address()
+        if ep is None or (self.pc() or 0) == ep:
+            return
+        bp = self.target.BreakpointCreateByAddress(ep)
+        if not bp.IsValid():
+            return
+        bp.SetOneShot(True)
+        bp_id = bp.GetID()
+        self.process.Continue()
+        if self.process.GetState() != lldb.eStateStopped or (self.pc() or 0) != ep:
+            self.target.BreakpointDelete(bp_id)
 
     def attach_pid(self, pid: int) -> lldb.SBProcess:
         self.target = self.dbg.CreateTarget("")
@@ -484,6 +574,8 @@ class Debugger:
             break
         if not text_bytes:
             return False, "could not read __text"
+        if text_load == 0 or text_load == lldb.LLDB_INVALID_ADDRESS:
+            return False, "target __text not mapped yet — launch the process first"
         svc_pattern = b"\x01\x10\x00\xd4"
         found = []
         for off in range(0, len(text_bytes) - 3, 4):
