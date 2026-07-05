@@ -718,6 +718,11 @@ class Debugger:
         if self.target.GetNumBreakpoints() <= n_before:
             return False
         hw_bp = self.target.GetBreakpointAtIndex(n_before)
+        # If no debug register was free the breakpoint resolves to nothing; abort
+        # rather than disable everything and lose the return (and all tracing).
+        if hw_bp.GetNumLocations() == 0:
+            self.target.BreakpointDelete(hw_bp.GetID())
+            return False
         saved = []
         for i in range(n_before):
             bp = self.target.GetBreakpointAtIndex(i)

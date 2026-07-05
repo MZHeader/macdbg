@@ -899,8 +899,15 @@ class WrapperApp(App):
     def _prompt_fork_decision(self, name: str, caller: Optional[int]) -> None:
         def parent():
             self.dbg.resolve_fork("parent")
-            self.console_pane.write(
-                "[anti-debug] {}() left real — real fork, staying in parent (child runs untraced)".format(name))
+            if self.dbg.in_fork_shield():
+                self.console_pane.write(
+                    "[anti-debug] {}() left real — staying in parent; breakpoints lifted across "
+                    "the fork so the child survives, restored on return".format(name))
+            else:
+                self.console_pane.write(
+                    "[anti-debug] {}() left real — staying in parent; could not shield the child "
+                    "(no free debug register), it may die on an inherited breakpoint".format(name),
+                    error=True)
 
         def child():
             self.dbg.resolve_fork("child")
