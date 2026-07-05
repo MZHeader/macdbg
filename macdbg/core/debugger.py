@@ -159,7 +159,13 @@ class Debugger:
             return True
         return host in out.split()
 
-    def _interpose_env(self) -> List[str]:
+    # The interposer's trace records go to this fixed fd (opened by an lldb file
+    # action, inherited across the fork tree) rather than one the interposer
+    # opens itself. A known number lets the lldb tracer skip its own hits on it,
+    # so the interposer's writes don't get double-traced as garbage rows.
+    INTERPOSE_FD = 199
+
+    def _interpose_env(self, info: lldb.SBLaunchInfo) -> List[str]:
         dylib = self.interpose_dylib()
         if not dylib:
             self.interpose_trace_path = None
@@ -168,9 +174,10 @@ class Debugger:
         fd, path = tempfile.mkstemp(prefix="macdbg-trace-", suffix=".tsv")
         os.close(fd)
         self.interpose_trace_path = path
+        info.AddOpenFileAction(self.INTERPOSE_FD, path, False, True)
         return [
             "DYLD_INSERT_LIBRARIES={}".format(dylib),
-            "MACDBG_TRACE_OUT={}".format(path),
+            "MACDBG_TRACE_FD={}".format(self.INTERPOSE_FD),
         ]
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
@@ -189,7 +196,7 @@ class Debugger:
         # tree and reports to a temp file macdbg tails, so children get traced
         # even though lldb can't follow a fork on macOS.
         if self.interpose_enabled:
-            env += self._interpose_env()
+            env += self._interpose_env(info)
         else:
             self.interpose_trace_path = None
         info.SetEnvironmentEntries(env, True)

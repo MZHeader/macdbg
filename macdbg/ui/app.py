@@ -284,8 +284,14 @@ class WrapperApp(App):
 
     def _maybe_start_interpose_reader(self) -> None:
         path = self.dbg.interpose_trace_path
-        if not path or self._interpose_thread is not None:
+        if not path:
+            self.tracer.skip_fd = -1
             return
+        if self._interpose_thread is not None:
+            return
+        # The lldb tracer must not log the interposer's own writes to its trace
+        # channel, so tell it which fd to ignore.
+        self.tracer.skip_fd = self.dbg.INTERPOSE_FD
         self._interpose_root_pid = (
             self.dbg.process.GetProcessID() if self.dbg.process else None)
         self._interpose_stop.clear()

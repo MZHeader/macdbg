@@ -11,6 +11,11 @@ FILE = "FILE"
 NET = "NET"
 PROC = "PROC"
 
+# Calls whose first arg is a file descriptor, used to skip hits on the interpose
+# trace fd so its writes aren't double-traced.
+_FD_CALLS = {"read", "write", "pread", "pwrite", "close",
+             "send", "recv", "sendto", "recvfrom"}
+
 
 @dataclass
 class TraceHit:
@@ -517,6 +522,7 @@ class Tracer:
         self._exec_name: str = ""
         self.caller_depth: int = 5
         self.hardware: bool = False
+        self.skip_fd: int = -1
 
     def enable(self, target: lldb.SBTarget, ci: Optional[lldb.SBCommandInterpreter] = None) -> Tuple[int, int]:
         if self.enabled or not target or not target.IsValid():
@@ -577,6 +583,10 @@ class Tracer:
     ) -> Optional[TraceHit]:
         if not frame or not frame.IsValid():
             return None
+        if self.skip_fd >= 0:
+            fname = (frame.GetFunctionName() or "").lstrip("_")
+            if fname.split("$", 1)[0] in _FD_CALLS and _reg(frame, "x0") == self.skip_fd:
+                return None
         if bp_id is not None and bp_id in self._regex_bps:
             cat, fmt = self._regex_bps[bp_id]
             if user_only and cat != NET and self._caller_is_noise(frame):

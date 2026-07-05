@@ -23,8 +23,15 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int out_fd(void) {
     if (trace_fd == -2) {
-        const char *path = getenv("MACDBG_TRACE_OUT");
-        trace_fd = path ? open(path, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
+        // macdbg opens the trace file at a fixed fd (MACDBG_TRACE_FD) so the
+        // lldb tracer can skip it; fall back to opening a path ourselves.
+        const char *fdstr = getenv("MACDBG_TRACE_FD");
+        if (fdstr) {
+            trace_fd = atoi(fdstr);
+        } else {
+            const char *path = getenv("MACDBG_TRACE_OUT");
+            trace_fd = path ? open(path, O_WRONLY | O_APPEND | O_CREAT, 0644) : -1;
+        }
     }
     return trace_fd;
 }
@@ -49,6 +56,7 @@ static void hexpreview(char *dst, size_t dstsz, const void *buf, size_t n) {
 }
 
 static void emit_io(const char *fn, int fd, const void *buf, size_t n) {
+    if (fd == out_fd()) return;  // never trace our own trace-channel writes
     char hex[160], rec[320];
     hexpreview(hex, sizeof hex, buf, n);
     snprintf(rec, sizeof rec, "%d\t%s\tfd=%d\tn=%zu\t%s\n", getpid(), fn, fd, n, hex);
