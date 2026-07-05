@@ -780,6 +780,18 @@ class Debugger:
             return None
         return cap["sym"], self._exec_preview(cap)
 
+    def _dumps_dir(self) -> str:
+        """Dumps live under a per-binary folder so samples don't share one bin,
+        e.g. ~/.macdbg/<binary>/dumps/. Falls back to 'unknown' if unnamed."""
+        name = ""
+        try:
+            if self.target:
+                name = self.target.GetExecutable().GetFilename() or ""
+        except Exception:
+            name = ""
+        safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in name)
+        return os.path.join(STATE_DIR, safe or "unknown", "dumps")
+
     def dump_exec_payload(self, bp_id: int) -> Optional[Tuple[str, int]]:
         """Write the full command / argv for the exec we're paused on to
         ~/.macdbg/dumps/ and return (path, bytes). None if not on an exec BP."""
@@ -797,7 +809,7 @@ class Debugger:
             for i, a in enumerate(cap["argv"]):
                 lines.append("  [{}] {}".format(i, a))
         body = "\n".join(lines) + "\n"
-        dumps = os.path.join(STATE_DIR, "dumps")
+        dumps = self._dumps_dir()
         os.makedirs(dumps, exist_ok=True)
         pid = self.process.GetProcessID() if self.process else 0
         stamp = time.strftime("%Y%m%d-%H%M%S")

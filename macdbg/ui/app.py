@@ -858,7 +858,7 @@ class WrapperApp(App):
             ("Allow  (let it run for real)",                     allow),
             ("Fake success  (do not run, return success)",       fake),
             ("Block  (do not run, return -1/failure)",           block),
-            ("Dump payload to file  (then choose)",              dump),
+            ("Dump payload to file",                             dump),
         ]
         self.console_pane.write(
             "[anti-debug] {}? paused — Allow / Fake success / Block / Dump (Esc = Block)".format(title))

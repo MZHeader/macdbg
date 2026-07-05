@@ -78,16 +78,26 @@ class ContextMenu(ModalScreen):
             box = self.query_one("#menu_box", Vertical)
             width = min(max(longest + 10, 48), max(20, screen_w - 2))
             header = self.query_one("#menu_header", Label)
-            header.styles.width = width - 2
-            header_lines = self._wrapped_line_count(self._header, width - 2)
-            height = len(self._items) + header_lines + 3
+            inner = max(1, width - 2)
+            # The header Label has 0 1 padding, so its text area is two columns
+            # narrower than the box interior; wrap to that or every line doubles.
+            htext = max(1, width - 4)
+            # Cap the preview so a huge command can never push the option list
+            # off the bottom of the box and hide the last choice.
+            capped = self._cap_lines(self._header, htext, self.MAX_HEADER_LINES)
+            header.update(capped)
+            header.styles.width = inner
+            header_lines = self._wrapped_line_count(capped, htext)
+            # Option list gets its full height; the box auto-sizes around header
+            # plus list, so every option always renders.
             menu.styles.height = len(self._items)
-            menu.styles.width = width - 2
+            menu.styles.width = inner
+            box.styles.width = width
+            box.styles.height = "auto"
+            height = len(self._items) + header_lines + 3
             x = min(self._x, max(0, screen_w - width))
             y = min(self._y, max(0, screen_h - height))
             box.styles.offset = (x, y)
-            box.styles.width = width
-            box.styles.height = height
         else:
             width = longest + 10
             height = len(self._items) + 2
@@ -98,6 +108,8 @@ class ContextMenu(ModalScreen):
             menu.styles.height = height
         menu.focus()
 
+    MAX_HEADER_LINES = 6
+
     @staticmethod
     def _wrapped_line_count(text: str, width: int) -> int:
         if width <= 0:
@@ -106,6 +118,21 @@ class ContextMenu(ModalScreen):
         for line in text.split("\n"):
             n += max(1, -(-len(line) // width))
         return n
+
+    @classmethod
+    def _cap_lines(cls, text: str, width: int, max_lines: int) -> str:
+        out: List[str] = []
+        for line in text.split("\n"):
+            while len(line) > width and len(out) < max_lines:
+                out.append(line[:width])
+                line = line[width:]
+            if len(out) >= max_lines:
+                break
+            out.append(line)
+        if len(out) >= max_lines and cls._wrapped_line_count(text, width) > max_lines:
+            out = out[:max_lines]
+            out[-1] = out[-1][: max(0, width - 2)] + " …"
+        return "\n".join(out)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         idx = int(event.option.id or "0")
