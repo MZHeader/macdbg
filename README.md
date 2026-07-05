@@ -1,18 +1,16 @@
 # macdbg
 
-A Textual TUI for Apple's system LLDB. Gives you a multi-pane view of the running process. Includes a lazy syscall & network tracer, defeats anti-debugging checks, and lets you edit registers and memory in place.
+A Textual TUI for LLDB. Gives you a multi-pane view of the running process. Includes a lazy syscall & network tracer that works on forked processes, defeats anti-debugging checks, and lets you edit registers and memory in place.
 
 ![Main view](docs/img/main-v4.png)
 
 ## Who Is This For
 
-For reverse engineers debugging macOS binaries who aren't very good at remembering CLI commands and want an experience closer to x64dbg.
+Reverse engineers and malware analysts debugging macOS binaries who aren't very good at remembering CLI commands and want an experience closer to x64dbg.
 
 ## Requirements
 
-- macOS with the Xcode Command Line Tools installed (`xcode-select --install`) — this provides `/usr/bin/lldb` and `/usr/bin/python3`, both of which macdbg uses directly.
-
-There is nothing to `pip install`: LLDB's Python bindings come from the system LLDB (they are not on PyPI) and the UI dependencies (textual, rich, and friends) are vendored under [`vendor/`](vendor), so a clone is self-contained. The one native component, the fork-tree tracer's interposer, ships as a prebuilt universal (arm64 + x86_64) dylib in [`macdbg/native/`](macdbg/native), so a stock offline box needs no compiler; the source sits beside it and is only recompiled if the prebuilt is missing or doesn't cover the host architecture.
+- macOS with the Xcode Command Line Tools installed
 
 ## Install
 
@@ -22,75 +20,41 @@ cd macdbg
 ./macdbg.sh /path/to/your/binary
 ```
 
-`macdbg.sh` is the entry point: it points `PYTHONPATH` at the system LLDB bindings (`lldb -P`) and the vendored dependencies, then launches the TUI. Run it from the clone.
-
 ## Syscall and Network Tracer
 
-Feeling lazy? Ctrl+T arms breakpoints on file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
-
-The tracer also hooks the plaintext side of TLS, so for a sample that rolls its own TLS over raw sockets the socket `send`/`recv` only carry ciphertext, but the cleartext request — the full URL, headers, and body — shows up at the write call before encryption. This is how you recover a C2 endpoint like `api.telegram.org/bot<token>/sendMessage` that never appears on the wire in the clear. Covered write functions: `SSL_write`/`SSL_write_ex` (OpenSSL/BoringSSL), `SSLWrite` (Secure Transport), `mbedtls_ssl_write`, `wolfSSL_write`, `gnutls_record_send`, `tls_write` (LibreSSL), Go's `crypto/tls.(*Conn).Write`, `EVP_AEAD_CTX_seal` (the BoringSSL/aws-lc record-sealing primitive), and rustls's `<Writer as std::io::Write>::write` (matched by regex since its symbol carries a per-build hash). Go and rustls both put the plaintext slice pointer and length in the same registers the C functions use, so one reader handles all of them.
-
-The catch is symbols. The C write functions resolve only if the sample links the TLS library dynamically; the Go and rustls hooks resolve only if the binary keeps its symbol table. A fully stripped in-language TLS stack — `go build -ldflags "-s -w"`, or a Rust build with `strip = true` — exposes no name to hook, and the plaintext is cleared before the socket `write`, so it isn't recoverable by scanning memory at send time either. For those the realistic options are finding the write function by hand (disassembly) and breakpointing it, or extracting the TLS session keys and decrypting the ciphertext the tracer already logs.
+Feeling lazy? `Ctrl+T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
 
 ![Trace tab](docs/img/trace.png)
 
-### Tracing forked children
-
-lldb on macOS cannot follow a fork into the child — there is no `PTRACE_TRACEFORK`, and a debugger that attaches to a forked child can read its memory but its breakpoints never fire. So a sample whose real work happens in a forked child (a C2 handler loop, a per-connection worker) is invisible to the breakpoint tracer, which only ever sees the parent.
-
-The **Fork-tree syscall trace** toggle in the Ctrl+D menu fills that gap without ptrace. It relaunches the target with a small interposer dylib on `DYLD_INSERT_LIBRARIES`, which is inherited across `fork`, so every child that isn't a restricted system binary reports its `read`/`write`/`send`/`recv`/`connect`/`open` calls — with decoded buffer contents — into the trace pane, tagged by pid. This is how you see the commands a forked C2 child receives and the data it sends back, which lldb alone can't show. It complements the breakpoint tracer: the interposer covers the children, the breakpoint tracer covers the parent (so parent calls aren't double-listed).
-
-The limit is `exec`. Because the parent is ptrace-traced, macOS marks its children restricted, and `dyld` drops `DYLD_INSERT_LIBRARIES` when a restricted process calls `exec`. So a fork **without** exec — the child runs the sample's own code — is fully traced; a fork **followed by exec** loses the interposer at the exec (into `/bin/sh` and other system binaries it would be stripped regardless). For a fork+exec child the parent side is usually the useful view anyway: the command it feeds the child over the pipe shows up in the parent's traced `write`.
-
 ## Anti-anti-debug
 
-Ctrl+D opens a menu of independent bypass toggles, all off by default:
+`Ctrl+D` opens a menu of toggles, all off by default.
 
 ![Defenses menu](docs/img/debug-menu.png)
 
-- **Anti-ptrace: defeat PT_DENY_ATTACH via libc** hooks `ptrace` and returns `0` when the deny flag is set, so the kernel never sees the call.
-- **Anti-ptrace: defeat inline PT_DENY_ATTACH** catches the same denial when the sample skips libc and issues `svc #0x80` inline.
-- **Anti-debug: cloak Mach exception ports** hooks `task_get_exception_ports` and returns zero ports, so nothing looks attached.
-- **Stealth BPs for your breakpoints** puts your breakpoints in hardware registers instead of patching bytes in `__TEXT`, which beats prologue-hash checks.
-- **Stealth BPs for the tracer** does the same for tracer BPs. Flip it before enabling the tracer.
-- **Fork intercept: run child path in-process** makes `fork`/`vfork` return `0` and `setsid` return a positive fake sid, so the current process walks the child code path in-process and no debugger reattach is needed. This is the tool for a *daemonization gate* (fork, parent `_exit`s, child `setsid`s to detach). It is the wrong tool for a fork that immediately `execvp`s a helper — that would exec your traced process into the helper and lose it — so pair it with the prompt below on a sample that does both.
-- **Fork intercept: prompt each fork** halts on every `fork`/`vfork` and asks per call site: **Stay in parent** (let the real fork happen, child runs untraced, you keep debugging the parent — right for a fork+exec where the interesting logic drives a pipe/PTY from the parent) or **Enter child in-process** (fake the return to `0` and walk the child branch in-process, right for a fork whose child is C2 logic rather than an `exec`). Lets you mix both in one sample.
-- **Exec sandbox: intercept outbound exec** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`. With the prompt off it auto-blocks (returns `-1`); with **prompt each call** on it halts on each and offers Allow, Fake success (block the call but return a success value, so a sample that checks the result keeps running instead of detecting the block), Block, or Dump payload. The preview reads the whole command and, for the exec/spawn calls, the full `argv`, so a dropper that hides its script in `osascript -e <script>` or `sh -c <script>` shows up instead of just the interpreter path. Dump payload writes the full command and `argv` to `~/.macdbg/<binary>-<sha>/dumps/` when you pick it; unattended auto-block writes large payloads there on its own since there's no prompt to ask.
+**Anti-debug**
 
-### What The Fork Bypass Defeats
+- **Defeat PT_DENY_ATTACH via libc** hooks `ptrace` and returns `0`, so the deny flag never reaches the kernel.
+- **Defeat inline PT_DENY_ATTACH** catches the same call when the sample skips libc and runs `svc #0x80` directly.
+- **Cloak Mach exception ports** hooks `task_get_exception_ports` to report none, so the process looks unattached.
 
-This is the macOS daemonization gate. Parent exits to look like normal termination, and the child re-parents to launchd and detaches from the controlling TTY so a debugger attached to the parent loses visibility. If either call fails, the sample bails without running the payload.
+**Breakpoints**
 
-```c
-pid_t pid = fork();
-if (pid < 0) {
-    return;
-}
-if (pid > 0) {
-    _exit(0);
-}
+- **Hardware breakpoints for your breakpoints** leave the bytes in `__TEXT` untouched, so a prologue-hash check passes.
+- **Hardware breakpoints for the tracer** do the same for tracer BPs. Turn it on before `Ctrl+T`.
 
-pid_t sid = setsid();
-if (sid < 0) {
-    return;
-}
-```
+**Forks**
+> For cases where the sample forks, the parent exits, and the child detaches with `setsid`.
 
-The compiled form checks the sign bit directly (`tst x0, #0x80000000` or `tbnz x0, #31, <bail>`) rather than comparing to `-1`. Fork identity mode returns `0` from `fork` and a positive value from `setsid` so both branches walk into the payload block instead of the abort path.
+- **Run child path in-process** fakes `fork`/`vfork` to `0` and `setsid` to a real sid.
+- **Prompt each fork** stops on every fork and asks whether to stay in the parent or enter the child. Answer per site.
+- **Trace the whole fork tree** shows the syscalls of children lldb can't follow.
 
-### What The Exec Sandbox Defeats
+**Exec**
+> For samples that call something like `killall Terminal`, we can just intercept it, say no, and spoof a success result.
 
-Samples that harden themselves against dynamic analysis by killing the analyst's environment. A common pattern is `killall Terminal`.
-
-```c
-system("uname -a");
-if (some_check()) {
-    system("killall Terminal");
-}
-decrypt_c2_config();
-```
-
-Auto-block mode intercepts every outbound exec and returns `-1`. Interactive mode is more useful for real triage: the recon `system("uname -a")` gets an Allow so the sample sees real output. The `system("killall Terminal")` gets a Block and returns `-1`. Sample believes both fired and keeps executing into the payload.
+- **Intercept outbound exec** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`.
+- **Prompt each call** offers Allow, Fake success, Block, or Dump per call, otherwise auto-blocks.
 
 ## Breakpoint Scripting
 
