@@ -397,6 +397,18 @@ class WrapperApp(App):
                             "[anti-debug] {} called from {:#x}".format(name, caller))
                     self._prompt_exec_decision(name, cmd, exec_bp)
                     return True
+        if self.dbg.fork_interactive and self.dbg.fork_bp_ids:
+            fork_bp = next((b for b in bp_ids if b in self.dbg.fork_bp_ids), None)
+            if fork_bp is not None:
+                name = self.dbg.peek_fork_hit(fork_bp)
+                if name is not None:
+                    caller = self._exec_caller_site()
+                    self._refresh_all(disasm_center=caller)
+                    if caller:
+                        self.console_pane.write(
+                            "[anti-debug] {} called from {:#x}".format(name, caller))
+                    self._prompt_fork_decision(name, caller)
+                    return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
@@ -739,21 +751,23 @@ class WrapperApp(App):
 
         def build_items():
             return [
-                ("{}  PT_DENY_ATTACH bypass (symbol hook)".format(tick(bool(self.dbg.anti_ptrace_bp_id))),
+                ("{}  Anti-ptrace: defeat PT_DENY_ATTACH via libc (hook ptrace, return 0)".format(tick(bool(self.dbg.anti_ptrace_bp_id))),
                  self._toggle_deny_attach_bypass),
-                ("{}  Direct-syscall ptrace scan (mov x16,#26 / svc)".format(tick(bool(self.dbg.direct_syscall_bp_ids))),
+                ("{}  Anti-ptrace: defeat inline PT_DENY_ATTACH (scan for svc #0x80, no libc)".format(tick(bool(self.dbg.direct_syscall_bp_ids))),
                  self._toggle_direct_syscall_scan),
-                ("{}  Mach exception port cloak".format(tick(bool(self.dbg.anti_mach_bp_id))),
+                ("{}  Anti-debug: cloak Mach exception ports (report none, look unattached)".format(tick(bool(self.dbg.anti_mach_bp_id))),
                  self._toggle_mach_ports_cloak),
-                ("{}  Hardware BPs for user breakpoints".format(tick(self.dbg.hw_breakpoints)),
+                ("{}  Stealth BPs: use hardware breakpoints for your breakpoints (no __TEXT patch)".format(tick(self.dbg.hw_breakpoints)),
                  self._toggle_hw_bps),
-                ("{}  Hardware BPs for tracer breakpoints".format(tick(self.tracer.hardware)),
+                ("{}  Stealth BPs: use hardware breakpoints for the tracer (set before Ctrl+T)".format(tick(self.tracer.hardware)),
                  self._toggle_tracer_hw),
-                ("{}  Fork identity mode (fork+setsid faked, parent runs child path)".format(tick(self.dbg.fork_mode == "identity")),
+                ("{}  Fork intercept: fake fork/vfork→0 & setsid, run child path in-process".format(tick(self.dbg.fork_mode == "identity")),
                  self._toggle_fork_identity),
-                ("{}  Outbound exec sandbox (system/popen/execve/posix_spawn)".format(tick(bool(self.dbg.exec_bp_ids))),
+                ("{}  Fork intercept: prompt each fork (stay in parent vs enter child)".format(tick(self.dbg.fork_interactive)),
+                 self._toggle_fork_interactive),
+                ("{}  Exec sandbox: intercept outbound system/popen/exec/posix_spawn".format(tick(bool(self.dbg.exec_bp_ids))),
                  self._toggle_exec_sandbox),
-                ("{}  Exec sandbox: interactive (prompt per call instead of auto-block)".format(tick(self.dbg.exec_interactive)),
+                ("{}  Exec sandbox: prompt each call (Allow / Fake / Block / Dump), else auto-block".format(tick(self.dbg.exec_interactive)),
                  self._toggle_exec_interactive),
             ]
         w, h = self.size
@@ -806,6 +820,16 @@ class WrapperApp(App):
             _, msg = self.dbg.enable_fork_identity()
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_fork_interactive(self) -> None:
+        self.dbg.fork_interactive = not self.dbg.fork_interactive
+        if self.dbg.fork_interactive and self.dbg.fork_mode != "identity":
+            # The prompt needs the fork breakpoints, so arm the intercept too.
+            _, msg = self.dbg.enable_fork_identity()
+            self.console_pane.write("[anti-debug] " + msg)
+            self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+        self.console_pane.write("[anti-debug] fork intercept prompt: {}".format(
+            "ON (choose parent or child per fork)" if self.dbg.fork_interactive else "OFF"))
 
     def _dump_exec_payload(self, bp_id: Optional[int]) -> None:
         if bp_id is None:
@@ -863,6 +887,40 @@ class WrapperApp(App):
             x=max(0, w // 2 - 25),
             y=max(0, h // 3),
             on_dismiss=default_block,
+            header=header,
+        ))
+
+    def _prompt_fork_decision(self, name: str, caller: Optional[int]) -> None:
+        def parent():
+            self.dbg.resolve_fork("parent")
+            self.console_pane.write(
+                "[anti-debug] {}() left real — real fork, staying in parent (child runs untraced)".format(name))
+
+        def child():
+            self.dbg.resolve_fork("child")
+            self.console_pane.write(
+                "[anti-debug] {}() faked to 0 — running the child code path in-process".format(name))
+
+        def default_parent():
+            self.dbg.resolve_fork("parent")
+            self.console_pane.write(
+                "[anti-debug] dismissed — real fork, staying in parent")
+
+        where = " at {:#x}".format(caller) if caller else ""
+        header = ("Intercepted {}(){}\nStay in the parent (real fork, child "
+                  "runs free), or walk the child path in-process?".format(name, where))
+        items = [
+            ("Stay in parent  (real fork; child runs untraced)",       parent),
+            ("Enter child in-process  (return 0; trace child path)",   child),
+        ]
+        self.console_pane.write(
+            "[anti-debug] {}(){}? paused — Parent / Child (Esc = Parent)".format(name, where))
+        w, h = self.size
+        self.push_screen(ContextMenu(
+            items,
+            x=max(0, w // 2 - 25),
+            y=max(0, h // 3),
+            on_dismiss=default_parent,
             header=header,
         ))
 

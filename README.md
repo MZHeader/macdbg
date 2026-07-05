@@ -40,13 +40,14 @@ Ctrl+D opens a menu of independent bypass toggles, all off by default:
 
 ![Defenses menu](docs/img/debug-menu.png)
 
-- **PT_DENY_ATTACH bypass** hooks `ptrace` and returns `0` when the deny flag is set, so the kernel never sees the call.
-- **Direct-syscall ptrace scan** catches the same denial when the sample skips libc and issues `svc #0x80` inline.
-- **Mach exception port cloak** hooks `task_get_exception_ports` and returns zero ports, so nothing looks attached.
-- **Hardware BPs for user breakpoints** stops user breakpoints from patching bytes in `__TEXT`, which beats prologue-hash checks.
-- **Hardware BPs for tracer breakpoints** does the same for tracer BPs. Flip it before enabling the tracer.
-- **Fork identity mode** makes `fork` return `0` and `setsid` return a positive fake sid, so the parent runs the child code path in-process and no debugger reattach is needed.
-- **Outbound exec sandbox** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`. Auto-block returns `-1` to every call; interactive halts on each and prompts Allow, Fake success (block the call but return a success value, so a sample that checks the result keeps running instead of detecting the block), Block, or Dump payload. The preview reads the whole command and, for the exec/spawn calls, the full `argv`, so a dropper that hides its script in `osascript -e <script>` or `sh -c <script>` shows up instead of just the interpreter path. Dump payload writes the full command and `argv` to `~/.macdbg/<binary>-<sha>/dumps/` when you pick it; unattended auto-block writes large payloads there on its own since there's no prompt to ask.
+- **Anti-ptrace: defeat PT_DENY_ATTACH via libc** hooks `ptrace` and returns `0` when the deny flag is set, so the kernel never sees the call.
+- **Anti-ptrace: defeat inline PT_DENY_ATTACH** catches the same denial when the sample skips libc and issues `svc #0x80` inline.
+- **Anti-debug: cloak Mach exception ports** hooks `task_get_exception_ports` and returns zero ports, so nothing looks attached.
+- **Stealth BPs for your breakpoints** puts your breakpoints in hardware registers instead of patching bytes in `__TEXT`, which beats prologue-hash checks.
+- **Stealth BPs for the tracer** does the same for tracer BPs. Flip it before enabling the tracer.
+- **Fork intercept: run child path in-process** makes `fork`/`vfork` return `0` and `setsid` return a positive fake sid, so the current process walks the child code path in-process and no debugger reattach is needed. This is the tool for a *daemonization gate* (fork, parent `_exit`s, child `setsid`s to detach). It is the wrong tool for a fork that immediately `execvp`s a helper — that would exec your traced process into the helper and lose it — so pair it with the prompt below on a sample that does both.
+- **Fork intercept: prompt each fork** halts on every `fork`/`vfork` and asks per call site: **Stay in parent** (let the real fork happen, child runs untraced, you keep debugging the parent — right for a fork+exec where the interesting logic drives a pipe/PTY from the parent) or **Enter child in-process** (fake the return to `0` and walk the child branch in-process, right for a fork whose child is C2 logic rather than an `exec`). Lets you mix both in one sample.
+- **Exec sandbox: intercept outbound exec** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`. With the prompt off it auto-blocks (returns `-1`); with **prompt each call** on it halts on each and offers Allow, Fake success (block the call but return a success value, so a sample that checks the result keeps running instead of detecting the block), Block, or Dump payload. The preview reads the whole command and, for the exec/spawn calls, the full `argv`, so a dropper that hides its script in `osascript -e <script>` or `sh -c <script>` shows up instead of just the interpreter path. Dump payload writes the full command and `argv` to `~/.macdbg/<binary>-<sha>/dumps/` when you pick it; unattended auto-block writes large payloads there on its own since there's no prompt to ask.
 
 ### What The Fork Bypass Defeats
 

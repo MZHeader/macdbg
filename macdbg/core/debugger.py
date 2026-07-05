@@ -462,6 +462,7 @@ class Debugger:
     fork_mode: str = "off"
     exec_bp_ids: Optional[Dict[int, str]] = None
     exec_interactive: bool = False
+    fork_interactive: bool = False
 
     def toggle_breakpoint_at(self, addr: int) -> Tuple[str, int]:
         assert self.target is not None
@@ -655,6 +656,7 @@ class Debugger:
         self.fork_bp_ids = []
         self.setsid_bp_ids = []
         self.fork_mode = "off"
+        self.fork_interactive = False
         return True, "fork identity disabled"
 
     def handle_setsid_hit(self, bp_id: int) -> Optional[str]:
@@ -668,10 +670,32 @@ class Debugger:
         self.process.Continue()
         return "identity: setsid() faked, returned {} (real call would fail)".format(fake_sid)
 
+    def peek_fork_hit(self, bp_id: int) -> Optional[str]:
+        """If stopped on a fork/vfork breakpoint, return its name without acting,
+        so the caller can prompt for parent-vs-child. None otherwise."""
+        if not self.fork_bp_ids or bp_id not in self.fork_bp_ids or not self.process:
+            return None
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        return frame.GetFunctionName() or "fork"
+
+    def resolve_fork(self, decision: str = "parent") -> None:
+        """parent: let the real fork happen (child runs untraced, we stay on the
+        parent). child: fake the return as 0 so the current process walks the
+        child code path in-process, where it stays traceable."""
+        if not self.process:
+            return
+        if decision == "child":
+            ret = lldb.SBCommandReturnObject()
+            self.ci.HandleCommand("thread return 0", ret, False)
+        self.process.Continue()
+
     def handle_fork_hit(self, bp_id: int) -> Optional[str]:
         if not self.fork_bp_ids or bp_id not in self.fork_bp_ids or not self.process:
             return None
-        if self.fork_mode != "identity":
+        if self.fork_mode != "identity" or self.fork_interactive:
             return None
         thread = self.process.GetSelectedThread()
         if not thread or not thread.IsValid():
