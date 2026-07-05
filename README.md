@@ -34,6 +34,14 @@ The catch is symbols. The C write functions resolve only if the sample links the
 
 ![Trace tab](docs/img/trace.png)
 
+### Tracing forked children
+
+lldb on macOS cannot follow a fork into the child — there is no `PTRACE_TRACEFORK`, and a debugger that attaches to a forked child can read its memory but its breakpoints never fire. So a sample whose real work happens in a forked child (a C2 handler loop, a per-connection worker) is invisible to the breakpoint tracer, which only ever sees the parent.
+
+The **Fork-tree syscall trace** toggle in the Ctrl+D menu fills that gap without ptrace. It relaunches the target with a small interposer dylib on `DYLD_INSERT_LIBRARIES`, which is inherited across `fork`, so every child that isn't a restricted system binary reports its `read`/`write`/`send`/`recv`/`connect`/`open` calls — with decoded buffer contents — into the trace pane, tagged by pid. This is how you see the commands a forked C2 child receives and the data it sends back, which lldb alone can't show. It complements the breakpoint tracer: the interposer covers the children, the breakpoint tracer covers the parent (so parent calls aren't double-listed).
+
+The limit is `exec`. Because the parent is ptrace-traced, macOS marks its children restricted, and `dyld` drops `DYLD_INSERT_LIBRARIES` when a restricted process calls `exec`. So a fork **without** exec — the child runs the sample's own code — is fully traced; a fork **followed by exec** loses the interposer at the exec (into `/bin/sh` and other system binaries it would be stripped regardless). For a fork+exec child the parent side is usually the useful view anyway: the command it feeds the child over the pipe shows up in the parent's traced `write`.
+
 ## Anti-anti-debug
 
 Ctrl+D opens a menu of independent bypass toggles, all off by default:

@@ -33,6 +33,8 @@ class Debugger:
         self.listener: lldb.SBListener = self.dbg.GetListener()
         self._attached: bool = False
         self.state: Optional[BinaryState] = None
+        self.interpose_enabled: bool = False
+        self.interpose_trace_path: Optional[str] = None
 
         self._out_r_fd, self._out_w_fd = os.pipe()
         os.set_blocking(self._out_r_fd, False)
@@ -117,6 +119,42 @@ class Debugger:
         self.state.breakpoints = self.snapshot_user_breakpoints(exclude_ids)
         return self.state.save()
 
+    def interpose_dylib(self) -> str:
+        """Path to the DYLD interposer, compiled on first use so a clone works
+        without a build step. Returns '' if it can't be produced."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        native = os.path.join(os.path.dirname(here), "native")
+        dylib = os.path.join(native, "interpose.dylib")
+        src = os.path.join(native, "interpose.c")
+        if os.path.exists(dylib):
+            if not os.path.exists(src) or os.path.getmtime(dylib) >= os.path.getmtime(src):
+                return dylib
+        if not os.path.exists(src):
+            return dylib if os.path.exists(dylib) else ""
+        import subprocess
+        try:
+            subprocess.run(
+                ["clang", "-dynamiclib", "-O2", "-o", dylib, src],
+                check=True, capture_output=True,
+            )
+        except Exception:
+            return dylib if os.path.exists(dylib) else ""
+        return dylib
+
+    def _interpose_env(self) -> List[str]:
+        dylib = self.interpose_dylib()
+        if not dylib:
+            self.interpose_trace_path = None
+            return []
+        import tempfile
+        fd, path = tempfile.mkstemp(prefix="macdbg-trace-", suffix=".tsv")
+        os.close(fd)
+        self.interpose_trace_path = path
+        return [
+            "DYLD_INSERT_LIBRARIES={}".format(dylib),
+            "MACDBG_TRACE_OUT={}".format(path),
+        ]
+
     def launch(self, argv: List[str]) -> lldb.SBProcess:
         assert self.target is not None
         info = lldb.SBLaunchInfo(argv)
@@ -128,10 +166,16 @@ class Debugger:
         # posix_spawn) falls back to /usr/bin:/bin and can't find tools in
         # /usr/sbin like system_profiler. Inherit our environment, minus the
         # PYTHONPATH macdbg.sh injected for its own use.
-        info.SetEnvironmentEntries(
-            ["{}={}".format(k, v) for k, v in os.environ.items() if k != "PYTHONPATH"],
-            True,
-        )
+        env = ["{}={}".format(k, v) for k, v in os.environ.items() if k != "PYTHONPATH"]
+        # Whole-tree syscall tracing: an interposer dylib rides DYLD_INSERT_
+        # LIBRARIES into every child of the fork tree and reports to a temp file
+        # macdbg tails. This is how children get traced at all, since lldb can't
+        # follow a fork on macOS.
+        if self.interpose_enabled:
+            env += self._interpose_env()
+        else:
+            self.interpose_trace_path = None
+        info.SetEnvironmentEntries(env, True)
         was_async = self.dbg.GetAsync()
         self.dbg.SetAsync(False)
         try:

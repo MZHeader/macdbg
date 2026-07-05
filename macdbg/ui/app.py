@@ -135,6 +135,9 @@ class WrapperApp(App):
         self._trace_count = 0
         self._output_stop = threading.Event()
         self._output_thread: Optional[threading.Thread] = None
+        self._interpose_stop = threading.Event()
+        self._interpose_thread: Optional[threading.Thread] = None
+        self._interpose_root_pid: Optional[int] = None
         self._search_last: Optional[bytes] = None
         self._search_hits: List[int] = []
         self._search_pos: int = 0
@@ -207,6 +210,7 @@ class WrapperApp(App):
             target=self._pump_lldb_output, name="lldb-output", daemon=True,
         )
         self._output_thread.start()
+        self._maybe_start_interpose_reader()
         if self.attach_pid:
             try:
                 self.dbg.attach_pid(self.attach_pid)
@@ -260,6 +264,7 @@ class WrapperApp(App):
         if self.pump:
             self.pump.stop()
         self._output_stop.set()
+        self._interpose_stop.set()
         try:
             self.dbg.save_state(self._hidden_bp_ids())
         except Exception:
@@ -276,6 +281,89 @@ class WrapperApp(App):
                 self.call_from_thread(self.console_pane.write, text)
             else:
                 time.sleep(0.05)
+
+    def _maybe_start_interpose_reader(self) -> None:
+        path = self.dbg.interpose_trace_path
+        if not path or self._interpose_thread is not None:
+            return
+        self._interpose_root_pid = (
+            self.dbg.process.GetProcessID() if self.dbg.process else None)
+        self._interpose_stop.clear()
+        self._interpose_thread = threading.Thread(
+            target=self._pump_interpose_trace, args=(path,),
+            name="interpose-trace", daemon=True,
+        )
+        self._interpose_thread.start()
+
+    _INTERPOSE_CAT = {
+        "read": "FILE", "write": "FILE", "open": "FILE",
+        "send": "NET", "recv": "NET", "connect": "NET",
+    }
+
+    @staticmethod
+    def _fmt_hexbuf(hexstr: str) -> str:
+        try:
+            b = bytes.fromhex(hexstr)
+        except ValueError:
+            return ""
+        printable = sum(1 for c in b if 32 <= c < 127 or c in (9, 10, 13))
+        if b and printable / len(b) > 0.7:
+            s = b.decode("ascii", "replace").replace("\n", "\\n").replace("\r", "\\r")
+            return '"{}"'.format(s[:80])
+        return "<{}B: {}{}>".format(len(b), b[:24].hex(), "…" if len(b) > 24 else "")
+
+    def _format_interpose(self, fields: List[str]) -> Optional[tuple]:
+        # pid<TAB>fn<TAB>...  — the root pid is the process lldb already traces,
+        # so skip it here and only surface the children lldb can't reach.
+        if len(fields) < 2:
+            return None
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            return None
+        if self._interpose_root_pid is not None and pid == self._interpose_root_pid:
+            return None
+        fn = fields[1]
+        cat = self._INTERPOSE_CAT.get(fn, "PROC")
+        tag = "[pid {}] ".format(pid)
+        if fn in ("read", "write", "send", "recv") and len(fields) >= 5:
+            buf = self._fmt_hexbuf(fields[4])
+            call = "{}{}({}, {})".format(tag, fn, fields[2], buf)
+        elif fn == "connect" and len(fields) >= 3:
+            call = "{}connect({}, {})".format(tag, fields[2], fields[3] if len(fields) > 3 else "")
+        elif fn == "open" and len(fields) >= 3:
+            call = '{}open("{}")'.format(tag, fields[2])
+        else:
+            call = "{}{}".format(tag, fn)
+        return cat, call
+
+    def _pump_interpose_trace(self, path: str) -> None:
+        pos = 0
+        buf = ""
+        while not self._interpose_stop.is_set():
+            try:
+                with open(path, "r") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+            except OSError:
+                chunk = ""
+            if not chunk:
+                time.sleep(0.08)
+                continue
+            buf += chunk
+            lines = buf.split("\n")
+            buf = lines.pop()
+            for line in lines:
+                if not line:
+                    continue
+                parsed = self._format_interpose(line.split("\t"))
+                if parsed:
+                    self.call_from_thread(self._add_interpose_row, parsed[0], parsed[1])
+
+    def _add_interpose_row(self, category: str, call: str) -> None:
+        self._trace_count += 1
+        self.trace_pane.add_hit(self._trace_count, category, call)
 
     def _on_stop_event(self, e: StopEvent) -> None:
         if e.state == lldb.eStateStopped:
@@ -555,6 +643,10 @@ class WrapperApp(App):
         p = self.dbg.process
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
+        self._interpose_stop.set()
+        if self._interpose_thread is not None:
+            self._interpose_thread.join(timeout=0.5)
+            self._interpose_thread = None
         # Tracer/anti-debug breakpoints sit on libSystem functions that run
         # during startup, so leave them disabled across the relaunch or the
         # entry-point hop would stop on one of them instead of the entry point.
@@ -577,9 +669,24 @@ class WrapperApp(App):
         proc = self.dbg.process
         if proc and proc.IsValid() and proc.GetState() == lldb.eStateStopped:
             self.console_pane.write("[restart] relaunched, at entry {:#x}".format(self.dbg.pc() or 0))
+            self._maybe_start_interpose_reader()
             self._refresh_all()
         elif proc and proc.GetState() == lldb.eStateExited:
             self.console_pane.write(self._describe_exit(), error=True)
+
+    def _toggle_fork_trace(self) -> None:
+        if self.attach_pid:
+            self.console_pane.write(
+                "[fork-trace] not available for an attached process", error=True)
+            return
+        self.dbg.interpose_enabled = not self.dbg.interpose_enabled
+        if self.dbg.interpose_enabled:
+            self.console_pane.write(
+                "[fork-trace] whole-tree syscall tracing ON — relaunching so the "
+                "interposer loads (follows forks/children lldb can't)")
+        else:
+            self.console_pane.write("[fork-trace] whole-tree syscall tracing OFF — relaunching")
+        self.action_restart()
 
     def action_toggle_bp(self) -> None:
         pc = self.dbg.pc()
@@ -775,6 +882,8 @@ class WrapperApp(App):
                  self._toggle_exec_sandbox),
                 ("{}  Exec sandbox: prompt each call (Allow / Fake / Block / Dump), else auto-block".format(tick(self.dbg.exec_interactive)),
                  self._toggle_exec_interactive),
+                ("{}  Fork-tree syscall trace (DYLD interpose; follows children lldb can't; relaunches)".format(tick(self.dbg.interpose_enabled)),
+                 self._toggle_fork_trace),
             ]
         w, h = self.size
         self.push_screen(ToggleMenu(build_items, x=max(0, w // 2 - 25), y=max(0, h // 3)))

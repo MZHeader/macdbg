@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 .DS_Store
 test/
+
+# compiled on first use from macdbg/native/interpose.c
+macdbg/native/interpose.dylib
