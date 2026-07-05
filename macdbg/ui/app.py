@@ -352,6 +352,20 @@ class WrapperApp(App):
                 return f.GetPC()
         return None
 
+    @staticmethod
+    def _stop_bp_ids(thread) -> List[int]:
+        # A breakpoint stop reports (bp_id, loc_id) pairs. When a symbol carries
+        # more than one breakpoint — the tracer and the exec sandbox both hook
+        # system/posix_spawn/… — every id lands here, so anti-debug handling must
+        # look at all of them rather than trusting index 0.
+        ids: List[int] = []
+        n = thread.GetStopReasonDataCount()
+        i = 0
+        while i < n:
+            ids.append(thread.GetStopReasonDataAtIndex(i))
+            i += 2
+        return ids
+
     def _handle_anti_debug_hit(self) -> bool:
         process = self.dbg.process
         if not process or not process.IsValid():
@@ -361,30 +375,32 @@ class WrapperApp(App):
             return False
         if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
             return False
-        if thread.GetStopReasonDataCount() < 1:
+        bp_ids = self._stop_bp_ids(thread)
+        if not bp_ids:
             return False
-        bp_id = thread.GetStopReasonDataAtIndex(0)
         if self.dbg.exec_interactive:
-            peeked = self.dbg.peek_exec_hit(bp_id)
-            if peeked is not None:
-                name, cmd = peeked
-                caller = self._exec_caller_site()
-                self._refresh_all(disasm_center=caller)
-                if caller:
-                    self.console_pane.write(
-                        "[anti-debug] {} called from {:#x}".format(name, caller))
-                self._prompt_exec_decision(name, cmd)
-                return True
+            for bp_id in bp_ids:
+                peeked = self.dbg.peek_exec_hit(bp_id)
+                if peeked is not None:
+                    name, cmd = peeked
+                    caller = self._exec_caller_site()
+                    self._refresh_all(disasm_center=caller)
+                    if caller:
+                        self.console_pane.write(
+                            "[anti-debug] {} called from {:#x}".format(name, caller))
+                    self._prompt_exec_decision(name, cmd)
+                    return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
                         self.dbg.handle_fork_hit,
                         self.dbg.handle_setsid_hit,
                         self.dbg.handle_exec_hit):
-            msg = handler(bp_id)
-            if msg is not None:
-                self.console_pane.write("[anti-debug] " + msg)
-                return True
+            for bp_id in bp_ids:
+                msg = handler(bp_id)
+                if msg is not None:
+                    self.console_pane.write("[anti-debug] " + msg)
+                    return True
         return False
 
     def _handle_possible_trace_hit(self) -> bool:
@@ -396,10 +412,9 @@ class WrapperApp(App):
             return False
         if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
             return False
-        if thread.GetStopReasonDataCount() < 1:
-            return False
-        bp_id = thread.GetStopReasonDataAtIndex(0)
-        if not self.tracer.is_trace_bp(bp_id):
+        bp_id = next((b for b in self._stop_bp_ids(thread)
+                      if self.tracer.is_trace_bp(b)), None)
+        if bp_id is None:
             return False
         frame = thread.GetFrameAtIndex(0)
         hit = self.tracer.hit_from(frame, process)
