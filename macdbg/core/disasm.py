@@ -43,6 +43,15 @@ def _first_reg(operands: str) -> Optional[str]:
     return m.group(0).lower() if m else None
 
 
+def _addr_base_reg(operands: str) -> Optional[str]:
+    """The address-base register of an add/ldr — the register an adrp result
+    flows into. That is the SECOND register operand, not the destination:
+    `add xD, xN, #imm` → xN, `ldr xD, [xN, #imm]` → xN. Returns None when there
+    is no second register (so a bare `ldr xD, [sp]` never spuriously matches)."""
+    regs = _REG_RE.findall(operands)
+    return regs[1].lower() if len(regs) >= 2 else None
+
+
 def _first_hex_addr(operands: str) -> Optional[int]:
     m = _HEX_ADDR_RE.search(operands)
     if not m:
@@ -141,9 +150,8 @@ def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> N
         for j in range(i + 1, min(i + 6, len(rows))):
             nxt = rows[j]
             mn = nxt.mnemonic.lower()
-            if _first_reg(nxt.operands) != reg:
-                continue
-            if mn == "add":
+            base = _addr_base_reg(nxt.operands)
+            if mn == "add" and base == reg:
                 imm = _parse_imm(nxt.operands)
                 if imm is None:
                     break
@@ -152,7 +160,7 @@ def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> N
                 if preview:
                     nxt.inline_hint = "= {:#x}  {}".format(effective, preview)
                 break
-            if mn in ("ldr", "ldrb", "ldrh", "ldrsw"):
+            if mn in ("ldr", "ldrb", "ldrh", "ldrsw") and base == reg:
                 dest = nxt.operands.split(",", 1)[0].strip()
                 if dest[:1].lower() in "dsqvhb" and dest[1:2].isdigit():
                     # SIMD/FP load (ldr d0/s0/q0/…): the loaded value is a float,
@@ -164,7 +172,10 @@ def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> N
                 if preview:
                     nxt.inline_hint = "load @ {:#x}  {}".format(addr, preview)
                 break
-            if mn in ("adrp",):
+            # The adrp result is clobbered before any add/ldr consumed it
+            # (e.g. a second `adrp xN` or a `mov xN, …` into the same register):
+            # stop so we don't attribute a later, unrelated use to this page.
+            if _first_reg(nxt.operands) == reg:
                 break
 
 

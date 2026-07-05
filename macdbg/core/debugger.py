@@ -847,6 +847,41 @@ class Debugger:
             return False
         return self.process.SetSelectedThreadByID(thread_id)
 
+    def select_stopped_thread(self) -> bool:
+        """Make the thread that actually caused the stop the selected one.
+
+        In async mode with multiple threads, lldb frequently leaves a parked
+        thread selected (e.g. the main thread blocked in __ulock_wait2 /
+        mach_msg2_trap), so a breakpoint hit on a worker thread looks like a
+        reason-less stop on an idle thread — and breakpoint/tracer/anti-debug
+        handlers that read GetSelectedThread() miss it entirely. Prefer a thread
+        stopped for a breakpoint, then any thread with a real (non-None) reason;
+        leave the selection untouched if nothing qualifies. Returns True if the
+        selection changed."""
+        if not self.process or not self.process.IsValid():
+            return False
+        sel = self.process.GetSelectedThread()
+        if sel and sel.IsValid() and sel.GetStopReason() == lldb.eStopReasonBreakpoint:
+            return False
+        best = None
+        for i in range(self.process.GetNumThreads()):
+            th = self.process.GetThreadAtIndex(i)
+            if not th.IsValid():
+                continue
+            reason = th.GetStopReason()
+            if reason == lldb.eStopReasonBreakpoint:
+                best = th
+                break
+            if best is None and reason not in (
+                lldb.eStopReasonNone, lldb.eStopReasonInvalid,
+            ):
+                best = th
+        if best is None:
+            return False
+        if sel and sel.IsValid() and best.GetThreadID() == sel.GetThreadID():
+            return False
+        return self.process.SetSelectedThreadByID(best.GetThreadID())
+
     def modules(self) -> List[Tuple[str, int, int, str]]:
         out: List[Tuple[int, str, int, int, str]] = []
         if not self.target:
