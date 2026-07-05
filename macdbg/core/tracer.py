@@ -400,6 +400,18 @@ def _f_tls_write(frame, p):
     return "{}({} B) {}".format(name, n, _fmt_text(data))
 
 
+def _f_aead_seal(frame, p):
+    # BoringSSL / aws-lc AEAD seal, the layer rustls encrypts through when it has
+    # no C SSL_write symbol. Signature is stable: plaintext is the 7th/8th args
+    # (in = x6, in_len = x7). The sealed record is the HTTP bytes plus a trailing
+    # content-type byte, so the URL still reads out.
+    name = (frame.GetFunctionName() or "EVP_AEAD_CTX_seal").lstrip("_")
+    buf = _reg(frame, "x6")
+    n = _reg(frame, "x7")
+    data = _read_mem(p, buf, n, 1024)
+    return "{}({} B) {}".format(name, n, _fmt_text(data))
+
+
 SIGS: Dict[str, Tuple[str, Callable]] = {
     "open":               (FILE, _f_open),
     "open$NOCANCEL":      (FILE, _f_open),
@@ -477,6 +489,7 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "gnutls_record_send": (NET,  _f_tls_write),
     "tls_write":          (NET,  _f_tls_write),
     "crypto/tls.(*Conn).Write": (NET, _f_tls_write),
+    "EVP_AEAD_CTX_seal":  (NET,  _f_aead_seal),
     "shutdown":           (NET,  _f_shutdown),
     "setsockopt":         (NET,  _f_setsockopt),
     "getaddrinfo":        (NET,  _f_getaddrinfo),
