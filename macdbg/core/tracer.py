@@ -337,10 +337,9 @@ _HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "HEAD", "PATCH",
 
 
 def _read_const_nsstring(process, obj: int) -> Optional[str]:
-    """Read a __CFConstantString's text with plain memory reads — no inferior
-    code. Layout: char *str at obj+0x10, CFIndex length at obj+0x18. Returns
-    None for tagged pointers or anything that doesn't look like a short ASCII
-    literal, so it degrades to silence rather than garbage."""
+    """Read a __CFConstantString's text with plain memory reads (char* at
+    obj+0x10, length at obj+0x18). None for tagged pointers or anything that
+    isn't a short ASCII literal."""
     if not obj or obj >> 63:
         return None
     err = lldb.SBError()

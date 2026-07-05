@@ -15,10 +15,9 @@ from .syntax import style_disasm_line
 
 
 def _force_dimensions_settled(table: DataTable) -> None:
-    """Force DataTable to compute its virtual size synchronously so scroll_to
-    can use it in the same event-loop tick. Without this, add_row batches the
-    dimension update to on_idle, causing a one-frame flash where the paint
-    happens before scroll can find its target."""
+    """Force DataTable to compute its virtual size now so scroll_to works in
+    the same tick. Otherwise add_row defers it to on_idle and the paint flashes
+    before scroll finds its target."""
     if not getattr(table, "_require_update_dimensions", False):
         return
     try:
@@ -213,9 +212,8 @@ class HexPane(Vertical):
             self._center_on(focus_row)
 
     def _center_on(self, focus_row: int, top_bias: int = 3) -> None:
-        """Center the cursor on `focus_row`, biased so `1/top_bias` of visible
-        rows sit above it. Runs synchronously — forces virtual-size settle so
-        the batched paint sees final scroll state (no flash)."""
+        """Center the cursor on `focus_row`, biased so 1/top_bias of the visible
+        rows sit above it. Settles the virtual size first to avoid a flash."""
         try:
             _force_dimensions_settled(self.table)
             self.table.move_cursor(row=focus_row, animate=False, scroll=False)
@@ -522,8 +520,8 @@ class ConsolePane(Vertical):
 
 
 class WatchPane(HexPane):
-    """A pinned mini-hexdump. Address does not move on step; only content
-    refreshes. Right-click → Follow in Watch N binds a target here."""
+    """A pinned mini-hexdump. The address stays put on step; only the bytes
+    refresh. Bind one with Follow in Watch N."""
 
     def __init__(self, slot: int, **kw):
         super().__init__(title="Watch {}".format(slot), **kw)

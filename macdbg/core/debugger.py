@@ -137,11 +137,9 @@ class Debugger:
         return self.process
 
     def entry_point_address(self) -> Optional[int]:
-        """The executable's real entry point (LC_MAIN entryoff + image base),
-        i.e. the arm64 equivalent of a PE AddressOfEntryPoint — NOT dyld's
-        _dyld_start. Computed slide-independently from the loaded image base so
-        it is correct regardless of where the executable mapped. Falls back to
-        the start/_start/main symbol, then None if it cannot be determined."""
+        """Load address of the executable's entry point (LC_MAIN entryoff plus
+        the image base), not dyld's _dyld_start. Falls back to the
+        start/_start/main symbol, or None."""
         if not self.target or not self.target.IsValid():
             return None
         exec_name = self.target.GetExecutable().GetFilename() or ""
@@ -169,9 +167,8 @@ class Debugger:
         return None
 
     def _read_lc_main_entryoff(self, hdr_addr: int) -> Optional[int]:
-        """Parse the Mach-O load commands at `hdr_addr` (in process memory) for
-        LC_MAIN and return its entryoff. 64-bit little-endian only; returns None
-        for anything else (e.g. legacy LC_UNIXTHREAD binaries)."""
+        """Find LC_MAIN's entryoff in the Mach-O header at hdr_addr. 64-bit
+        little-endian only; None otherwise."""
         head = self.read_memory(hdr_addr, 32)
         if len(head) < 32:
             return None
@@ -195,11 +192,9 @@ class Debugger:
         return None
 
     def _advance_to_entry_point(self) -> None:
-        """From the stop-at-entry position (_dyld_start), run to the
-        executable's own entry point via a one-shot breakpoint. Must be called
-        with the debugger in synchronous mode. A user breakpoint that fires
-        earlier (e.g. a restored BP in a constructor) simply wins — we leave the
-        process there and drop the pending one-shot."""
+        """Run from _dyld_start to the executable's entry point with a one-shot
+        breakpoint. Debugger must be synchronous. If an earlier user breakpoint
+        fires first we stop there and drop the one-shot."""
         if not self.process or not self.process.IsValid():
             return
         if self.process.GetState() != lldb.eStateStopped:
@@ -273,8 +268,7 @@ class Debugger:
             t.StepInstruction(False)
 
     def step_out(self) -> None:
-        """Run until the current frame returns. Equivalent to x64dbg's
-        'Execute till return' / gdb's 'finish'."""
+        """Run until the current frame returns (gdb's 'finish')."""
         t = self._thread()
         if t:
             t.StepOut()
@@ -282,10 +276,9 @@ class Debugger:
     _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
 
     def step_over(self) -> None:
-        """Step over the current instruction. lldb's SBThread.StepInstruction(True)
-        can silently degrade to step-in when it cannot identify a call site in
-        stripped code, so for arm64 call instructions we set a one-shot BP at
-        pc+4 and continue — the reliable classical implementation."""
+        """Step over the current instruction. StepInstruction(True) can degrade
+        to step-in on stripped call sites, so for arm64 calls we set a one-shot
+        BP at pc+4 and continue instead."""
         t = self._thread()
         if not t or not self.target or not self.target.IsValid():
             return
@@ -411,9 +404,8 @@ class Debugger:
         return b""
 
     def read_around(self, addr: int, before: int, total: int) -> Tuple[int, bytes]:
-        """Read `total` bytes containing `addr`, with roughly `before` bytes of
-        context before it. Walks across adjacent readable regions if the desired
-        range crosses a boundary."""
+        """Read `total` bytes around `addr`, with about `before` bytes ahead of
+        it, stitching across adjacent readable regions."""
         if not self.process or not self.process.IsValid():
             return addr, b""
         info = lldb.SBMemoryRegionInfo()
@@ -703,8 +695,8 @@ class Debugger:
         return True, "exec sandbox disabled"
 
     def peek_exec_hit(self, bp_id: int) -> Optional[Tuple[str, str]]:
-        """If this stop is at an exec BP, return (symbol, command_string) without
-        advancing the process. The caller decides whether to allow or block."""
+        """If stopped at an exec BP, return (symbol, command) without continuing.
+        Caller decides allow or block."""
         if not self.exec_bp_ids or bp_id not in self.exec_bp_ids or not self.process:
             return None
         name = self.exec_bp_ids[bp_id]
@@ -845,16 +837,11 @@ class Debugger:
         return self.process.SetSelectedThreadByID(thread_id)
 
     def select_stopped_thread(self) -> bool:
-        """Make the thread that actually caused the stop the selected one.
-
-        In async mode with multiple threads, lldb frequently leaves a parked
-        thread selected (e.g. the main thread blocked in __ulock_wait2 /
-        mach_msg2_trap), so a breakpoint hit on a worker thread looks like a
-        reason-less stop on an idle thread — and breakpoint/tracer/anti-debug
-        handlers that read GetSelectedThread() miss it entirely. Prefer a thread
-        stopped for a breakpoint, then any thread with a real (non-None) reason;
-        leave the selection untouched if nothing qualifies. Returns True if the
-        selection changed."""
+        """Select the thread that actually caused the stop. With several threads
+        lldb often leaves a parked one selected, so a breakpoint hit on a worker
+        looks like a reason-less stop and the handlers reading GetSelectedThread()
+        miss it. Prefer a breakpoint thread, then any with a real stop reason,
+        else leave it. Returns True if it changed."""
         if not self.process or not self.process.IsValid():
             return False
         sel = self.process.GetSelectedThread()
@@ -908,11 +895,9 @@ class Debugger:
 
     def scan_live_strings(self, min_len: int = 8,
                           budget_bytes: int = 512 * 1024 * 1024) -> List[Tuple[int, str]]:
-        """Scan heap, stack, and private mmap regions for null-terminated
-        printable ASCII runs likely to be real strings (letters or path
-        separators required, single-char runs filtered). Excludes libraries
-        and the target binary's own static sections (dedup with the bin list).
-        Bounded by `budget_bytes`."""
+        """Scan heap, stack, and private mmap regions for null-terminated ASCII
+        runs that look like real strings. Skips libraries and the target's own
+        static sections. Bounded by `budget_bytes`."""
         if not self.process or not self.process.IsValid():
             return []
         exec_name = ""
@@ -985,9 +970,8 @@ class Debugger:
                 run_start = None
 
     def extract_strings(self, min_len: int = 5) -> List[Tuple[int, str]]:
-        """Extract null-terminated printable strings from the target executable's
-        string-bearing sections. Returns (load_address, string). Called once
-        after target load; results are stable while the process runs."""
+        """Extract null-terminated strings from the executable's string sections.
+        Returns (load_address, string)."""
         if not self.target or not self.target.IsValid():
             return []
         exec_name = self.target.GetExecutable().GetFilename() or ""
@@ -1061,12 +1045,9 @@ class Debugger:
     def memory_search(self, needle: bytes, max_hits: int = 32,
                       total_budget_bytes: int = 4 * 1024 * 1024 * 1024,
                       scope: str = "target") -> Tuple[List[int], int]:
-        """Search process memory for `needle`.
-        scope:
-          "target"  — target binary's own sections + anonymous regions
-                      (heap, stack, private mmaps). Skips other modules.
-          "all"     — every readable region including dyld/libSystem/frameworks.
-        Returns (hits, bytes_scanned).
+        """Search process memory for `needle`. scope "target" covers the binary's
+        own sections plus anonymous regions (heap, stack, mmaps); scope "all"
+        covers every readable region. Returns (hits, bytes_scanned).
         """
         if not self.process or not self.process.IsValid() or not needle:
             return [], 0

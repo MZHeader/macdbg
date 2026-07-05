@@ -16,11 +16,7 @@ def hexdump_rows(data: bytes, base_addr: int, width: int = 16) -> List[Tuple[int
 
 def bytes_per_row_for(pane_width: int) -> int:
     """Pick 16 or 8 bytes per hexdump row so the ASCII column stays visible.
-
-    A 16-byte row needs ~16 (addr) + 47 (hex) + 16 (ascii) + column padding.
-    A 8-byte row needs ~16 + 23 + 8. When the pane is narrower than what fits
-    a 16-byte row cleanly — or when we cannot measure yet (an inactive tab
-    reports 0 width) — fall back to 8."""
+    Falls back to 8 when the pane is too narrow or its width isn't known yet."""
     if pane_width < 88:
         return 8
     return 16

@@ -44,10 +44,9 @@ def _first_reg(operands: str) -> Optional[str]:
 
 
 def _addr_base_reg(operands: str) -> Optional[str]:
-    """The address-base register of an add/ldr — the register an adrp result
-    flows into. That is the SECOND register operand, not the destination:
-    `add xD, xN, #imm` → xN, `ldr xD, [xN, #imm]` → xN. Returns None when there
-    is no second register (so a bare `ldr xD, [sp]` never spuriously matches)."""
+    """The address-base register of an add/ldr, the second register operand
+    that an adrp result flows into, not the destination. None when there is no
+    second register."""
     regs = _REG_RE.findall(operands)
     return regs[1].lower() if len(regs) >= 2 else None
 
@@ -70,10 +69,8 @@ _ADRP_IMM_RE = re.compile(r"adrp?\s+[xw]\d+\s*,\s*#?(-?(?:0x[0-9a-fA-F]+|\d+))",
 
 
 def _parse_adrp_imm(operands: str) -> Optional[int]:
-    """adrp encodes the target as (pc_page + imm * 4096). Some lldb versions
-    show that shifted immediate directly (e.g. 'adrp x8, 4'); others show
-    the final address (e.g. 'adrp x8, 0x100004000'). This parses just the
-    trailing immediate for the former case."""
+    """Parse the trailing immediate of an adrp for lldb versions that print
+    the shifted immediate ('adrp x8, 4') rather than the final address."""
     m = re.match(r"\s*[xw]\d+\s*,\s*#?(-?(?:0x[0-9a-fA-F]+|\d+))\s*$",
                  operands, re.IGNORECASE)
     if not m:
@@ -129,12 +126,8 @@ def _preview_addr(read_mem, target: lldb.SBTarget, addr: int) -> str:
 
 
 def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> None:
-    """Detect adrp+add / adrp+ldr pairs and attach an inline preview of what
-    the computed address holds. arm64 -O0 pattern:
-        adrp xN, 0xPAGE
-        add  xN, xN, #OFF     ; xN = &PAGE+OFF
-        ldr  xN, [xN, #OFF]   ; xN = *(u64*)(PAGE+OFF)
-    """
+    """Find adrp+add / adrp+ldr pairs and attach a preview of what the
+    computed address holds."""
     for i, row in enumerate(rows):
         if row.mnemonic.lower() != "adrp":
             continue
@@ -178,11 +171,9 @@ def disasm_around(target: lldb.SBTarget, pc: int, count: int = 512,
                   read_mem: Optional[Callable[[int, int], bytes]] = None,
                   center: Optional[int] = None,
                   frame: Optional["lldb.SBFrame"] = None) -> List[DisasmRow]:
-    """Disassemble `count` instructions around `center` (or `pc` if not set).
-    `pc` is still used to mark the pc row. When `center != pc`, the caller is
-    browsing another address; the pc row will only appear if it falls in the
-    fetched range. If `frame` is provided and the row at pc is a conditional
-    branch, its arrow is colored green (taken) or red (not taken)."""
+    """Disassemble `count` instructions around `center` (default `pc`). `pc`
+    marks the pc row when it falls in range. With `frame`, a conditional branch
+    at pc is colored green (taken) or red (not taken)."""
     if not target or not target.IsValid() or pc == 0:
         return []
     anchor = center if center is not None else pc
@@ -213,9 +204,8 @@ def disasm_around(target: lldb.SBTarget, pc: int, count: int = 512,
 
 
 def _mark_function_heads(rows: List[DisasmRow], target: lldb.SBTarget) -> None:
-    """Tag rows where the containing function/symbol changes. On the first row
-    of each function, populate `function_head` with either the function name
-    ('main', 'main+0x0') or the symbol name for unnamed / stripped code."""
+    """Set `function_head` on the first row of each function, using the
+    function or symbol name (the synthetic name for stripped code)."""
     if not rows:
         return
     prev_name = None
@@ -252,11 +242,9 @@ _BRANCH_MNEMONICS = {
 
 def _draw_branch_gutter(rows: List[DisasmRow], width: int = 4,
                          frame: Optional["lldb.SBFrame"] = None) -> None:
-    """Draw a fixed-width arrow gutter to the left of each row indicating
-    branches whose source AND target are both in view. Columns are assigned
-    greedily so overlapping arrows sit in different lanes. If `frame` is
-    provided, evaluates the pc row's condition to color that one branch
-    green (taken) or red (not taken)."""
+    """Draw an arrow gutter for branches whose source and target are both in
+    view, putting overlapping arrows in separate lanes. With `frame`, colors the
+    pc branch green (taken) or red (not taken)."""
     if not rows:
         return
     addr_to_idx = {r.addr: i for i, r in enumerate(rows)}
@@ -411,9 +399,8 @@ def _evaluate_condition(row: DisasmRow, frame: "lldb.SBFrame") -> Optional[bool]
 
 
 def _branch_target(operands: str) -> Optional[int]:
-    """Best-effort extraction of a branch target address from an arm64
-    conditional/unconditional branch operand. For tbz/tbnz the last operand
-    is the target; for cbz/cbnz and b.cond the second; for b the first."""
+    """Extract the branch target from an arm64 branch operand (the last hex
+    operand, which is the target for b, b.cond, cbz/cbnz, and tbz/tbnz)."""
     hex_addrs = _HEX_ADDR_RE.findall(operands)
     if not hex_addrs:
         return None
