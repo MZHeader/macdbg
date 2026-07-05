@@ -119,6 +119,7 @@ Lots of themes to choose from :)
 | F7 | Step in (instruction) |
 | F8 | Step over (instruction) |
 | F9 | Continue |
+| Ctrl+R | Restart (kill and re-run to the entry point) |
 | Enter (in disasm) | Follow operand address in the memory pane |
 | `:` | Focus the console command bar |
 | Ctrl+B | Interrupt a running process |

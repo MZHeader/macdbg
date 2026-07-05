@@ -101,6 +101,7 @@ class WrapperApp(App):
         Binding("f7", "step_in", "Step In"),
         Binding("f8", "step_over", "Step Over"),
         Binding("f9", "cont", "Continue"),
+        Binding("ctrl+r", "restart", "Restart", priority=True),
         Binding("f2", "toggle_bp", "Toggle BP"),
         Binding("colon", "focus_cmd", "Command", key_display=":"),
         Binding("ctrl+g", "focus_mem", "Goto Addr"),
@@ -471,6 +472,42 @@ class WrapperApp(App):
 
     def action_cont(self) -> None:
         self.dbg.cont()
+
+    def action_restart(self) -> None:
+        if self.attach_pid:
+            self.console_pane.write("[restart] not available for an attached process", error=True)
+            return
+        if not self.dbg.target or not self.dbg.target.IsValid():
+            self.console_pane.write("[restart] no target loaded", error=True)
+            return
+        p = self.dbg.process
+        if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
+            p.Kill()
+        # Tracer/anti-debug breakpoints sit on libSystem functions that run
+        # during startup, so leave them disabled across the relaunch or the
+        # entry-point hop would stop on one of them instead of the entry point.
+        # User breakpoints stay live so one in a constructor still wins.
+        hidden = self._hidden_bp_ids()
+        for bid in hidden:
+            self.dbg.set_bp_enabled(bid, False)
+        try:
+            self.dbg.launch(list(self.program_args))
+        except Exception as e:
+            self.console_pane.write("[restart] relaunch failed: {}".format(e), error=True)
+            return
+        finally:
+            for bid in hidden:
+                self.dbg.set_bp_enabled(bid, True)
+        self._prev_regs = {}
+        self._mem_follow = None
+        self._disasm_follow = None
+        self._annot_cache.clear()
+        proc = self.dbg.process
+        if proc and proc.IsValid() and proc.GetState() == lldb.eStateStopped:
+            self.console_pane.write("[restart] relaunched, at entry {:#x}".format(self.dbg.pc() or 0))
+            self._refresh_all()
+        elif proc and proc.GetState() == lldb.eStateExited:
+            self.console_pane.write(self._describe_exit(), error=True)
 
     def action_toggle_bp(self) -> None:
         pc = self.dbg.pc()
@@ -1395,6 +1432,7 @@ class WrapperApp(App):
         self.console_pane.write("follow -> {:#x}".format(addr))
 
     _CLEAR_STATE_ALIASES = ("clear-state", "macdbg clear-state", "macdbg clear")
+    _RESTART_ALIASES = ("restart", "macdbg restart")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "cmd_input":
@@ -1405,6 +1443,9 @@ class WrapperApp(App):
             self.console_pane.write("> " + cmd)
             if cmd.lower() in self._CLEAR_STATE_ALIASES:
                 self._prompt_clear_state()
+                return
+            if cmd.lower() in self._RESTART_ALIASES:
+                self.action_restart()
                 return
             self._preempt_interactive(cmd)
             ok, out, err = self.dbg.handle_command(cmd)
