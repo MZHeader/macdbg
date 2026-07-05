@@ -216,7 +216,10 @@ class WrapperApp(App):
             try:
                 self.dbg.create_target(self.program)
                 restored = self.dbg.restore_stored_breakpoints()
-                self.dbg.launch([self.program] + list(self.program_args))
+                # SBLaunchInfo takes the inferior's arguments only — lldb sets
+                # argv[0] to the executable itself. Passing the program here too
+                # would duplicate it as argv[1] and shift the real arguments.
+                self.dbg.launch(list(self.program_args))
                 self.console_pane.write("launched {}".format(self.program))
                 if self.dbg.state:
                     self.console_pane.write(
