@@ -345,6 +345,48 @@ def _f_nw_connection_receive(frame, p):
     return "nw_connection_receive()"
 
 
+_HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "HEAD", "PATCH",
+                 "OPTIONS", "CONNECT", "TRACE"}
+
+
+def _read_const_nsstring(process, obj: int) -> Optional[str]:
+    """Read a __CFConstantString's text with plain memory reads — no inferior
+    code. Layout: char *str at obj+0x10, CFIndex length at obj+0x18. Returns
+    None for tagged pointers or anything that doesn't look like a short ASCII
+    literal, so it degrades to silence rather than garbage."""
+    if not obj or obj >> 63:  # nil or arm64 objc tagged pointer
+        return None
+    err = lldb.SBError()
+    hdr = process.ReadMemory(obj + 0x10, 16, err)
+    if not err.Success() or len(hdr) < 16:
+        return None
+    ptr = int.from_bytes(hdr[:8], "little")
+    n = int.from_bytes(hdr[8:16], "little")
+    if not ptr or n <= 0 or n > 64:
+        return None
+    err2 = lldb.SBError()
+    data = process.ReadMemory(ptr, min(n, 32), err2)
+    if not err2.Success() or not data:
+        return None
+    s = data.split(b"\x00")[0].decode("ascii", "replace")
+    if not s or not all(32 <= ord(c) < 127 for c in s):
+        return None
+    return s
+
+
+def _f_set_http_method(frame, p):
+    # objc_msgSend$setHTTPMethod: stub — caller puts self in x0 and the first
+    # real argument in x2 (x1 is reserved for the selector the stub loads). The
+    # method is a constant NSString, read without running any inferior code.
+    # Returns None (suppressing the hit) when it isn't a recognizable method, so
+    # internal framework calls don't create noise.
+    for reg in ("x2", "x1"):
+        m = _read_const_nsstring(p, _reg(frame, reg))
+        if m and (m.upper() in _HTTP_METHODS or (m.isalpha() and len(m) <= 16)):
+            return 'HTTP method "{}"'.format(m)
+    return None
+
+
 def _f_cfurl_bytes(frame, p):
     # CFURLCreateWithBytes(alloc, const UInt8 *bytes, CFIndex length, enc, base).
     # The URL text is raw bytes at x1 with length x2 — the reliable place to
@@ -429,6 +471,7 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "nw_connection_send":      (NET, _f_nw_connection_send),
     "nw_connection_receive":   (NET, _f_nw_connection_receive),
     "CFURLCreateWithBytes":    (NET, _f_cfurl_bytes),
+    "objc_msgSend$setHTTPMethod:": (NET, _f_set_http_method),
     "shutdown":           (NET,  _f_shutdown),
     "setsockopt":         (NET,  _f_setsockopt),
     "getaddrinfo":        (NET,  _f_getaddrinfo),
@@ -507,6 +550,10 @@ class Tracer:
                     call = fmt(frame, process)
                 except Exception as e:
                     call = "{}(...) [formatter error: {}]".format(candidate, e)
+                if call is None:
+                    # Formatter opted out (e.g. an internal setHTTPMethod: call
+                    # whose argument isn't a readable method) — suppress the hit.
+                    return None
                 return TraceHit(category=cat, call=call)
         return None
 
