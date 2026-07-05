@@ -122,6 +122,15 @@ class Debugger:
         info.SetLaunchFlags(
             lldb.eLaunchFlagStopAtEntry | lldb.eLaunchFlagDisableASLR
         )
+        # A fresh SBLaunchInfo launches with an empty environment, so the target
+        # sees no PATH and anything it shells out to (do shell script, system,
+        # posix_spawn) falls back to /usr/bin:/bin and can't find tools in
+        # /usr/sbin like system_profiler. Inherit our environment, minus the
+        # PYTHONPATH macdbg.sh injected for its own use.
+        info.SetEnvironmentEntries(
+            ["{}={}".format(k, v) for k, v in os.environ.items() if k != "PYTHONPATH"],
+            True,
+        )
         was_async = self.dbg.GetAsync()
         self.dbg.SetAsync(False)
         try:
