@@ -288,6 +288,63 @@ def _f_pclose(frame, p):
     return "pclose(fp={:#x})".format(_reg(frame, "x0"))
 
 
+# --- modern networking stack (Network.framework / NSURLSession / CFNetwork) ---
+# These are what most current macOS software (and malware) actually use; the
+# classic BSD socket(2)/connect(2) path is often never touched directly.
+
+def _f_connectx(frame, p):
+    # int connectx(int s, const sa_endpoints_t *endpoints, ...)
+    # sa_endpoints_t: sae_dstaddr (struct sockaddr *) sits at offset 24 on arm64.
+    fd = _reg(frame, "x0")
+    eps = _reg(frame, "x1")
+    dst = "?"
+    if eps:
+        raw = _read_bytes(p, eps + 24, 8)
+        if len(raw) == 8:
+            dst = _fmt_sockaddr(p, int.from_bytes(raw, "little"))
+    return "connectx({}, {})".format(fd, dst)
+
+
+def _f_recvmsg(frame, p):
+    return "recvmsg(fd={}, msg={:#x})".format(_reg(frame, "x0"), _reg(frame, "x1"))
+
+
+def _f_sendmsg(frame, p):
+    return "sendmsg(fd={}, msg={:#x})".format(_reg(frame, "x0"), _reg(frame, "x1"))
+
+
+def _looks_like_port(s: str) -> bool:
+    return bool(s) and len(s) <= 5 and s.isdigit()
+
+
+def _f_nw_endpoint_create_host(frame, p):
+    # const char *hostname (x0), const char *port (x1). The host reads reliably
+    # at entry and is the key IOC; the port is only shown when it actually looks
+    # like a port (Network.framework also calls this internally with the arg in
+    # a different place, so guard against printing stack garbage).
+    host = _read_cstr(p, _reg(frame, "x0"))
+    port = _read_cstr(p, _reg(frame, "x1"))
+    if _looks_like_port(port):
+        return 'nw_endpoint_create_host("{}", "{}")'.format(host, port)
+    return 'nw_endpoint_create_host("{}")'.format(host)
+
+
+# nw_connection_t is an opaque object and its argument is not reliably in x0 at
+# the symbol entry, so these are logged as lifecycle markers — the event (and
+# that the sample uses Network.framework) is the signal, paired with the
+# endpoint above and connectx/getaddrinfo for the actual address.
+def _f_nw_connection_start(frame, p):
+    return "nw_connection_start()"
+
+
+def _f_nw_connection_send(frame, p):
+    return "nw_connection_send()"
+
+
+def _f_nw_connection_receive(frame, p):
+    return "nw_connection_receive()"
+
+
 SIGS: Dict[str, Tuple[str, Callable]] = {
     "open":               (FILE, _f_open),
     "open$NOCANCEL":      (FILE, _f_open),
@@ -345,6 +402,15 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "sendto$NOCANCEL":    (NET,  _f_sendto),
     "recvfrom":           (NET,  _f_recvfrom),
     "recvfrom$NOCANCEL":  (NET,  _f_recvfrom),
+    "connectx":           (NET,  _f_connectx),
+    "recvmsg":            (NET,  _f_recvmsg),
+    "recvmsg$NOCANCEL":   (NET,  _f_recvmsg),
+    "sendmsg":            (NET,  _f_sendmsg),
+    "sendmsg$NOCANCEL":   (NET,  _f_sendmsg),
+    "nw_endpoint_create_host": (NET, _f_nw_endpoint_create_host),
+    "nw_connection_start":     (NET, _f_nw_connection_start),
+    "nw_connection_send":      (NET, _f_nw_connection_send),
+    "nw_connection_receive":   (NET, _f_nw_connection_receive),
     "shutdown":           (NET,  _f_shutdown),
     "setsockopt":         (NET,  _f_setsockopt),
     "getaddrinfo":        (NET,  _f_getaddrinfo),
@@ -413,7 +479,11 @@ class Tracer:
         for candidate in (name, name.lstrip("_")):
             if candidate in SIGS:
                 cat, fmt = SIGS[candidate]
-                if user_only and self._caller_is_noise(frame):
+                # Network calls in Network.framework/CFNetwork run on internal
+                # dispatch queues with no user frame on the stack, so the
+                # caller-depth filter would always drop them. Network activity is
+                # high-signal for triage — never suppress it.
+                if user_only and cat != NET and self._caller_is_noise(frame):
                     return None
                 try:
                     call = fmt(frame, process)
