@@ -463,6 +463,8 @@ class Debugger:
     exec_bp_ids: Optional[Dict[int, str]] = None
     exec_interactive: bool = False
     fork_interactive: bool = False
+    _fork_shield_hw_bp: int = 0
+    _fork_shield_saved: Optional[List[int]] = None
 
     def toggle_breakpoint_at(self, addr: int) -> Tuple[str, int]:
         assert self.target is not None
@@ -690,7 +692,57 @@ class Debugger:
         if decision == "child":
             ret = lldb.SBCommandReturnObject()
             self.ci.HandleCommand("thread return 0", ret, False)
+            self.process.Continue()
+            return
+        # A real fork copies our breakpoints into the child, which then dies on
+        # the first inherited trap before it can exec. Lift every breakpoint
+        # across the fork so the child's memory is clean, and catch the parent's
+        # return with a hardware breakpoint (not inherited by the child). The
+        # saved breakpoints go back on the next stop, in finish_fork_shield.
+        if not self._arm_fork_shield():
+            self.process.Continue()
+            return
         self.process.Continue()
+
+    def _arm_fork_shield(self) -> bool:
+        if not self.target:
+            return False
+        thread = self.process.GetSelectedThread()
+        frame = thread.GetFrameAtIndex(0) if thread and thread.IsValid() else None
+        ret_addr = frame.FindRegister("lr").GetValueAsUnsigned() if frame else 0
+        if not ret_addr:
+            return False
+        n_before = self.target.GetNumBreakpoints()
+        ro = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("breakpoint set -H -a {:#x}".format(ret_addr), ro, False)
+        if self.target.GetNumBreakpoints() <= n_before:
+            return False
+        hw_bp = self.target.GetBreakpointAtIndex(n_before)
+        saved = []
+        for i in range(n_before):
+            bp = self.target.GetBreakpointAtIndex(i)
+            if bp.IsEnabled():
+                bp.SetEnabled(False)
+                saved.append(bp.GetID())
+        self._fork_shield_hw_bp = hw_bp.GetID()
+        self._fork_shield_saved = saved
+        return True
+
+    def in_fork_shield(self) -> bool:
+        return self._fork_shield_hw_bp != 0
+
+    def finish_fork_shield(self) -> None:
+        """Back in the parent after the real fork: drop the temporary hardware
+        breakpoint and re-arm everything we lifted."""
+        if self.target:
+            if self._fork_shield_hw_bp:
+                self.target.BreakpointDelete(self._fork_shield_hw_bp)
+            for bid in (self._fork_shield_saved or []):
+                bp = self.target.FindBreakpointByID(bid)
+                if bp.IsValid():
+                    bp.SetEnabled(True)
+        self._fork_shield_hw_bp = 0
+        self._fork_shield_saved = None
 
     def handle_fork_hit(self, bp_id: int) -> Optional[str]:
         if not self.fork_bp_ids or bp_id not in self.fork_bp_ids or not self.process:

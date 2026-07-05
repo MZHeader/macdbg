@@ -280,6 +280,12 @@ class WrapperApp(App):
     def _on_stop_event(self, e: StopEvent) -> None:
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
+            if self.dbg.in_fork_shield():
+                # Parent has returned from the shielded fork; restore breakpoints
+                # and keep going without surfacing the internal stop.
+                self.dbg.finish_fork_shield()
+                self.dbg.cont()
+                return
             if self._handle_anti_debug_hit():
                 return
             if self.tracer.enabled and self._handle_possible_trace_hit():
