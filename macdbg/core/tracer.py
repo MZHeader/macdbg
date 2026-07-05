@@ -426,8 +426,11 @@ def _f_rustls_write(frame, p):
 
 # (regex pattern, category, formatter) for symbols whose names are not stable
 # enough to list exactly — mangled Rust, versioned C symbols, and the like.
+# Anchor hard: the "rustls..conn" prefix exists only in a statically linked
+# rustls, so no other crate or system library can collide, and "::write::h"
+# ties it to the write method alone (not flush/write_all/write_vectored).
 REGEX_SIGS: List[Tuple[str, str, Callable]] = [
-    (r"connection..Writer.*::write::h", NET, _f_rustls_write),
+    (r"rustls..conn.*Writer.*::write::h", NET, _f_rustls_write),
 ]
 
 
