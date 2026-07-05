@@ -50,11 +50,21 @@ Feeling lazy? `Ctrl+T` arms breakpoints on common file, process, and network ent
 - **Prompt each fork** stops on every fork and asks whether to stay in the parent or enter the child. Answer per site.
 - **Trace the whole fork tree** shows the syscalls of children lldb can't follow.
 
+![Fork decision prompt](docs/img/follow-fork.png)
+
 **Exec**
 > For samples that call something like `killall Terminal`, we can just intercept it, say no, and spoof a success result.
 
 - **Intercept outbound exec** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`.
 - **Prompt each call** offers Allow, Fake success, Block, or Dump per call, otherwise auto-blocks.
+
+![Exec sandbox prompt](docs/img/exec-prompt.png)
+
+The preview reads the full `argv`, so a dropper hiding its script behind `osascript -e` shows the script, not just the interpreter. Pick **Dump payload to file** to write the whole command to `~/.macdbg/<binary>-<sha>/dumps/`.
+
+![Dumping an osascript payload](docs/img/exec-dump.png)
+
+![The dumped payload on disk](docs/img/exec-payload.png)
 
 ## Breakpoint Scripting
 
