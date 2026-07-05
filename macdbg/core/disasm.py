@@ -153,6 +153,11 @@ def _annotate_pairs(rows: List[DisasmRow], read_mem, target: lldb.SBTarget) -> N
                     nxt.inline_hint = "= {:#x}  {}".format(effective, preview)
                 break
             if mn in ("ldr", "ldrb", "ldrh", "ldrsw"):
+                dest = nxt.operands.split(",", 1)[0].strip()
+                if dest[:1].lower() in "dsqvhb" and dest[1:2].isdigit():
+                    # SIMD/FP load (ldr d0/s0/q0/…): the loaded value is a float,
+                    # not a pointer — symbolizing it produces misleading hints.
+                    break
                 imm = _parse_imm(nxt.operands) or 0
                 addr = page + imm
                 preview = _preview_addr(read_mem, target, addr)
