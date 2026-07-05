@@ -319,14 +319,17 @@ class WrapperApp(App):
         return "<{}B: {}{}>".format(len(b), b[:24].hex(), "…" if len(b) > 24 else "")
 
     def _format_interpose(self, fields: List[str]) -> Optional[tuple]:
-        # Skip the root pid; lldb already traces it. Only surface the children.
+        # Skip the root pid only when the lldb tracer is on, since that already
+        # covers the parent. With it off (e.g. the tracer crashes a forking
+        # sample), show the parent too or the window would be empty.
         if len(fields) < 2:
             return None
         try:
             pid = int(fields[0])
         except ValueError:
             return None
-        if self._interpose_root_pid is not None and pid == self._interpose_root_pid:
+        if (self.tracer.enabled and self._interpose_root_pid is not None
+                and pid == self._interpose_root_pid):
             return None
         fn = fields[1]
         cat = self._INTERPOSE_CAT.get(fn, "PROC")
