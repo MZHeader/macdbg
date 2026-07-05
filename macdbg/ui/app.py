@@ -378,9 +378,16 @@ class WrapperApp(App):
         bp_ids = self._stop_bp_ids(thread)
         if not bp_ids:
             return False
-        if self.dbg.exec_interactive:
-            for bp_id in bp_ids:
-                peeked = self.dbg.peek_exec_hit(bp_id)
+        exec_bp = None
+        if self.dbg.exec_bp_ids:
+            exec_bp = next((b for b in bp_ids if b in self.dbg.exec_bp_ids), None)
+        if exec_bp is not None:
+            # The sandbox is about to consume this stop, so the tracer's own
+            # breakpoint never gets a turn. Log the call here so it still shows
+            # in the trace window when both are on.
+            self._log_exec_trace(thread)
+            if self.dbg.exec_interactive:
+                peeked = self.dbg.peek_exec_hit(exec_bp)
                 if peeked is not None:
                     name, cmd = peeked
                     caller = self._exec_caller_site()
@@ -388,12 +395,12 @@ class WrapperApp(App):
                     if caller:
                         self.console_pane.write(
                             "[anti-debug] {} called from {:#x}".format(name, caller))
-                    dumped = self.dbg.autodump_large_exec(bp_id)
+                    dumped = self.dbg.autodump_large_exec(exec_bp)
                     if dumped:
                         self.console_pane.write(
                             "[anti-debug] full payload ({} B) → {}".format(
                                 dumped[1], dumped[0]))
-                    self._prompt_exec_decision(name, cmd, bp_id)
+                    self._prompt_exec_decision(name, cmd, exec_bp)
                     return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_anti_mach_hit,
@@ -407,6 +414,15 @@ class WrapperApp(App):
                     self.console_pane.write("[anti-debug] " + msg)
                     return True
         return False
+
+    def _log_exec_trace(self, thread) -> None:
+        if not self.tracer.enabled:
+            return
+        frame = thread.GetFrameAtIndex(0)
+        hit = self.tracer.hit_from(frame, self.dbg.process)
+        if hit is not None:
+            self._trace_count += 1
+            self.trace_pane.add_hit(self._trace_count, hit.category, hit.call)
 
     def _handle_possible_trace_hit(self) -> bool:
         process = self.dbg.process
