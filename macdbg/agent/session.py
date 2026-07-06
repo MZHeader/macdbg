@@ -44,7 +44,7 @@ def _int_arg(v) -> int:
     prefixed strings and plain decimal strings as well as raw ints. Every
     address-shaped field (``addr``, ``value``, ``bp_id``, ``thread_id``,
     ``size``, ``depth``, ``budget_bytes``) is fed through this so a caller
-    never has to hand-convert ``0x10001d078`` to ``4295086216`` in JSON --
+    never has to hand-convert ``0x100003f88`` to ``4294983560`` in JSON --
     that manual conversion is where address typos come from.
 
     A raw ``bool`` is rejected explicitly (``isinstance(True, int)`` is

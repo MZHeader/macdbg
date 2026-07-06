@@ -73,7 +73,7 @@ almost immediately," not "wait forever" — omit it entirely for the 60s
 default.
 
 **Every numeric field accepts either a JSON integer or a string** —
-`{"addr": "0x10001d078"}` and `{"addr": 4295086392}` resolve to the same
+`{"addr": "0x100003f88"}` and `{"addr": 4294983560}` resolve to the same
 address. Hex/octal/binary prefixes (`0x`, `0o`, `0b`) all work. Prefer the
 hex form for addresses; hand-converting to decimal is where transcription
 errors happen.
@@ -194,7 +194,7 @@ constantly:
 **Address → function name.** By far the most common one — every time you
 see an address in a register or a xref and want to know what it is:
 ```
-raw {"command": "image lookup -a 0x100047df4"}
+raw {"command": "image lookup -a 0x100004a20"}
 ```
 
 **Symbol → address (exact name):**
@@ -243,7 +243,7 @@ manually.
 **Word-formatted memory dump** (nicer than `read_memory`'s raw hex when
 you're looking at instructions or pointer tables):
 ```
-raw {"command": "memory read -f x -c 4 0x10001d078"}
+raw {"command": "memory read -f x -c 4 0x100003f88"}
 ```
 `-f x` = hex words, `-c 4` = four words. For string content, use
 `-f s`; for byte-oriented dumps, `read_memory` is fine.
@@ -251,14 +251,14 @@ raw {"command": "memory read -f x -c 4 0x10001d078"}
 **Disassemble past the auto-clamp** — `disasm` refuses addresses outside
 the enclosing function, which is usually right but occasionally not:
 ```
-raw {"command": "disassemble -s 0x10001d078 -c 8"}
+raw {"command": "disassemble -s 0x100003f88 -c 8"}
 ```
 
 **Look up what module and section an address belongs to** (useful when
 you don't yet know if an address is in `__text`, a stub, or a data
 section):
 ```
-raw {"command": "image lookup --verbose --address 0x1000a7c38"}
+raw {"command": "image lookup --verbose --address 0x1000a4210"}
 ```
 
 ## Session management
