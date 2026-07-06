@@ -199,18 +199,18 @@ raw {"command": "image lookup -a 0x100047df4"}
 
 **Symbol → address (exact name):**
 ```
-raw {"command": "image lookup -n \"-[CXServer forkExecCommand:withArgs:]\""}
+raw {"command": "image lookup -n \"-[NSApplication run]\""}
 ```
 
 **Symbol → address (regex, useful when you don't know the exact selector):**
 ```
-raw {"command": "image lookup -r -n \"licenseID\""}
+raw {"command": "image lookup -r -n \"delegate\""}
 ```
 
 **Break by symbol name** (the structured `breakpoint_toggle` is
 address-only):
 ```
-raw {"command": "breakpoint set -n \"-[CXApplication isDemo]\""}
+raw {"command": "breakpoint set -n \"-[MyController doSomething:]\""}
 ```
 The response's `output` includes the breakpoint id and the resolved
 address — read them back if you want to manage the breakpoint later.
@@ -220,14 +220,14 @@ emits per-selector `objc_msgSend$foo` stubs; setting a breakpoint on that
 stub fires every time anyone calls `[obj foo]`. Discover them with
 `nm -a <binary> | grep 'objc_msgSend\$'`.
 ```
-raw {"command": "breakpoint set -n \"objc_msgSend$isDemo\""}
+raw {"command": "breakpoint set -n \"objc_msgSend$description\""}
 ```
 
 **Call an Objective-C method at runtime** (invaluable for
-reverse-engineering — see what `[NSApp isDemo]` really returns, or drive a
-decode routine with test input):
+reverse-engineering — poke at any Cocoa object without patching, or drive
+a decode routine with test input):
 ```
-raw {"command": "expression -l objc -O -- [NSApp isDemo]"}
+raw {"command": "expression -l objc -O -- [NSApp delegate]"}
 raw {"command": "expression -l objc -O -- [(id)0x12345 description]"}
 ```
 `-l objc` selects the ObjC parser; `-O` prints via `-description` instead
