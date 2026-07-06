@@ -96,6 +96,21 @@ Lots of themes to choose from :)
 
 ![Themes](docs/img/theme.png)
 
+## Headless / agentic
+
+`./agent.sh` is the same debugger driven by JSON over a Unix socket instead of a TUI. Made for scripts, cron jobs, and agentic use.
+
+```sh
+./agent.sh start --session s1 /path/to/binary
+./agent.sh cmd s1 breakpoint_toggle --json '{"addr": "0x100003f88"}'
+./agent.sh cmd s1 continue --json '{"timeout": 10}'
+./agent.sh stop s1
+```
+
+The daemon holds one live LLDB session per name and keeps state (breakpoints, register overrides, patched memory) between commands. Every JSON handler has an equivalent to what the TUI does, plus a `raw` command that runs any lldb command literally.
+
+A Claude Code skill at `.claude/skills/macdbg-agent/SKILL.md` documents the protocol plus recipes for reversing Cocoa apps. Drop this repo into a project and Claude drives the debugger directly.
+
 ## Keys
 
 | Key | Action |
