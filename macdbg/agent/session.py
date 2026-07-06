@@ -38,6 +38,32 @@ from .client import _RESUME_COMMANDS  # noqa: F401 -- re-exported for server.py
 # EventPump's use of the literal `1` in core/events.py), not a float.
 DEFAULT_WAIT_TIMEOUT = 1
 
+
+def _int_arg(v) -> int:
+    """Coerce a JSON arg to an int, accepting ``"0x…"``/``"0o…"``/``"0b…"``
+    prefixed strings and plain decimal strings as well as raw ints. Every
+    address-shaped field (``addr``, ``value``, ``bp_id``, ``thread_id``,
+    ``size``, ``depth``, ``budget_bytes``) is fed through this so a caller
+    never has to hand-convert ``0x10001d078`` to ``4295086216`` in JSON --
+    that manual conversion is where address typos come from.
+
+    A raw ``bool`` is rejected explicitly (``isinstance(True, int)`` is
+    True in Python, so ``int(True)`` would silently yield 1 and mask a
+    JSON-shape mismatch upstream).
+    """
+    if isinstance(v, bool):
+        raise ValueError("expected an integer, got bool")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            raise ValueError("empty string is not a number")
+        return int(s, 0)
+    raise ValueError(
+        "expected int or numeric string, got {}".format(type(v).__name__)
+    )
+
 _DEFENSES = {
     "anti_ptrace": ("enable_anti_ptrace", "disable_anti_ptrace"),
     "anti_mach_ports": ("enable_anti_mach_ports", "disable_anti_mach_ports"),
@@ -185,7 +211,7 @@ class AgentSession:
             self.dbg.interrupt()
             return {"ok": True}
         if cmd == "breakpoint_toggle":
-            addr = int(args["addr"])
+            addr = _int_arg(args["addr"])
             existing = self._bp_id_at_addr(addr)
             if existing is not None:
                 guard = self._guard_hidden_bp(existing)
@@ -201,30 +227,34 @@ class AgentSession:
                 for (i, a, s, c, en, cond) in rows
             ]}
         if cmd == "breakpoint_enable":
-            guard = self._guard_hidden_bp(int(args["bp_id"]))
+            bp_id = _int_arg(args["bp_id"])
+            guard = self._guard_hidden_bp(bp_id)
             if guard is not None:
                 return guard
-            ok = self.dbg.set_bp_enabled(int(args["bp_id"]), bool(args["enabled"]))
+            ok = self.dbg.set_bp_enabled(bp_id, bool(args["enabled"]))
             return {"ok": ok}
         if cmd == "breakpoint_condition":
-            guard = self._guard_hidden_bp(int(args["bp_id"]))
+            bp_id = _int_arg(args["bp_id"])
+            guard = self._guard_hidden_bp(bp_id)
             if guard is not None:
                 return guard
-            ok = self.dbg.set_bp_condition(int(args["bp_id"]), args.get("condition") or "")
+            ok = self.dbg.set_bp_condition(bp_id, args.get("condition") or "")
             return {"ok": ok}
         if cmd == "breakpoint_commands":
-            guard = self._guard_hidden_bp(int(args["bp_id"]))
+            bp_id = _int_arg(args["bp_id"])
+            guard = self._guard_hidden_bp(bp_id)
             if guard is not None:
                 return guard
-            ok = self.dbg.set_bp_commands(int(args["bp_id"]), list(args.get("commands") or []))
+            ok = self.dbg.set_bp_commands(bp_id, list(args.get("commands") or []))
             return {"ok": ok}
         if cmd == "breakpoint_delete":
             if not self.dbg.target:
                 return {"ok": False, "error": "no target"}
-            guard = self._guard_hidden_bp(int(args["bp_id"]))
+            bp_id = _int_arg(args["bp_id"])
+            guard = self._guard_hidden_bp(bp_id)
             if guard is not None:
                 return guard
-            ok = self.dbg.target.BreakpointDelete(int(args["bp_id"]))
+            ok = self.dbg.target.BreakpointDelete(bp_id)
             return {"ok": bool(ok)}
         if cmd == "registers":
             return self.cmd_registers()
@@ -248,7 +278,7 @@ class AgentSession:
                 for (tid, idx, name, pc, fn) in rows
             ]}
         if cmd == "select_thread":
-            thread_id = int(args["thread_id"])
+            thread_id = _int_arg(args["thread_id"])
             # core Debugger.select_thread -> SBProcess.SetSelectedThreadByID
             # returns False for an unknown id but STILL resets the selection
             # to thread 0 as a side effect -- every subsequent
@@ -269,25 +299,27 @@ class AgentSession:
                 for (name, base, size, triple) in rows
             ]}
         if cmd == "disasm":
-            return self.cmd_disasm(args.get("addr"), int(args.get("count", 64)))
+            raw_addr = args.get("addr")
+            addr = _int_arg(raw_addr) if raw_addr is not None else None
+            return self.cmd_disasm(addr, _int_arg(args.get("count", 64)))
         if cmd == "read_memory":
-            return self.cmd_read_memory(int(args["addr"]), int(args["size"]))
+            return self.cmd_read_memory(_int_arg(args["addr"]), _int_arg(args["size"]))
         if cmd == "write_memory":
             data = bytes.fromhex(args["hex"])
-            ok, msg = self.dbg.write_memory(int(args["addr"]), data)
+            ok, msg = self.dbg.write_memory(_int_arg(args["addr"]), data)
             return {"ok": ok, "message": msg}
         if cmd == "write_register":
-            ok, msg = self.dbg.write_register(args["name"], int(args["value"]))
+            ok, msg = self.dbg.write_register(args["name"], _int_arg(args["value"]))
             return {"ok": ok, "message": msg}
         if cmd == "memory_search":
             return self.cmd_memory_search(args)
         if cmd == "extract_strings":
-            hits = self.dbg.extract_strings(min_len=int(args.get("min_len", 5)))
+            hits = self.dbg.extract_strings(min_len=_int_arg(args.get("min_len", 5)))
             return {"ok": True, "strings": [{"addr": a, "text": s} for (a, s) in hits]}
         if cmd == "scan_live_strings":
             hits = self.dbg.scan_live_strings(
-                min_len=int(args.get("min_len", 8)),
-                budget_bytes=int(args.get("budget_bytes", 512 * 1024 * 1024)),
+                min_len=_int_arg(args.get("min_len", 8)),
+                budget_bytes=_int_arg(args.get("budget_bytes", 512 * 1024 * 1024)),
             )
             return {"ok": True, "strings": [{"addr": a, "text": s} for (a, s) in hits]}
         if cmd == "defense_enable":
@@ -311,10 +343,10 @@ class AgentSession:
             self.tracer.disable(self.dbg.target)
             return {"ok": True}
         if cmd == "tracer_depth":
-            self.tracer.caller_depth = int(args["depth"])
+            self.tracer.caller_depth = _int_arg(args["depth"])
             return {"ok": True, "caller_depth": self.tracer.caller_depth}
         if cmd == "trace_hits":
-            since = int(args.get("since", 0))
+            since = _int_arg(args.get("since", 0))
             return {"ok": True, "hits": [h for h in self._trace_hits if h["n"] > since]}
         if cmd == "raw":
             ok, out, err = self.dbg.handle_command(args["command"])
@@ -400,6 +432,22 @@ class AgentSession:
 
     def cmd_registers(self) -> dict:
         frame = self.dbg.frame()
+        if frame is None and self._process_stopped():
+            # LLDB sometimes clears the "selected thread" after an interrupt --
+            # cmd_registers would then bail with "no stopped frame" even though
+            # `raw {"command": "register read"}` still works, because the
+            # command interpreter falls back to thread 0 implicitly. Mirror
+            # that fallback so callers don't have to manually select_thread
+            # after every interrupt.
+            proc = self.dbg.process
+            if proc and proc.GetNumThreads() > 0:
+                for i in range(proc.GetNumThreads()):
+                    t = proc.GetThreadAtIndex(i)
+                    if t and t.IsValid():
+                        proc.SetSelectedThread(t)
+                        frame = self.dbg.frame()
+                        if frame is not None:
+                            break
         if frame is None:
             return {"ok": False, "error": "no stopped frame"}
         rows = collect_regs(frame, prev={}, read_mem=self.dbg.read_memory,
@@ -557,7 +605,7 @@ class AgentSession:
         needle = bytes.fromhex(needle_hex) if needle_hex else args.get("needle_ascii", "").encode()
         if not needle:
             return {"ok": False, "error": "needle_hex or needle_ascii required"}
-        max_hits = int(args.get("max_hits", 32))
+        max_hits = _int_arg(args.get("max_hits", 32))
         if max_hits <= 0:
             # core Debugger.memory_search appends a hit *then* checks
             # len(hits) >= max_hits, so max_hits=0 still returns one hit.
@@ -567,7 +615,7 @@ class AgentSession:
             # Exposes core's total_budget_bytes so a caller can bound a
             # scope="all" scan themselves -- it defaults to a multi-GB sweep
             # of the whole address space, which can take tens of seconds.
-            kwargs["total_budget_bytes"] = int(args["budget_bytes"])
+            kwargs["total_budget_bytes"] = _int_arg(args["budget_bytes"])
         hits, scanned = self.dbg.memory_search(needle, **kwargs)
         return {"ok": True, "hits": [hex(h) for h in hits], "bytes_scanned": scanned}
 
