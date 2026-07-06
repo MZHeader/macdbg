@@ -6,7 +6,7 @@ A Textual TUI for LLDB. Gives you a multi-pane view of the running process. Incl
 
 ## Who Is This For
 
-Reverse engineers and malware analysts debugging macOS binaries who aren't very good at remembering CLI commands and want an experience closer to x64dbg. The Trace tab gives results with no breakpoints needed and the debugger has built-in functionality to defeat common anti-cheat techniques.
+Reverse engineers and malware analysts debugging macOS binaries who aren't very good at remembering CLI commands and want an experience closer to x64dbg. The Trace tab gives results with no breakpoints needed and the debugger has built-in functionality to defeat common anti-debug techniques.
 
 ## Requirements
 
