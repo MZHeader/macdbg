@@ -109,7 +109,7 @@ class WrapperApp(App):
         Binding("ctrl+r", "restart", "Restart", priority=True),
         Binding("f2", "toggle_bp", "Toggle BP"),
         Binding("colon", "focus_cmd", "Command", key_display=":"),
-        Binding("ctrl+g", "focus_mem", "Goto Addr"),
+        Binding("ctrl+g", "goto_disasm", "Goto (disasm)"),
         Binding("ctrl+t", "toggle_trace", "Trace"),
         Binding("ctrl+k", "clear_trace", "Clear Trace"),
         Binding("ctrl+y", "cycle_trace_depth", "Trace Scope"),
@@ -683,6 +683,12 @@ class WrapperApp(App):
         if not (p and p.IsValid() and p.GetState() == lldb.eStateStopped):
             return False
         self._resuming = True
+        # Stepping / continuing follows execution, so drop any disassembly browse
+        # (Ctrl+G / follow) -- the next stop re-centres on the new pc instead of
+        # staying parked on the address you were looking at.
+        if self._disasm_follow is not None:
+            self._disasm_follow = None
+            self.disasm.set_status(None)
         return True
 
     def action_step_in(self) -> None:
@@ -777,8 +783,24 @@ class WrapperApp(App):
     def action_focus_cmd(self) -> None:
         self.console_pane.cmd.focus()
 
-    def action_focus_mem(self) -> None:
-        self.mem.addr_input.focus()
+    def action_goto_disasm(self) -> None:
+        """Ctrl+G: browse to an address in the disassembly view. F5 (or the next
+        step) snaps back to pc. The Memory pane keeps its own address box for
+        following data."""
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Go to address in disassembly (hex, e.g. 0x100003f88)",
+                initial="0x",
+            ))
+            if val is None or not val.strip():
+                return
+            try:
+                addr = int(val.strip(), 0)
+            except ValueError:
+                self.console_pane.write("[disasm] bad address: {!r}".format(val), error=True)
+                return
+            self._follow_disasm(addr)
+        self.run_worker(_run(), exclusive=True)
 
     def action_disasm_snap_pc(self) -> None:
         if self._disasm_follow is None:
@@ -1396,6 +1418,7 @@ class WrapperApp(App):
                 return
             row_w = self._hex_row_width(pane)
             items = [
+                ("Follow in disassembly",         lambda: self._follow_disasm(base)),
                 ("Goto qword here (follow ptr)",  lambda: self._follow_qword(base)),
                 ("Set watchpoint on this addr",   lambda: self._set_watchpoint(base)),
                 ("Edit bytes at this row…",       lambda: self._prompt_edit_mem(base)),

@@ -127,7 +127,7 @@ A Claude Code skill at `.claude/skills/macdbg-agent/SKILL.md` documents the prot
 | Ctrl+B | Interrupt a running process |
 | Ctrl+D | Defenses menu |
 | Ctrl+F | Search process memory (target scope by default; prefix `all:` for libraries) |
-| Ctrl+G | Focus the memory follow-address input |
+| Ctrl+G | Go to an address in the disassembly view (browse; F5 or the next step snaps back to pc) |
 | Ctrl+K | Clear the trace tab |
 | Ctrl+P | Command palette |
 | Ctrl+T | Toggle the tracer |
