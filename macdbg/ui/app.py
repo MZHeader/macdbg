@@ -392,10 +392,19 @@ class WrapperApp(App):
             self._resuming = False
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
-            if self.dbg.resume_pending_step_over():
-                # step_over stepped into a call; we've issued the StepOut that
-                # finishes it. Keep gating input until that real stop lands.
-                self._resuming = True
+            if self.dbg.in_user_step():
+                # A user step is completing. Log this stop first if it is a
+                # tracer hit (so the trace window still fills), then drive the
+                # step -- never handing control to the tracer/anti-debug
+                # auto-continue, which is what turned a step into a free run when
+                # Trace was on.
+                if self.tracer.enabled:
+                    self._log_trace_hit()
+                if self.dbg.advance_user_step(self._hidden_bp_ids()) == "more":
+                    self._resuming = True
+                    return
+                self.console_pane.write(self._describe_stop())
+                self._refresh_all()
                 return
             if self.dbg.in_fork_shield():
                 # Parent has returned from the shielded fork; restore breakpoints
@@ -410,6 +419,7 @@ class WrapperApp(App):
             self.console_pane.write(self._describe_stop())
             self._refresh_all()
         elif e.state == lldb.eStateExited:
+            self.dbg.cancel_user_step()
             self.console_pane.write(self._describe_exit())
         else:
             self.console_pane.write("[event] state={} ({})".format(e.description, e.state))
@@ -552,7 +562,10 @@ class WrapperApp(App):
             self._trace_count += 1
             self.trace_pane.add_hit(self._trace_count, hit.category, hit.call)
 
-    def _handle_possible_trace_hit(self) -> bool:
+    def _log_trace_hit(self) -> bool:
+        """If the current stop is a tracer breakpoint, add it to the trace
+        window. Returns True if it was a trace hit. Does not resume the process,
+        so it is safe to call while a user step is completing."""
         process = self.dbg.process
         if not process or not process.IsValid():
             return False
@@ -570,7 +583,12 @@ class WrapperApp(App):
         if hit is not None:
             self._trace_count += 1
             self.trace_pane.add_hit(self._trace_count, hit.category, hit.call)
-        process.Continue()
+        return True
+
+    def _handle_possible_trace_hit(self) -> bool:
+        if not self._log_trace_hit():
+            return False
+        self.dbg.process.Continue()
         return True
 
     def _on_output_event(self, e: OutputEvent) -> None:

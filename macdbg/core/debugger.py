@@ -35,9 +35,11 @@ class Debugger:
         self.state: Optional[BinaryState] = None
         self.interpose_enabled: bool = False
         self.interpose_trace_path: Optional[str] = None
-        # Frame depth captured when step_over stepped *into* a call, so the
-        # follow-up stop knows to run back out and finish the step-over.
-        self._pending_step_out_depth: Optional[int] = None
+        # State for completing an in-flight user step across stop events, so a
+        # step's thread plan surviving a tracer/anti-debug breakpoint is driven
+        # by frame depth rather than left to be hijacked by an auto-continue.
+        self._step_active: bool = False
+        self._step_target_depth: Optional[int] = None
 
         self._out_r_fd, self._out_w_fd = os.pipe()
         os.set_blocking(self._out_r_fd, False)
@@ -185,9 +187,10 @@ class Debugger:
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
         assert self.target is not None
-        # Drop any step-over-in-progress state from a prior run so the first stop
-        # of the fresh process can't be mistaken for a pending step-out.
-        self._pending_step_out_depth = None
+        # Drop any step-in-progress state from a prior run so the first stop of
+        # the fresh process can't be mistaken for a step to complete.
+        self._step_active = False
+        self._step_target_depth = None
         info = lldb.SBLaunchInfo(argv)
         info.SetLaunchFlags(
             lldb.eLaunchFlagStopAtEntry | lldb.eLaunchFlagDisableASLR
@@ -374,12 +377,18 @@ class Debugger:
     def step_in(self) -> None:
         t = self._thread()
         if t:
+            # Single instruction, no depth target: whatever it lands on is the
+            # stop, even if that is a traced libSystem entry.
+            self._step_active = True
+            self._step_target_depth = None
             t.StepInstruction(False)
 
     def step_out(self) -> None:
         """Run until the current frame returns (gdb's 'finish')."""
         t = self._thread()
         if t:
+            self._step_active = True
+            self._step_target_depth = t.GetNumFrames() - 1
             t.StepOut()
 
     _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
@@ -396,43 +405,73 @@ class Debugger:
     def step_over(self) -> None:
         """Step over the current instruction.
 
-        We deliberately never use StepInstruction(step_over=True): its
-        step-over-a-call thread plan can run to process exit on some call sites
-        (indirect / PAC-authenticated calls especially) -- the "step over just
-        continues" bug. Instead:
-          * non-call: StepInstruction(False), the same single-instruction step
-            as step_in, which is the path that never runs away.
-          * call: StepInstruction(False) to step *into* the callee (one bounded
-            instruction), then resume_pending_step_over() runs back out on the
-            follow-up stop. StepOut is bounded to the frame's return address, so
-            it can't turn a step-over into a free run.
-        """
+        We never use StepInstruction(step_over=True): its step-over-a-call thread
+        plan can run to process exit on some call sites (indirect / PAC calls
+        especially). Instead:
+          * non-call: StepInstruction(False), a single instruction step.
+          * call: StepInstruction(False) to step *into* the callee, then
+            advance_user_step() runs back out to the caller frame.
+        advance_user_step() completes the step by frame depth, so tracer /
+        anti-debug breakpoints firing inside the callee can't hijack it into a
+        free run (the "step over runs away when Trace is on" bug)."""
         t = self._thread()
         if not t or not self.target or not self.target.IsValid():
             return
         frame = t.GetFrameAtIndex(0)
         if not frame or not frame.IsValid():
             return
+        self._step_active = True
         if self._is_call_at(frame.GetPC()):
-            self._pending_step_out_depth = t.GetNumFrames()
+            self._step_target_depth = t.GetNumFrames()
         else:
-            self._pending_step_out_depth = None
+            self._step_target_depth = None
         t.StepInstruction(False)
 
-    def resume_pending_step_over(self) -> bool:
-        """Called on the stop that follows step_over stepping into a call. If we
-        did land one frame deeper, run back out to finish the step-over and
-        return True (the current stop is internal -- don't surface it). Returns
-        False when there is nothing pending or we didn't actually enter a call."""
-        depth = self._pending_step_out_depth
-        self._pending_step_out_depth = None
-        if depth is None:
-            return False
+    def advance_user_step(self, auto_bp_ids=None) -> str:
+        """Called on every stop. Drives an in-flight user step to completion.
+
+        Returns 'inactive' when no user step is running (caller handles the stop
+        normally), 'more' when it re-issued a StepOut and the loop should keep
+        pumping without surfacing this stop, or 'done' when the step has landed
+        and its stop should be surfaced.
+
+        `auto_bp_ids` is the set of tracer / anti-debug breakpoint ids: a stop on
+        one of those inside the stepped-over callee is transparent (keep going),
+        but a genuine user breakpoint there ends the step so it can be seen."""
+        if not self._step_active:
+            return "inactive"
         t = self._thread()
-        if t and t.GetFrameAtIndex(0).IsValid() and t.GetNumFrames() > depth:
-            t.StepOut()
-            return True
-        return False
+        if not t or not t.GetFrameAtIndex(0).IsValid():
+            self._step_active = False
+            self._step_target_depth = None
+            return "done"
+        # Single-instruction step (step-in, or step-over of a non-call): done.
+        if self._step_target_depth is None:
+            self._step_active = False
+            return "done"
+        if t.GetNumFrames() <= self._step_target_depth:
+            self._step_active = False
+            self._step_target_depth = None
+            return "done"
+        # Still inside the callee. A genuine user breakpoint here should stop the
+        # step (x64dbg stops at breakpoints hit inside a stepped-over call).
+        if t.GetStopReason() == lldb.eStopReasonBreakpoint:
+            auto = set(auto_bp_ids or ())
+            hit = {t.GetStopReasonDataAtIndex(i)
+                   for i in range(0, t.GetStopReasonDataCount(), 2)}
+            if hit - auto:
+                self._step_active = False
+                self._step_target_depth = None
+                return "done"
+        t.StepOut()
+        return "more"
+
+    def in_user_step(self) -> bool:
+        return self._step_active
+
+    def cancel_user_step(self) -> None:
+        self._step_active = False
+        self._step_target_depth = None
 
     def step_in_source(self) -> None:
         t = self._thread()

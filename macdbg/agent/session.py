@@ -758,12 +758,21 @@ class AgentSession:
                 continue
             if state == lldb.eStateStopped:
                 self.dbg.select_stopped_thread()
-                if self.dbg.resume_pending_step_over():
-                    # step_over stepped into a call; finish it by running out.
-                    hit = _deadline_hit()
-                    if hit is not None:
-                        return hit
-                    continue
+                if self.dbg.in_user_step():
+                    # Completing a user step: log this stop first if it is a
+                    # tracer hit, then drive the step -- never letting the tracer
+                    # auto-continue hijack it into a free run.
+                    if self.tracer.enabled:
+                        self._log_trace_hit()
+                    if self.dbg.advance_user_step(self._hidden_bp_ids()) == "more":
+                        hit = _deadline_hit()
+                        if hit is not None:
+                            return hit
+                        continue
+                    # The step landed -- surface it directly, bypassing the
+                    # auto-continue handlers below.
+                    return {"ok": True, "event": "stop", "stop": self._describe_stop(),
+                            "console": self._drain_console()}
                 if self.dbg.in_fork_shield():
                     self.dbg.finish_fork_shield()
                     self.dbg.cont()
@@ -877,7 +886,10 @@ class AgentSession:
                     return True
         return False
 
-    def _try_trace_hit(self) -> bool:
+    def _log_trace_hit(self) -> bool:
+        """Record the current stop in the trace log if it is a tracer
+        breakpoint. Returns True if it was. Does not resume, so it is safe to
+        call while a user step is completing."""
         process = self.dbg.process
         if not process or not process.IsValid():
             return False
@@ -894,6 +906,11 @@ class AgentSession:
         if hit is not None:
             self._trace_count += 1
             self._trace_hits.append({"n": self._trace_count, "category": hit.category, "call": hit.call})
+        return True
+
+    def _try_trace_hit(self) -> bool:
+        if not self._log_trace_hit():
+            return False
         self.dbg.cont()
         return True
 
