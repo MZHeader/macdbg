@@ -191,6 +191,7 @@ class Debugger:
         # the fresh process can't be mistaken for a step to complete.
         self._step_active = False
         self._step_target_depth = None
+        self._clear_flag_scrub_returns()
         info = lldb.SBLaunchInfo(argv)
         info.SetLaunchFlags(
             lldb.eLaunchFlagStopAtEntry | lldb.eLaunchFlagDisableASLR
@@ -738,6 +739,17 @@ class Debugger:
     _CS_OPS_STATUS = 0
     _CTL_KERN = 1
     _KERN_PROC = 14
+    _KERN_PROC_PID = 1
+
+    def _clear_flag_scrub_returns(self) -> None:
+        """Drop any pending return-address one-shots. Called on (re)launch so a
+        one-shot armed but never reached (process died mid-call) can't fire in a
+        fresh run -- with ASLR off its address recurs -- and scrub a stale
+        buffer. The entry breakpoints stay; only the transient returns go."""
+        if self._flag_scrub_returns and self.target and self.target.IsValid():
+            for bp_id in list(self._flag_scrub_returns):
+                self.target.BreakpointDelete(bp_id)
+        self._flag_scrub_returns = None
 
     def enable_anti_sysctl(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
@@ -830,13 +842,19 @@ class Debugger:
             return None
         if bp_id == self.anti_sysctl_bp_id:
             mib = frame.FindRegister("x0").GetValueAsUnsigned()
+            namelen = frame.FindRegister("x1").GetValueAsUnsigned()
             oldp = frame.FindRegister("x2").GetValueAsUnsigned()
-            if mib and oldp:
+            if mib and oldp and namelen >= 3:
                 err = lldb.SBError()
-                head = self.process.ReadMemory(mib, 8, err)
-                if err.Success() and head and len(head) == 8:
-                    if (int.from_bytes(head[0:4], "little") == self._CTL_KERN
-                            and int.from_bytes(head[4:8], "little") == self._KERN_PROC):
+                head = self.process.ReadMemory(mib, 12, err)
+                if err.Success() and head and len(head) == 12:
+                    name = [int.from_bytes(head[i:i + 4], "little") for i in (0, 4, 8)]
+                    # {CTL_KERN, KERN_PROC, KERN_PROC_PID, ...} is the per-process
+                    # query that carries P_TRACED. Even if we over-matched, the
+                    # scrub only fires when the bit is actually set, so this is
+                    # just to avoid arming a return on unrelated kern.* queries.
+                    if (name[0] == self._CTL_KERN and name[1] == self._KERN_PROC
+                            and name[2] == self._KERN_PROC_PID):
                         self._arm_return_scrub(thread, "sysctl", oldp)
             self.process.Continue()
             return ""
