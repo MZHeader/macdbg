@@ -914,6 +914,12 @@ class AgentSession:
     def _try_trace_hit(self) -> bool:
         if not self._log_trace_hit():
             return False
+        # Don't swallow a user breakpoint that sits on the same traced address:
+        # if one is also present at this stop, surface it instead of continuing.
+        thread = self.dbg.process.GetSelectedThread()
+        hidden = self._hidden_bp_ids()
+        if any(b not in hidden for b in self._stop_bp_ids(thread)):
+            return False
         self.dbg.cont()
         return True
 

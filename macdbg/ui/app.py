@@ -588,6 +588,13 @@ class WrapperApp(App):
     def _handle_possible_trace_hit(self) -> bool:
         if not self._log_trace_hit():
             return False
+        # If the user also has a breakpoint at this traced address, surface the
+        # stop instead of auto-continuing -- otherwise the tracer silently
+        # swallows a breakpoint set on open/connect/stat/etc. while it is on.
+        thread = self.dbg.process.GetSelectedThread()
+        hidden = self._hidden_bp_ids()
+        if any(b not in hidden for b in self._stop_bp_ids(thread)):
+            return False
         self.dbg.process.Continue()
         return True
 
