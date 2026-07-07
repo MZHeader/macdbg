@@ -149,14 +149,23 @@ Strings:
   Default `budget_bytes` is 512 MiB.
 
 Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
-`anti_csops`, `anti_mach_ports`, `direct_syscall`, `fork_identity`,
-`exec_sandbox`):
+`anti_csops`, `anti_timing`, `anti_mach_ports`, `direct_syscall`,
+`fork_identity`, `exec_sandbox`):
 - `defense_enable {"name": "…"}` / `defense_disable {"name": "…"}`.
 - `anti_sysctl` clears `P_TRACED` from `sysctl(KERN_PROC)` results and
   `anti_csops` clears `CS_DEBUGGED` from `csops(CS_OPS_STATUS)` results --
   the two flag-based checks that otherwise see the debugger even with
   `anti_ptrace` on. Enable them at the entry stop, before your first
   `continue`, so the check can't run first.
+- `anti_timing` feeds `mach_absolute_time()` a fake monotonic clock. A
+  sample that times a sensitive call catches the millisecond latency the
+  scrubs above add (a scrubbed flag plus a slow call still reads as
+  "debugger"); this hides that delta, and the per-instruction cost of
+  single-stepping. Pair it with `anti_sysctl`/`anti_csops`. It intercepts
+  *every* `mach_absolute_time` call, so it slows timing-heavy targets --
+  leave it off unless a timing check needs it.
+- All defenses now apply whether you `continue` past the checked call or
+  single-step *through* it; stepping no longer bypasses a defense.
 
 Fork/exec interactive decisions — by default these auto-resolve
 (identity/sandbox mode blocks/fakes the call and keeps going); set

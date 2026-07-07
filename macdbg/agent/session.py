@@ -68,6 +68,7 @@ _DEFENSES = {
     "anti_ptrace": ("enable_anti_ptrace", "disable_anti_ptrace"),
     "anti_sysctl": ("enable_anti_sysctl", "disable_anti_sysctl"),
     "anti_csops": ("enable_anti_csops", "disable_anti_csops"),
+    "anti_timing": ("enable_anti_timing", "disable_anti_timing"),
     "anti_mach_ports": ("enable_anti_mach_ports", "disable_anti_mach_ports"),
     "direct_syscall": ("enable_direct_syscall_scan", "disable_direct_syscall_scan"),
     "fork_identity": ("enable_fork_identity", "disable_fork_identity"),
@@ -880,6 +881,7 @@ class AgentSession:
             return False
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_flag_scrub_hit,
+                        self.dbg.handle_anti_timing_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
                         self.dbg.handle_fork_hit,
@@ -963,6 +965,8 @@ class AgentSession:
             ids.add(self.dbg.anti_sysctl_bp_id)
         if self.dbg.anti_csops_bp_id:
             ids.add(self.dbg.anti_csops_bp_id)
+        if self.dbg.anti_timing_bp_id:
+            ids.add(self.dbg.anti_timing_bp_id)
         if self.dbg._flag_scrub_returns:
             ids.update(self.dbg._flag_scrub_returns.keys())
         if self.dbg.anti_mach_bp_id:

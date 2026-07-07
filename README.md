@@ -39,6 +39,7 @@ Feeling lazy? `Ctrl+T` arms breakpoints on common file, process, and network ent
 - **Cloak Mach exception ports** hooks `task_get_exception_ports` to report none, so the process looks unattached.
 - **Scrub P_TRACED from sysctl** lets `sysctl(KERN_PROC)` run, then clears the `P_TRACED` bit in the returned `kinfo_proc` so the classic sysctl check sees an untraced process.
 - **Scrub CS_DEBUGGED from csops** does the same for `csops(CS_OPS_STATUS)`, clearing the `CS_DEBUGGED` code-signing flag modern samples check.
+- **Cloak timing via mach_absolute_time** feeds a fake monotonic clock, so a sample that *times* a sensitive call to catch the latency a flag-scrubber adds (a scrubbed flag plus a call that suddenly takes milliseconds still reads as "debugger") sees a normal, tiny delta. It also hides the per-instruction cost of single-stepping. Turn it on alongside the sysctl/csops scrubs. Every `mach_absolute_time` call is intercepted, so it's slower on timing-heavy targets — leave it off unless a timing check needs it.
 
 **Breakpoints**
 

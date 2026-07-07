@@ -542,6 +542,7 @@ class WrapperApp(App):
                     return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_flag_scrub_hit,
+                        self.dbg.handle_anti_timing_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
                         self.dbg.handle_fork_hit,
@@ -973,6 +974,8 @@ class WrapperApp(App):
             ids.add(self.dbg.anti_sysctl_bp_id)
         if self.dbg.anti_csops_bp_id:
             ids.add(self.dbg.anti_csops_bp_id)
+        if self.dbg.anti_timing_bp_id:
+            ids.add(self.dbg.anti_timing_bp_id)
         if self.dbg._flag_scrub_returns:
             ids.update(self.dbg._flag_scrub_returns.keys())
         if self.dbg.anti_mach_bp_id:
@@ -995,18 +998,21 @@ class WrapperApp(App):
             return (text, None)
 
         def build_items():
+            all_anti = bool(self.dbg.anti_ptrace_bp_id and self.dbg.direct_syscall_bp_ids
+                            and self.dbg.anti_mach_bp_id and self.dbg.anti_sysctl_bp_id
+                            and self.dbg.anti_csops_bp_id and self.dbg.anti_timing_bp_id)
             return [
                 header("Anti-debug"),
-                ("{}  Defeat PT_DENY_ATTACH via libc (hook ptrace, return 0)".format(tick(bool(self.dbg.anti_ptrace_bp_id))),
+                ("{}  Enable all anti-debug bypasses (incl. timing cloak; slower)".format(tick(all_anti)),
+                 self._toggle_all_anti_debug),
+                ("{}  Defeat PT_DENY_ATTACH (libc hook + inline svc #0x80 scan)".format(tick(bool(self.dbg.anti_ptrace_bp_id) or bool(self.dbg.direct_syscall_bp_ids))),
                  self._toggle_deny_attach_bypass),
-                ("{}  Defeat inline PT_DENY_ATTACH (scan for svc #0x80, no libc)".format(tick(bool(self.dbg.direct_syscall_bp_ids))),
-                 self._toggle_direct_syscall_scan),
                 ("{}  Cloak Mach exception ports (report none, look unattached)".format(tick(bool(self.dbg.anti_mach_bp_id))),
                  self._toggle_mach_ports_cloak),
-                ("{}  Scrub P_TRACED from sysctl(KERN_PROC) results".format(tick(bool(self.dbg.anti_sysctl_bp_id))),
-                 self._toggle_anti_sysctl),
-                ("{}  Scrub CS_DEBUGGED from csops(CS_OPS_STATUS) results".format(tick(bool(self.dbg.anti_csops_bp_id))),
-                 self._toggle_anti_csops),
+                ("{}  Scrub debugger flags (P_TRACED from sysctl + CS_DEBUGGED from csops)".format(tick(bool(self.dbg.anti_sysctl_bp_id) or bool(self.dbg.anti_csops_bp_id))),
+                 self._toggle_flag_scrubs),
+                ("{}  Cloak timing: fake mach_absolute_time (hide hook latency)".format(tick(bool(self.dbg.anti_timing_bp_id))),
+                 self._toggle_anti_timing),
                 header("Breakpoints"),
                 ("{}  Hardware breakpoints for your breakpoints (no __TEXT patch)".format(tick(self.dbg.hw_breakpoints)),
                  self._toggle_hw_bps),
@@ -1028,27 +1034,60 @@ class WrapperApp(App):
         w, h = self.size
         self.push_screen(ToggleMenu(build_items, x=max(0, w // 2 - 25), y=max(0, h // 3)))
 
+    def _toggle_all_anti_debug(self) -> None:
+        """Arm every Anti-debug bypass at once, or disarm them all if all are
+        already on. Includes the timing cloak, which hooks every
+        mach_absolute_time call and so slows timing-heavy targets -- flip it back
+        off individually if a target gets sluggish."""
+        d = self.dbg
+        all_on = bool(d.anti_ptrace_bp_id and d.direct_syscall_bp_ids
+                      and d.anti_mach_bp_id and d.anti_sysctl_bp_id
+                      and d.anti_csops_bp_id and d.anti_timing_bp_id)
+        if all_on:
+            pairs = [d.disable_anti_ptrace(), d.disable_direct_syscall_scan(),
+                     d.disable_anti_mach_ports(), d.disable_anti_sysctl(),
+                     d.disable_anti_csops(), d.disable_anti_timing()]
+        else:
+            pairs = [d.enable_anti_ptrace(), d.enable_direct_syscall_scan(),
+                     d.enable_anti_mach_ports(), d.enable_anti_sysctl(),
+                     d.enable_anti_csops(), d.enable_anti_timing()]
+        for _, m in pairs:
+            self.console_pane.write("[anti-debug] " + m)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
     def _toggle_deny_attach_bypass(self) -> None:
-        if self.dbg.anti_ptrace_bp_id:
-            _, msg = self.dbg.disable_anti_ptrace()
+        """One toggle for both PT_DENY_ATTACH paths -- the libc ptrace hook and
+        the inline svc #0x80 scan. On if either is armed; flipping arms/disarms
+        both. (The agent keeps anti_ptrace and direct_syscall as separate names.)"""
+        if self.dbg.anti_ptrace_bp_id or self.dbg.direct_syscall_bp_ids:
+            msgs = [self.dbg.disable_anti_ptrace()[1],
+                    self.dbg.disable_direct_syscall_scan()[1]]
         else:
-            _, msg = self.dbg.enable_anti_ptrace()
-        self.console_pane.write("[anti-debug] " + msg)
+            msgs = [self.dbg.enable_anti_ptrace()[1],
+                    self.dbg.enable_direct_syscall_scan()[1]]
+        for m in msgs:
+            self.console_pane.write("[anti-debug] " + m)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
-    def _toggle_anti_sysctl(self) -> None:
-        if self.dbg.anti_sysctl_bp_id:
-            _, msg = self.dbg.disable_anti_sysctl()
+    def _toggle_flag_scrubs(self) -> None:
+        """One toggle for both flag scrubs -- P_TRACED from sysctl and
+        CS_DEBUGGED from csops. On if either is armed; flipping arms/disarms
+        both. (The agent keeps anti_sysctl and anti_csops as separate names.)"""
+        if self.dbg.anti_sysctl_bp_id or self.dbg.anti_csops_bp_id:
+            msgs = [self.dbg.disable_anti_sysctl()[1],
+                    self.dbg.disable_anti_csops()[1]]
         else:
-            _, msg = self.dbg.enable_anti_sysctl()
-        self.console_pane.write("[anti-debug] " + msg)
+            msgs = [self.dbg.enable_anti_sysctl()[1],
+                    self.dbg.enable_anti_csops()[1]]
+        for m in msgs:
+            self.console_pane.write("[anti-debug] " + m)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
-    def _toggle_anti_csops(self) -> None:
-        if self.dbg.anti_csops_bp_id:
-            _, msg = self.dbg.disable_anti_csops()
+    def _toggle_anti_timing(self) -> None:
+        if self.dbg.anti_timing_bp_id:
+            _, msg = self.dbg.disable_anti_timing()
         else:
-            _, msg = self.dbg.enable_anti_csops()
+            _, msg = self.dbg.enable_anti_timing()
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
@@ -1073,14 +1112,6 @@ class WrapperApp(App):
             _, msg = self.dbg.disable_anti_mach_ports()
         else:
             _, msg = self.dbg.enable_anti_mach_ports()
-        self.console_pane.write("[anti-debug] " + msg)
-        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
-
-    def _toggle_direct_syscall_scan(self) -> None:
-        if self.dbg.direct_syscall_bp_ids:
-            _, msg = self.dbg.disable_direct_syscall_scan()
-        else:
-            _, msg = self.dbg.enable_direct_syscall_scan()
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 

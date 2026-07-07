@@ -191,6 +191,9 @@ class Debugger:
         # the fresh process can't be mistaken for a step to complete.
         self._step_active = False
         self._step_target_depth = None
+        self._pending_step_scrubs = None
+        self._fake_clock = 0
+        self._anti_timing_logged = False
         self._clear_flag_scrub_returns()
         info = lldb.SBLaunchInfo(argv)
         info.SetLaunchFlags(
@@ -382,6 +385,7 @@ class Debugger:
             # stop, even if that is a traced libSystem entry.
             self._step_active = True
             self._step_target_depth = None
+            self._pending_step_scrubs = None
             t.StepInstruction(False)
 
     def step_out(self) -> None:
@@ -390,6 +394,7 @@ class Debugger:
         if t:
             self._step_active = True
             self._step_target_depth = t.GetNumFrames() - 1
+            self._pending_step_scrubs = None
             t.StepOut()
 
     _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
@@ -422,6 +427,7 @@ class Debugger:
         if not frame or not frame.IsValid():
             return
         self._step_active = True
+        self._pending_step_scrubs = None
         if self._is_call_at(frame.GetPC()):
             self._step_target_depth = t.GetNumFrames()
         else:
@@ -445,17 +451,19 @@ class Debugger:
         if not t or not t.GetFrameAtIndex(0).IsValid():
             self._step_active = False
             self._step_target_depth = None
+            self._pending_step_scrubs = None
             return "done"
+        # A sysctl/csops call we let run during this step may have just returned;
+        # scrub its now-filled buffer before doing anything else.
+        self._resolve_pending_step_scrubs(t)
         # Single-instruction step (step-in, or step-over of a non-call): done.
         if self._step_target_depth is None:
             self._step_active = False
             return "done"
-        if t.GetNumFrames() <= self._step_target_depth:
-            self._step_active = False
-            self._step_target_depth = None
-            return "done"
-        # Still inside the callee. A genuine user breakpoint here should stop the
-        # step (x64dbg stops at breakpoints hit inside a stepped-over call).
+        # Still inside the callee. Stopping on a breakpoint here is either a
+        # genuine user breakpoint (end the step, x64dbg-style) or a defense
+        # breakpoint we must neutralise transparently so stepping *through* an
+        # anti-debug call still gets the same protection a plain continue would.
         if t.GetStopReason() == lldb.eStopReasonBreakpoint:
             auto = set(auto_bp_ids or ())
             hit = {t.GetStopReasonDataAtIndex(i)
@@ -464,8 +472,116 @@ class Debugger:
                 self._step_active = False
                 self._step_target_depth = None
                 return "done"
+            for bp_id in hit:
+                self._defense_step_action(bp_id, t)
+        # Complete once we're back at or above the target frame depth. This is
+        # re-checked *after* _defense_step_action because a fake-the-call defense
+        # (ptrace/mach/setsid) pops the callee frame via `thread return`, which
+        # can itself finish the step -- StepOut-ing again would overshoot.
+        if t.GetNumFrames() <= self._step_target_depth:
+            self._step_active = False
+            self._step_target_depth = None
+            return "done"
         t.StepOut()
         return "more"
+
+    def _resolve_pending_step_scrubs(self, thread) -> None:
+        """Scrub any deferred sysctl/csops buffer whose call frame has returned
+        (current depth shallower than the depth recorded when the call began)."""
+        if not self._pending_step_scrubs:
+            return
+        cur = thread.GetNumFrames()
+        remaining = []
+        for depth, kind, buf in self._pending_step_scrubs:
+            if cur < depth:
+                self._scrub_flag(kind, buf)
+            else:
+                remaining.append((depth, kind, buf))
+        self._pending_step_scrubs = remaining or None
+
+    def _arm_step_scrub(self, thread, kind: str) -> None:
+        """Record a sysctl/csops output buffer to scrub once the call returns,
+        using the same entry-side argument checks as handle_flag_scrub_hit."""
+        frame = thread.GetFrameAtIndex(0)
+        if kind == "sysctl":
+            mib = frame.FindRegister("x0").GetValueAsUnsigned()
+            namelen = frame.FindRegister("x1").GetValueAsUnsigned()
+            oldp = frame.FindRegister("x2").GetValueAsUnsigned()
+            if not (mib and oldp and namelen >= 3):
+                return
+            err = lldb.SBError()
+            head = self.process.ReadMemory(mib, 12, err)
+            if not (err.Success() and head and len(head) == 12):
+                return
+            name = [int.from_bytes(head[i:i + 4], "little") for i in (0, 4, 8)]
+            if not (name[0] == self._CTL_KERN and name[1] == self._KERN_PROC
+                    and name[2] == self._KERN_PROC_PID):
+                return
+            buf = oldp
+        else:  # csops
+            ops = frame.FindRegister("x1").GetValueAsUnsigned()
+            useraddr = frame.FindRegister("x2").GetValueAsUnsigned()
+            if not (useraddr and ops == self._CS_OPS_STATUS):
+                return
+            buf = useraddr
+        if self._pending_step_scrubs is None:
+            self._pending_step_scrubs = []
+        self._pending_step_scrubs.append((thread.GetNumFrames(), kind, buf))
+
+    def _defense_step_action(self, bp_id: int, thread) -> None:
+        """Apply a defense whose breakpoint fired *inside a user step*, without a
+        free process.Continue() (which would abandon the step and run away).
+          * fake-the-call defenses (ptrace/mach/setsid) -> `thread return`, which
+            pops the callee frame so the step's depth check finishes it.
+          * inline ptrace-deny svc -> skip the instruction in place.
+          * sysctl/csops scrub -> defer: let the step's StepOut run the call,
+            then _resolve_pending_step_scrubs scrubs the filled buffer.
+        Anything else is left for the enclosing StepOut to run normally."""
+        if not self.process:
+            return
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return
+        ret = lldb.SBCommandReturnObject()
+        if bp_id == self.anti_ptrace_bp_id:
+            if frame.FindRegister("x0").GetValueAsUnsigned() == 31:  # PT_DENY_ATTACH
+                self.ci.HandleCommand("thread return 0", ret, False)
+            return
+        if bp_id == self.anti_mach_bp_id:
+            cnt_ptr = frame.FindRegister("x3").GetValueAsUnsigned()
+            if cnt_ptr:
+                err = lldb.SBError()
+                self.process.WriteMemory(cnt_ptr, b"\x00\x00\x00\x00", err)
+            self.ci.HandleCommand("thread return 0", ret, False)
+            return
+        if self.setsid_bp_ids and bp_id in self.setsid_bp_ids and self.fork_mode == "identity":
+            fake_sid = self.process.GetProcessID() or 1
+            self.ci.HandleCommand("thread return {}".format(fake_sid), ret, False)
+            return
+        if self.direct_syscall_bp_ids and bp_id in self.direct_syscall_bp_ids:
+            x16 = frame.FindRegister("x16").GetValueAsUnsigned()
+            x0 = frame.FindRegister("x0").GetValueAsUnsigned()
+            if x16 == 26 and x0 == 31:  # ptrace(PT_DENY_ATTACH) via inline svc
+                pc = frame.GetPC()
+                self.ci.HandleCommand("register write x0 0", ret, False)
+                self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
+            return
+        if bp_id == self.anti_timing_bp_id:
+            self.ci.HandleCommand("thread return {}".format(self._advance_fake_clock()),
+                                  ret, False)
+            return
+        if bp_id == self.anti_sysctl_bp_id:
+            self._arm_step_scrub(thread, "sysctl")
+            return
+        if bp_id == self.anti_csops_bp_id:
+            self._arm_step_scrub(thread, "csops")
+            return
+        if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
+            # A return one-shot armed by a prior non-step hit fired during the
+            # step; scrub now and retire it.
+            kind, buf = self._flag_scrub_returns.pop(bp_id)
+            self.target.BreakpointDelete(bp_id)
+            self._scrub_flag(kind, buf)
 
     def set_pc(self, addr: int) -> Tuple[bool, str]:
         """Redirect execution: point the program counter at `addr` (x64dbg's
@@ -487,6 +603,7 @@ class Debugger:
     def cancel_user_step(self) -> None:
         self._step_active = False
         self._step_target_depth = None
+        self._pending_step_scrubs = None
 
     def step_in_source(self) -> None:
         t = self._thread()
@@ -638,9 +755,19 @@ class Debugger:
     anti_ptrace_bp_id: int = 0
     anti_sysctl_bp_id: int = 0
     anti_csops_bp_id: int = 0
+    anti_timing_bp_id: int = 0
+    # monotonic fake clock fed to mach_absolute_time() so a self-timing check
+    # can't see the milliseconds our stop/continue hooks actually cost.
+    _fake_clock: int = 0
+    _fake_clock_step: int = 100   # ticks added per mach_absolute_time() call
+    _anti_timing_logged: bool = False
     # return-address one-shots waiting to scrub a flag out of a syscall's output
     # buffer once the call fills it: {ret_bp_id: (kind, buffer_addr)}.
     _flag_scrub_returns: Optional[Dict[int, tuple]] = None
+    # scrubs deferred while a user step runs: [(frame_depth_at_call, kind, buf)].
+    # We can't Continue mid-step, so instead of a return one-shot we let the
+    # step's own StepOut run the call, then scrub once its frame has returned.
+    _pending_step_scrubs: Optional[List[tuple]] = None
     anti_mach_bp_id: int = 0
     direct_syscall_bp_ids: Optional[List[int]] = None
     fork_bp_ids: Optional[List[int]] = None
@@ -866,6 +993,54 @@ class Debugger:
             self.process.Continue()
             return ""
         return None
+
+    # -- mach_absolute_time timing cloak --------------------------------------
+    # A self-timing check reads the monotonic clock before and after a sensitive
+    # call; a debugger that hooks that call adds milliseconds the check catches.
+    # We feed mach_absolute_time() a fake clock that advances a small fixed step
+    # per call, so any measured delta stays tiny no matter how long we were
+    # really stopped. Scoped to libsystem_kernel.dylib so dyld's private copy
+    # (used before our first stop anyway) is left alone.
+
+    def enable_anti_timing(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.anti_timing_bp_id:
+            return True, "already enabled"
+        bp = self.target.BreakpointCreateByName("mach_absolute_time",
+                                                "libsystem_kernel.dylib")
+        if not bp.IsValid() or bp.GetNumLocations() == 0:
+            bp = self.target.BreakpointCreateByName("mach_absolute_time")
+        if not bp.IsValid():
+            return False, "mach_absolute_time symbol not found"
+        self.anti_timing_bp_id = bp.GetID()
+        self._anti_timing_logged = False
+        return True, "timing cloak armed: mach_absolute_time fake clock (bp #{})".format(bp.GetID())
+
+    def disable_anti_timing(self) -> Tuple[bool, str]:
+        if not self.target or not self.anti_timing_bp_id:
+            return True, "already disabled"
+        self.target.BreakpointDelete(self.anti_timing_bp_id)
+        self.anti_timing_bp_id = 0
+        return True, "timing cloak disabled"
+
+    def _advance_fake_clock(self) -> int:
+        self._fake_clock += self._fake_clock_step
+        return self._fake_clock
+
+    def handle_anti_timing_hit(self, bp_id: int) -> Optional[str]:
+        """mach_absolute_time() called: return the next fake-clock value instead
+        of the real one, so timing checks can't see our stop/continue latency."""
+        if bp_id != self.anti_timing_bp_id or not self.process:
+            return None
+        ret = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("thread return {}".format(self._advance_fake_clock()),
+                              ret, False)
+        self.process.Continue()
+        if not self._anti_timing_logged:
+            self._anti_timing_logged = True
+            return "timing cloak: feeding mach_absolute_time() a fake monotonic clock"
+        return ""  # silent thereafter; this fires on every call
 
     def enable_direct_syscall_scan(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
