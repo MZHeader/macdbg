@@ -37,6 +37,8 @@ Feeling lazy? `Ctrl+T` arms breakpoints on common file, process, and network ent
 - **Defeat PT_DENY_ATTACH via libc** hooks `ptrace` and returns `0`, so the deny flag never reaches the kernel.
 - **Defeat inline PT_DENY_ATTACH** catches the same call when the sample skips libc and runs `svc #0x80` directly.
 - **Cloak Mach exception ports** hooks `task_get_exception_ports` to report none, so the process looks unattached.
+- **Scrub P_TRACED from sysctl** lets `sysctl(KERN_PROC)` run, then clears the `P_TRACED` bit in the returned `kinfo_proc` so the classic sysctl check sees an untraced process.
+- **Scrub CS_DEBUGGED from csops** does the same for `csops(CS_OPS_STATUS)`, clearing the `CS_DEBUGGED` code-signing flag modern samples check.
 
 **Breakpoints**
 

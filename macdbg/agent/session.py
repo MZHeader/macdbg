@@ -66,6 +66,8 @@ def _int_arg(v) -> int:
 
 _DEFENSES = {
     "anti_ptrace": ("enable_anti_ptrace", "disable_anti_ptrace"),
+    "anti_sysctl": ("enable_anti_sysctl", "disable_anti_sysctl"),
+    "anti_csops": ("enable_anti_csops", "disable_anti_csops"),
     "anti_mach_ports": ("enable_anti_mach_ports", "disable_anti_mach_ports"),
     "direct_syscall": ("enable_direct_syscall_scan", "disable_direct_syscall_scan"),
     "fork_identity": ("enable_fork_identity", "disable_fork_identity"),
@@ -877,6 +879,7 @@ class AgentSession:
         if not bp_ids:
             return False
         for handler in (self.dbg.handle_anti_ptrace_hit,
+                        self.dbg.handle_flag_scrub_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
                         self.dbg.handle_fork_hit,
@@ -885,7 +888,8 @@ class AgentSession:
             for bp_id in bp_ids:
                 msg = handler(bp_id)
                 if msg is not None:
-                    self._log("[anti-debug] " + msg)
+                    if msg:  # "" == handled silently (a passed-through sysctl)
+                        self._log("[anti-debug] " + msg)
                     return True
         return False
 
@@ -955,6 +959,12 @@ class AgentSession:
         ids = set(self.tracer._bp_to_name)
         if self.dbg.anti_ptrace_bp_id:
             ids.add(self.dbg.anti_ptrace_bp_id)
+        if self.dbg.anti_sysctl_bp_id:
+            ids.add(self.dbg.anti_sysctl_bp_id)
+        if self.dbg.anti_csops_bp_id:
+            ids.add(self.dbg.anti_csops_bp_id)
+        if self.dbg._flag_scrub_returns:
+            ids.update(self.dbg._flag_scrub_returns.keys())
         if self.dbg.anti_mach_bp_id:
             ids.add(self.dbg.anti_mach_bp_id)
         if self.dbg.direct_syscall_bp_ids:

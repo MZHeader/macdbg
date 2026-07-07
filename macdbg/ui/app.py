@@ -541,6 +541,7 @@ class WrapperApp(App):
                     self._prompt_fork_decision(name, caller)
                     return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
+                        self.dbg.handle_flag_scrub_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
                         self.dbg.handle_fork_hit,
@@ -549,7 +550,10 @@ class WrapperApp(App):
             for bp_id in bp_ids:
                 msg = handler(bp_id)
                 if msg is not None:
-                    self.console_pane.write("[anti-debug] " + msg)
+                    # "" means handled but not worth a console line (e.g. a
+                    # non-matching sysctl we just passed through).
+                    if msg:
+                        self.console_pane.write("[anti-debug] " + msg)
                     return True
         return False
 
@@ -965,6 +969,12 @@ class WrapperApp(App):
         ids = set(self.tracer._bp_to_name)
         if self.dbg.anti_ptrace_bp_id:
             ids.add(self.dbg.anti_ptrace_bp_id)
+        if self.dbg.anti_sysctl_bp_id:
+            ids.add(self.dbg.anti_sysctl_bp_id)
+        if self.dbg.anti_csops_bp_id:
+            ids.add(self.dbg.anti_csops_bp_id)
+        if self.dbg._flag_scrub_returns:
+            ids.update(self.dbg._flag_scrub_returns.keys())
         if self.dbg.anti_mach_bp_id:
             ids.add(self.dbg.anti_mach_bp_id)
         if self.dbg.direct_syscall_bp_ids:
@@ -993,6 +1003,10 @@ class WrapperApp(App):
                  self._toggle_direct_syscall_scan),
                 ("{}  Cloak Mach exception ports (report none, look unattached)".format(tick(bool(self.dbg.anti_mach_bp_id))),
                  self._toggle_mach_ports_cloak),
+                ("{}  Scrub P_TRACED from sysctl(KERN_PROC) results".format(tick(bool(self.dbg.anti_sysctl_bp_id))),
+                 self._toggle_anti_sysctl),
+                ("{}  Scrub CS_DEBUGGED from csops(CS_OPS_STATUS) results".format(tick(bool(self.dbg.anti_csops_bp_id))),
+                 self._toggle_anti_csops),
                 header("Breakpoints"),
                 ("{}  Hardware breakpoints for your breakpoints (no __TEXT patch)".format(tick(self.dbg.hw_breakpoints)),
                  self._toggle_hw_bps),
@@ -1019,6 +1033,22 @@ class WrapperApp(App):
             _, msg = self.dbg.disable_anti_ptrace()
         else:
             _, msg = self.dbg.enable_anti_ptrace()
+        self.console_pane.write("[anti-debug] " + msg)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_anti_sysctl(self) -> None:
+        if self.dbg.anti_sysctl_bp_id:
+            _, msg = self.dbg.disable_anti_sysctl()
+        else:
+            _, msg = self.dbg.enable_anti_sysctl()
+        self.console_pane.write("[anti-debug] " + msg)
+        self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _toggle_anti_csops(self) -> None:
+        if self.dbg.anti_csops_bp_id:
+            _, msg = self.dbg.disable_anti_csops()
+        else:
+            _, msg = self.dbg.enable_anti_csops()
         self.console_pane.write("[anti-debug] " + msg)
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 

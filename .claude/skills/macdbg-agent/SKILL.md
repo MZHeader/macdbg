@@ -148,9 +148,15 @@ Strings:
   heap/stack memory; needs a running process. Same response shape.
   Default `budget_bytes` is 512 MiB.
 
-Anti-anti-debug defenses (`name` is one of `anti_ptrace`,
-`anti_mach_ports`, `direct_syscall`, `fork_identity`, `exec_sandbox`):
+Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
+`anti_csops`, `anti_mach_ports`, `direct_syscall`, `fork_identity`,
+`exec_sandbox`):
 - `defense_enable {"name": "…"}` / `defense_disable {"name": "…"}`.
+- `anti_sysctl` clears `P_TRACED` from `sysctl(KERN_PROC)` results and
+  `anti_csops` clears `CS_DEBUGGED` from `csops(CS_OPS_STATUS)` results --
+  the two flag-based checks that otherwise see the debugger even with
+  `anti_ptrace` on. Enable them at the entry stop, before your first
+  `continue`, so the check can't run first.
 
 Fork/exec interactive decisions — by default these auto-resolve
 (identity/sandbox mode blocks/fakes the call and keeps going); set

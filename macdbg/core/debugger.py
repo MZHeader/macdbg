@@ -635,6 +635,11 @@ class Debugger:
 
     hw_breakpoints: bool = False
     anti_ptrace_bp_id: int = 0
+    anti_sysctl_bp_id: int = 0
+    anti_csops_bp_id: int = 0
+    # return-address one-shots waiting to scrub a flag out of a syscall's output
+    # buffer once the call fills it: {ret_bp_id: (kind, buffer_addr)}.
+    _flag_scrub_returns: Optional[Dict[int, tuple]] = None
     anti_mach_bp_id: int = 0
     direct_syscall_bp_ids: Optional[List[int]] = None
     fork_bp_ids: Optional[List[int]] = None
@@ -720,6 +725,129 @@ class Debugger:
         self.ci.HandleCommand("thread return 0", ret, False)
         self.process.Continue()
         return "cloaked task_get_exception_ports (returned 0 masks)"
+
+    # -- sysctl(P_TRACED) / csops(CS_DEBUGGED) flag scrubbing -----------------
+    # Both checks read a real kernel result we must let through, then test one
+    # bit. We can't fake the whole call like ptrace; instead we tag the relevant
+    # call at entry, let it run, and clear the offending bit in its output buffer
+    # on return so the caller sees a clean flag.
+
+    _P_TRACED = 0x00000800       # extern_proc.p_flag, offset 32 in kinfo_proc
+    _KINFO_PROC_PFLAG_OFF = 32
+    _CS_DEBUGGED = 0x10000000
+    _CS_OPS_STATUS = 0
+    _CTL_KERN = 1
+    _KERN_PROC = 14
+
+    def enable_anti_sysctl(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.anti_sysctl_bp_id:
+            return True, "already enabled"
+        bp = self.target.BreakpointCreateByName("sysctl")
+        if not bp.IsValid():
+            return False, "sysctl symbol not found"
+        self.anti_sysctl_bp_id = bp.GetID()
+        return True, "sysctl(P_TRACED) scrub armed (bp #{})".format(bp.GetID())
+
+    def disable_anti_sysctl(self) -> Tuple[bool, str]:
+        if not self.target or not self.anti_sysctl_bp_id:
+            return True, "already disabled"
+        self.target.BreakpointDelete(self.anti_sysctl_bp_id)
+        self.anti_sysctl_bp_id = 0
+        return True, "sysctl(P_TRACED) scrub disabled"
+
+    def enable_anti_csops(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        if self.anti_csops_bp_id:
+            return True, "already enabled"
+        bp = self.target.BreakpointCreateByName("csops")
+        if not bp.IsValid():
+            return False, "csops symbol not found"
+        self.anti_csops_bp_id = bp.GetID()
+        return True, "csops(CS_DEBUGGED) scrub armed (bp #{})".format(bp.GetID())
+
+    def disable_anti_csops(self) -> Tuple[bool, str]:
+        if not self.target or not self.anti_csops_bp_id:
+            return True, "already disabled"
+        self.target.BreakpointDelete(self.anti_csops_bp_id)
+        self.anti_csops_bp_id = 0
+        return True, "csops(CS_DEBUGGED) scrub disabled"
+
+    def _arm_return_scrub(self, thread, kind: str, buf: int) -> None:
+        ret_addr = thread.GetFrameAtIndex(0).FindRegister("lr").GetValueAsUnsigned()
+        if not ret_addr:
+            return
+        bp = self.target.BreakpointCreateByAddress(ret_addr)
+        bp.SetOneShot(True)
+        bp.SetThreadID(thread.GetThreadID())
+        if self._flag_scrub_returns is None:
+            self._flag_scrub_returns = {}
+        self._flag_scrub_returns[bp.GetID()] = (kind, buf)
+
+    def _scrub_flag(self, kind: str, buf: int) -> Optional[str]:
+        err = lldb.SBError()
+        if kind == "sysctl":
+            addr = buf + self._KINFO_PROC_PFLAG_OFF
+            data = self.process.ReadMemory(addr, 4, err)
+            if not err.Success() or not data:
+                return None
+            flag = int.from_bytes(data, "little")
+            if not (flag & self._P_TRACED):
+                return ""
+            self.process.WriteMemory(addr, (flag & ~self._P_TRACED).to_bytes(4, "little"), err)
+            return "scrubbed P_TRACED from sysctl(KERN_PROC) result"
+        if kind == "csops":
+            data = self.process.ReadMemory(buf, 4, err)
+            if not err.Success() or not data:
+                return None
+            flag = int.from_bytes(data, "little")
+            if not (flag & self._CS_DEBUGGED):
+                return ""
+            self.process.WriteMemory(buf, (flag & ~self._CS_DEBUGGED).to_bytes(4, "little"), err)
+            return "scrubbed CS_DEBUGGED from csops(CS_OPS_STATUS) result"
+        return None
+
+    def handle_flag_scrub_hit(self, bp_id: int) -> Optional[str]:
+        """Entry side tags a P_TRACED/CS_DEBUGGED query and arms a return-address
+        one-shot; return side clears the bit in the now-filled buffer. Returns a
+        message to log, "" for handled-but-silent, or None if not ours."""
+        if not self.process:
+            return None
+        # Return side: a tagged call has come back.
+        if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
+            kind, buf = self._flag_scrub_returns.pop(bp_id)
+            self.target.BreakpointDelete(bp_id)
+            msg = self._scrub_flag(kind, buf)
+            self.process.Continue()
+            return msg if msg else ""
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return None
+        if bp_id == self.anti_sysctl_bp_id:
+            mib = frame.FindRegister("x0").GetValueAsUnsigned()
+            oldp = frame.FindRegister("x2").GetValueAsUnsigned()
+            if mib and oldp:
+                err = lldb.SBError()
+                head = self.process.ReadMemory(mib, 8, err)
+                if err.Success() and head and len(head) == 8:
+                    if (int.from_bytes(head[0:4], "little") == self._CTL_KERN
+                            and int.from_bytes(head[4:8], "little") == self._KERN_PROC):
+                        self._arm_return_scrub(thread, "sysctl", oldp)
+            self.process.Continue()
+            return ""
+        if bp_id == self.anti_csops_bp_id:
+            ops = frame.FindRegister("x1").GetValueAsUnsigned()
+            useraddr = frame.FindRegister("x2").GetValueAsUnsigned()
+            if useraddr and ops == self._CS_OPS_STATUS:
+                self._arm_return_scrub(thread, "csops", useraddr)
+            self.process.Continue()
+            return ""
+        return None
 
     def enable_direct_syscall_scan(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
