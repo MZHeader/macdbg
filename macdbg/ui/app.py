@@ -1361,6 +1361,7 @@ class WrapperApp(App):
                 ("Follow operand in disassembly",  lambda: self._follow_disasm(target)),
                 ("Follow operand in Memory",       lambda: self._follow_memory(target)),
                 ("Toggle breakpoint here",         lambda: self._toggle_bp(drow.addr)),
+                ("Set PC to here (jump execution)", lambda: self._set_pc(drow.addr)),
                 ("Run to cursor",                  lambda: self._run_to(drow.addr)),
                 ("Edit comment…" if has_comment else "Add comment…",
                  lambda: self._prompt_edit_comment(drow.addr)),
@@ -1505,6 +1506,15 @@ class WrapperApp(App):
         op, bp_id = self.dbg.toggle_breakpoint_at(addr)
         self.console_pane.write("breakpoint {} #{} @ {:#x}".format(op, bp_id, addr))
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
+
+    def _set_pc(self, addr: int) -> None:
+        ok, msg = self.dbg.set_pc(addr)
+        self.console_pane.write("[pc] " + msg, error=not ok)
+        if ok:
+            # Jump lands us on the new pc: drop any browse and re-centre there.
+            self._disasm_follow = None
+            self.disasm.set_status(None)
+            self._refresh_all()
 
     def _run_to(self, addr: int) -> None:
         # Gate through the same resume guard as stepping so a run-to issued while

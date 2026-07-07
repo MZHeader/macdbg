@@ -466,6 +466,20 @@ class Debugger:
         t.StepOut()
         return "more"
 
+    def set_pc(self, addr: int) -> Tuple[bool, str]:
+        """Redirect execution: point the program counter at `addr` (x64dbg's
+        'Set New Origin Here'). Does not run; the next step/continue proceeds
+        from there. No verification that `addr` is a valid instruction boundary
+        -- that is the caller's call, same as x64dbg."""
+        if not self.process or self.process.GetState() != lldb.eStateStopped:
+            return False, "process is not stopped"
+        frame = self.frame()
+        if frame is None:
+            return False, "no frame"
+        if not frame.SetPC(addr):
+            return False, "could not set pc to {:#x}".format(addr)
+        return True, "pc set to {:#x}".format(addr)
+
     def in_user_step(self) -> bool:
         return self._step_active
 

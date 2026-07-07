@@ -133,6 +133,8 @@ Memory:
 - `write_memory {"addr": N, "hex": "9090"}` — patches persist in the live
   process; do not persist across `restart` (the binary is re-mapped).
 - `write_register {"name": "x0", "value": N}`.
+- `set_pc {"addr": N}` — redirect execution by pointing the program counter
+  at `addr` (x64dbg's "Set New Origin Here"); does not run.
 - `memory_search {"needle_hex": "…", "scope": "target"|"all", "max_hits":
   32, "budget_bytes": N}` — or `"needle_ascii"` instead of `needle_hex`.
   `scope: "all"` can take tens of seconds; bound with `budget_bytes`

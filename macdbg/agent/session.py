@@ -311,6 +311,9 @@ class AgentSession:
         if cmd == "write_register":
             ok, msg = self.dbg.write_register(args["name"], _int_arg(args["value"]))
             return {"ok": ok, "message": msg}
+        if cmd == "set_pc":
+            ok, msg = self.dbg.set_pc(_int_arg(args["addr"]))
+            return {"ok": ok, "message": msg}
         if cmd == "memory_search":
             return self.cmd_memory_search(args)
         if cmd == "extract_strings":
