@@ -120,13 +120,21 @@ class DisasmPane(Vertical):
                 for start, end, style in r.gutter_styles:
                     if end > start:
                         gutter.stylize(style, start, end)
-            # A red ● in front of the address marks a breakpoint on this line
-            # (hollow ○ when the breakpoint is disabled), like x64dbg's gutter.
+            # Two leading marker columns keep both the current instruction and
+            # any breakpoint on this line visible even when the row cursor has
+            # been moved away by browsing:
+            #   col 0: breakpoint (● enabled / ○ disabled), x64dbg-style
+            #   col 1: the program counter (▶)
+            addr = Text()
             if r.has_breakpoint:
-                dot, dot_style = ("●", "bold #ff5f5f") if r.bp_enabled else ("○", "#af5f5f")
-                addr = Text.assemble((dot + " ", dot_style), "{:016x}".format(r.addr))
+                addr.append("●" if r.bp_enabled else "○",
+                            style="bold #ff5f5f" if r.bp_enabled else "#af5f5f")
             else:
-                addr = Text("  {:016x}".format(r.addr))
+                addr.append(" ")
+            addr.append("▶ " if r.is_pc else "  ",
+                        style="bold #5fff87" if r.is_pc else "")
+            addr.append("{:016x}".format(r.addr),
+                        style="bold #5fff87" if r.is_pc else "")
             bytez = Text(format_bytes(r.raw))
             mn, op = style_disasm_line(r.mnemonic, r.operands)
             insn = Text.assemble(mn, " ", op)
@@ -136,6 +144,12 @@ class DisasmPane(Vertical):
                 insn.append("  ; " + r.inline_hint, style="#5fafff")
             if r.user_comment:
                 insn.append("  ← " + r.user_comment, style="bold #ffd75f")
+            if r.is_pc:
+                # Tint the whole current-instruction line so it reads at a glance
+                # (the row cursor only marks it right after a step). The cursor's
+                # own highlight still wins when it sits on this row.
+                for cell in (gutter, addr, bytez, insn):
+                    cell.stylize("on #14323c")
             key = self.table.add_row(gutter, addr, bytez, insn)
             new_keys.append(key)
             self._display_to_row[display_idx] = row_idx

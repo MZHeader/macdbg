@@ -151,6 +151,10 @@ class WrapperApp(App):
         self._disasm_follow: Optional[int] = None
         self._strings_bin: List = []
         self._strings_live: List = []
+        # Set while a step/continue is in flight so a burst of key/click events
+        # can't stack multiple resumes -- the cause of step-over occasionally
+        # running away when F8 is mashed. Cleared when the stop event lands.
+        self._resuming = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -383,6 +387,9 @@ class WrapperApp(App):
         self.trace_pane.table.refresh()
 
     def _on_stop_event(self, e: StopEvent) -> None:
+        if e.state in (lldb.eStateStopped, lldb.eStateExited, lldb.eStateCrashed):
+            # The in-flight resume has landed; let the next step/continue through.
+            self._resuming = False
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
             if self.dbg.in_fork_shield():
@@ -642,17 +649,34 @@ class WrapperApp(App):
                 continue
             wp.render_bytes(addr, data, focus_addr=None, preserve_scroll=True)
 
+    def _begin_resume(self) -> bool:
+        """Gate a step/continue so it only fires when the process is actually
+        stopped and no earlier resume is still in flight. Returns True if the
+        caller may resume. Without this, mashing F8 stacks StepInstruction calls
+        on an already-running process, which can turn a step-over into a run."""
+        if self._resuming:
+            return False
+        p = self.dbg.process
+        if not (p and p.IsValid() and p.GetState() == lldb.eStateStopped):
+            return False
+        self._resuming = True
+        return True
+
     def action_step_in(self) -> None:
-        self.dbg.step_in()
+        if self._begin_resume():
+            self.dbg.step_in()
 
     def action_step_over(self) -> None:
-        self.dbg.step_over()
+        if self._begin_resume():
+            self.dbg.step_over()
 
     def action_step_out(self) -> None:
-        self.dbg.step_out()
+        if self._begin_resume():
+            self.dbg.step_out()
 
     def action_cont(self) -> None:
-        self.dbg.cont()
+        if self._begin_resume():
+            self.dbg.cont()
 
     def action_restart(self) -> None:
         if self.attach_pid:
@@ -683,6 +707,7 @@ class WrapperApp(App):
         finally:
             for bid in hidden:
                 self.dbg.set_bp_enabled(bid, True)
+        self._resuming = False
         self._prev_regs = {}
         self._mem_follow = None
         self._disasm_follow = None
@@ -1436,8 +1461,14 @@ class WrapperApp(App):
         self.bps.render_rows(self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids()))
 
     def _run_to(self, addr: int) -> None:
-        self._run_palette_command("breakpoint set -o true -a {:#x}".format(addr))
-        self._run_palette_command("continue")
+        # Gate through the same resume guard as stepping so a run-to issued while
+        # a step is still in flight can't stack on a running process.
+        if not self._begin_resume():
+            return
+        started, msg = self.dbg.run_to_address(addr)
+        self.console_pane.write("[run-to] " + msg, error=not started)
+        if not started:
+            self._resuming = False
 
     def _follow_qword(self, addr: int) -> None:
         data = self.dbg.read_memory(addr, 8)

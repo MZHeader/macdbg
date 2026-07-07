@@ -340,6 +340,31 @@ class Debugger:
         if self.process:
             self.process.Continue()
 
+    def run_to_address(self, addr: int) -> Tuple[bool, str]:
+        """Set a one-shot breakpoint at `addr` and continue to it. Returns
+        (started, message). Refuses unless the process is stopped and `addr`
+        resolves to a real code location, so a stray run-to on a non-code line
+        (or while already running) can't silently turn into a run to exit."""
+        if not self.target or not self.target.IsValid() or not self.process:
+            return False, "no process"
+        if self.process.GetState() != lldb.eStateStopped:
+            return False, "process is running"
+        cur = self.pc()
+        if cur is not None and addr == cur:
+            return False, "already at {:#x}".format(addr)
+        bp = self.target.BreakpointCreateByAddress(addr)
+        if (not bp.IsValid() or bp.GetNumLocations() == 0
+                or not bp.GetLocationAtIndex(0).IsResolved()):
+            if bp.IsValid():
+                self.target.BreakpointDelete(bp.GetID())
+            return False, "no runnable code at {:#x}".format(addr)
+        bp.SetOneShot(True)
+        t = self._thread()
+        if t:
+            bp.SetThreadID(t.GetThreadID())
+        self.process.Continue()
+        return True, "running to {:#x}".format(addr)
+
     def step_in(self) -> None:
         t = self._thread()
         if t:
