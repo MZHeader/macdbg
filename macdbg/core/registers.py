@@ -123,6 +123,31 @@ def _annotate_value(
     return ""
 
 
+# Condition-flag layouts: bit position for each NZCV / status flag. arm64 packs
+# them in cpsr; x86-64 in rflags. Shown decoded next to the register and
+# toggled from its right-click menu so branch decisions can be flipped live.
+CPSR_FLAGS = (("N", 31), ("Z", 30), ("C", 29), ("V", 28))
+RFLAGS_FLAGS = (("O", 11), ("S", 7), ("Z", 6), ("C", 0))
+
+
+def flag_layout_for(reg_name: str):
+    n = reg_name.lower()
+    if n == "cpsr":
+        return CPSR_FLAGS
+    if n in ("rflags", "eflags"):
+        return RFLAGS_FLAGS
+    return None
+
+
+def _decode_flags(val_str: str, layout) -> str:
+    try:
+        v = int(val_str, 16) if val_str.lower().startswith("0x") else int(val_str)
+    except ValueError:
+        return ""
+    # Upper-case letter = set, lower-case = clear, so state reads at a glance.
+    return "".join(name if (v >> bit) & 1 else name.lower() for name, bit in layout)
+
+
 def collect(
     frame: Optional[lldb.SBFrame],
     prev: Dict[str, str],
@@ -142,6 +167,9 @@ def collect(
             seen[name] = val
 
     def annotate(name: str, val: str) -> str:
+        layout = flag_layout_for(name)
+        if layout is not None:
+            return _decode_flags(val, layout)
         if read_mem is None or name in _SKIP_DEREF:
             return ""
         if annot_cache is not None:

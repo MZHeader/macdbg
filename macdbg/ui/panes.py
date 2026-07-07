@@ -120,7 +120,13 @@ class DisasmPane(Vertical):
                 for start, end, style in r.gutter_styles:
                     if end > start:
                         gutter.stylize(style, start, end)
-            addr = Text("{:016x}".format(r.addr))
+            # A red ● in front of the address marks a breakpoint on this line
+            # (hollow ○ when the breakpoint is disabled), like x64dbg's gutter.
+            if r.has_breakpoint:
+                dot, dot_style = ("●", "bold #ff5f5f") if r.bp_enabled else ("○", "#af5f5f")
+                addr = Text.assemble((dot + " ", dot_style), "{:016x}".format(r.addr))
+            else:
+                addr = Text("  {:016x}".format(r.addr))
             bytez = Text(format_bytes(r.raw))
             mn, op = style_disasm_line(r.mnemonic, r.operands)
             insn = Text.assemble(mn, " ", op)

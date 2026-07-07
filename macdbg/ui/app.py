@@ -14,7 +14,12 @@ from .context import ContextMenu, MultilineEditor, PromptScreen, ToggleMenu
 from ..core.debugger import Debugger
 from ..core.disasm import disasm_around, extract_addr
 from ..core.events import EventPump, OutputEvent, StopEvent
-from ..core.registers import collect as collect_regs, snapshot as reg_snapshot
+from ..core.memory import bytes_per_row_for
+from ..core.registers import (
+    collect as collect_regs,
+    flag_layout_for,
+    snapshot as reg_snapshot,
+)
 from ..core.tracer import Tracer
 from .palette import LldbCommandProvider
 from .panes import (
@@ -580,6 +585,12 @@ class WrapperApp(App):
                     c = comments.get(r.addr)
                     if c:
                         r.user_comment = c
+            bp_addrs = self._user_bp_addrs()
+            if bp_addrs:
+                for r in rows:
+                    if r.addr in bp_addrs:
+                        r.has_breakpoint = True
+                        r.bp_enabled = bp_addrs[r.addr]
             self.disasm.render_rows(rows, center_addr=center)
 
         self._annot_cache.clear()
@@ -860,6 +871,18 @@ class WrapperApp(App):
     def _update_trace_title(self) -> None:
         label = self._SCOPE_LABELS.get(self.tracer.caller_depth, str(self.tracer.caller_depth))
         self.trace_pane.set_status(self.tracer.enabled, label)
+
+    def _user_bp_addrs(self) -> Dict[int, bool]:
+        """Map load address -> enabled for every user breakpoint location, so the
+        disasm view can mark breakpointed lines. Tracer/anti-debug breakpoints
+        are excluded; they sit on libSystem, not lines the user browses."""
+        out: Dict[int, bool] = {}
+        for _bp_id, addr, _desc, _n, enabled, _cond in self.dbg.breakpoints(
+                exclude_ids=self._hidden_bp_ids()):
+            if addr:
+                # An enabled bp wins if two share a line (e.g. dup locations).
+                out[addr] = enabled or out.get(addr, False)
+        return out
 
     def _hidden_bp_ids(self) -> set:
         ids = set(self.tracer._bp_to_name)
@@ -1239,6 +1262,17 @@ class WrapperApp(App):
                 ("Edit value…",             lambda: self._prompt_edit_reg(reg_row.name, reg_row.value)),
                 ("Copy value",              lambda: self._copy(reg_row.value)),
             ]
+            layout = flag_layout_for(reg_row.name)
+            if layout is not None:
+                names = {"N": "Negative", "Z": "Zero", "C": "Carry",
+                         "V": "Overflow", "S": "Sign", "O": "Overflow"}
+                cur = self._parse_hex(reg_row.value) or 0
+                for fname, bit in layout:
+                    state = "set" if (cur >> bit) & 1 else "clear"
+                    items.append((
+                        "Flip {} flag ({}) — now {}".format(names.get(fname, fname), fname, state),
+                        lambda rn=reg_row.name, b=bit: self._toggle_flag_bit(rn, b),
+                    ))
             if addr:
                 items.extend(self._watch_follow_items(addr, length=32, label=reg_row.name))
             if reg_row.annotation:
@@ -1312,11 +1346,16 @@ class WrapperApp(App):
             base = self._hex_row_addr(pane, row)
             if base is None:
                 return
+            row_w = self._hex_row_width(pane)
             items = [
                 ("Goto qword here (follow ptr)",  lambda: self._follow_qword(base)),
                 ("Set watchpoint on this addr",   lambda: self._set_watchpoint(base)),
                 ("Edit bytes at this row…",       lambda: self._prompt_edit_mem(base)),
                 ("Edit ASCII at this row…",       lambda: self._prompt_edit_ascii(base)),
+                ("Copy this row (hex)",           lambda: self._copy_mem(base, row_w, "hex")),
+                ("Copy this row (ASCII)",         lambda: self._copy_mem(base, row_w, "ascii")),
+                ("Copy region from here (hex)…",  lambda: self._prompt_copy_mem(base, "hex")),
+                ("Copy region from here (ASCII)…", lambda: self._prompt_copy_mem(base, "ascii")),
                 ("Copy address",                  lambda: self._copy("{:#x}".format(base))),
             ]
             items.extend(self._watch_follow_items(base, length=32))
@@ -1351,6 +1390,45 @@ class WrapperApp(App):
                 return int(s)
             except ValueError:
                 return None
+
+    def _hex_row_width(self, pane: str) -> int:
+        pane_widget = self.mem if pane == "mem" else self.stack
+        return bytes_per_row_for(pane_widget.size.width)
+
+    def _copy_mem(self, addr: int, length: int, mode: str) -> None:
+        """Copy a run of memory to the clipboard as hex or as text. ASCII mode
+        renders non-printable bytes as '.', matching the pane, so a whole struct
+        or string comes out in one clean copy instead of a mouse drag that also
+        grabs the address and hex columns."""
+        length = max(1, min(length, 8192))
+        data = self.dbg.read_memory(addr, length)
+        if not data:
+            self.console_pane.write(
+                "[copy] could not read {} bytes at {:#x}".format(length, addr), error=True)
+            return
+        if mode == "hex":
+            payload = " ".join("{:02x}".format(b) for b in data)
+        else:
+            payload = "".join(chr(b) if 32 <= b < 127 else "." for b in data)
+        self._copy(payload)
+        self.console_pane.write(
+            "[copy] {} bytes at {:#x} ({})".format(len(data), addr, mode))
+
+    def _prompt_copy_mem(self, addr: int, mode: str) -> None:
+        async def _run() -> None:
+            val = await self.push_screen_wait(PromptScreen(
+                "Copy {} from {:#x} — how many bytes? (decimal or 0x…)".format(mode, addr),
+                initial="256",
+            ))
+            if val is None or val.strip() == "":
+                return
+            try:
+                n = int(val.strip(), 0)
+            except ValueError:
+                self.console_pane.write("[copy] bad length {!r}".format(val), error=True)
+                return
+            self._copy_mem(addr, n, mode)
+        self.run_worker(_run(), exclusive=True)
 
     def _toggle_bp(self, addr: int) -> None:
         op, bp_id = self.dbg.toggle_breakpoint_at(addr)
@@ -1591,6 +1669,23 @@ class WrapperApp(App):
             state.save()
             self._refresh_all()
         self.run_worker(_run(), exclusive=True)
+
+    def _toggle_flag_bit(self, reg_name: str, bit: int) -> None:
+        """Flip one condition-flag bit in cpsr/rflags and refresh, so a branch's
+        taken/not-taken arrow in the disasm flips live — the x64dbg move of
+        editing the zero flag to redirect control flow."""
+        frame = self.dbg.frame()
+        if frame is None:
+            self.console_pane.write("[flags] no stopped frame", error=True)
+            return
+        reg = frame.FindRegister(reg_name)
+        if not reg.IsValid():
+            self.console_pane.write("[flags] {} unavailable".format(reg_name), error=True)
+            return
+        cur = reg.GetValueAsUnsigned()
+        ok, msg = self.dbg.write_register(reg_name, cur ^ (1 << bit))
+        self.console_pane.write(msg, error=not ok)
+        self._refresh_all()
 
     def _prompt_edit_reg(self, name: str, current: str) -> None:
         async def _run() -> None:

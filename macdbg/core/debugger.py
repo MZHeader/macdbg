@@ -351,30 +351,21 @@ class Debugger:
         if t:
             t.StepOut()
 
-    _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
-
     def step_over(self) -> None:
-        """Step over the current instruction. StepInstruction(True) can degrade
-        to step-in on stripped call sites, so for arm64 calls we set a one-shot
-        BP at pc+4 and continue instead."""
+        """Step over the current instruction, stepping over calls.
+
+        This used to set a one-shot breakpoint at pc+4 and `process.Continue()`
+        for arm64 calls, on the theory that StepInstruction(True) degrades to
+        step-in on stripped call sites. But Continue is unbounded: if the callee
+        never returns cleanly to pc+4 (a large function that hits another
+        breakpoint, longjmps, or exits), the step-over turned into a full run --
+        the reported "step over just continues" bug. StepInstruction(True) is a
+        bounded thread plan that steps over calls correctly (verified on
+        stripped target binaries) and, like step_in, can never run away, so we
+        use it directly."""
         t = self._thread()
-        if not t or not self.target or not self.target.IsValid():
-            return
-        frame = t.GetFrameAtIndex(0)
-        if not frame or not frame.IsValid():
-            return
-        pc = frame.GetPC()
-        insns = self.target.ReadInstructions(lldb.SBAddress(pc, self.target), 1)
-        if insns.GetSize() >= 1:
-            mn = (insns.GetInstructionAtIndex(0).GetMnemonic(self.target) or "").lower()
-            if mn in self._CALL_MNEMONICS:
-                bp = self.target.BreakpointCreateByAddress(pc + 4)
-                bp.SetOneShot(True)
-                bp.SetThreadID(t.GetThreadID())
-                if self.process:
-                    self.process.Continue()
-                return
-        t.StepInstruction(True)
+        if t:
+            t.StepInstruction(True)
 
     def step_in_source(self) -> None:
         t = self._thread()

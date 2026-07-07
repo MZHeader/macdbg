@@ -20,6 +20,8 @@ class DisasmRow:
     gutter: str = "    "
     gutter_styles: List = None
     function_head: str = ""
+    has_breakpoint: bool = False
+    bp_enabled: bool = True
 
 
 _INT_RE = re.compile(r"#-?(?:0x[0-9a-fA-F]+|\d+)")
