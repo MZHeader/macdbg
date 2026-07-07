@@ -145,11 +145,12 @@ class DisasmPane(Vertical):
             if r.user_comment:
                 insn.append("  ← " + r.user_comment, style="bold #ffd75f")
             if r.is_pc:
-                # Tint the whole current-instruction line so it reads at a glance
-                # (the row cursor only marks it right after a step). The cursor's
-                # own highlight still wins when it sits on this row.
-                for cell in (gutter, addr, bytez, insn):
-                    cell.stylize("on #14323c")
+                # Mark the current instruction with the ▶ (set above) plus a bold
+                # green line, so it reads at a glance even after the row cursor
+                # moves. A per-cell background would only paint behind the glyphs
+                # and leave gaps between columns, so style the text instead.
+                bytez.stylize("bold #5fff87")
+                insn.stylize("bold")
             key = self.table.add_row(gutter, addr, bytez, insn)
             new_keys.append(key)
             self._display_to_row[display_idx] = row_idx

@@ -758,6 +758,12 @@ class AgentSession:
                 continue
             if state == lldb.eStateStopped:
                 self.dbg.select_stopped_thread()
+                if self.dbg.resume_pending_step_over():
+                    # step_over stepped into a call; finish it by running out.
+                    hit = _deadline_hit()
+                    if hit is not None:
+                        return hit
+                    continue
                 if self.dbg.in_fork_shield():
                     self.dbg.finish_fork_shield()
                     self.dbg.cont()

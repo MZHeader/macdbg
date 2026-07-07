@@ -35,6 +35,9 @@ class Debugger:
         self.state: Optional[BinaryState] = None
         self.interpose_enabled: bool = False
         self.interpose_trace_path: Optional[str] = None
+        # Frame depth captured when step_over stepped *into* a call, so the
+        # follow-up stop knows to run back out and finish the step-over.
+        self._pending_step_out_depth: Optional[int] = None
 
         self._out_r_fd, self._out_w_fd = os.pipe()
         os.set_blocking(self._out_r_fd, False)
@@ -182,6 +185,9 @@ class Debugger:
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
         assert self.target is not None
+        # Drop any step-over-in-progress state from a prior run so the first stop
+        # of the fresh process can't be mistaken for a pending step-out.
+        self._pending_step_out_depth = None
         info = lldb.SBLaunchInfo(argv)
         info.SetLaunchFlags(
             lldb.eLaunchFlagStopAtEntry | lldb.eLaunchFlagDisableASLR
@@ -376,21 +382,57 @@ class Debugger:
         if t:
             t.StepOut()
 
-    def step_over(self) -> None:
-        """Step over the current instruction, stepping over calls.
+    _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
 
-        This used to set a one-shot breakpoint at pc+4 and `process.Continue()`
-        for arm64 calls, on the theory that StepInstruction(True) degrades to
-        step-in on stripped call sites. But Continue is unbounded: if the callee
-        never returns cleanly to pc+4 (a large function that hits another
-        breakpoint, longjmps, or exits), the step-over turned into a full run --
-        the reported "step over just continues" bug. StepInstruction(True) is a
-        bounded thread plan that steps over calls correctly (verified on
-        stripped target binaries) and, like step_in, can never run away, so we
-        use it directly."""
+    def _is_call_at(self, pc: int) -> bool:
+        if not self.target or not self.target.IsValid():
+            return False
+        insns = self.target.ReadInstructions(lldb.SBAddress(pc, self.target), 1)
+        if insns.GetSize() < 1:
+            return False
+        mn = (insns.GetInstructionAtIndex(0).GetMnemonic(self.target) or "").lower()
+        return mn in self._CALL_MNEMONICS
+
+    def step_over(self) -> None:
+        """Step over the current instruction.
+
+        We deliberately never use StepInstruction(step_over=True): its
+        step-over-a-call thread plan can run to process exit on some call sites
+        (indirect / PAC-authenticated calls especially) -- the "step over just
+        continues" bug. Instead:
+          * non-call: StepInstruction(False), the same single-instruction step
+            as step_in, which is the path that never runs away.
+          * call: StepInstruction(False) to step *into* the callee (one bounded
+            instruction), then resume_pending_step_over() runs back out on the
+            follow-up stop. StepOut is bounded to the frame's return address, so
+            it can't turn a step-over into a free run.
+        """
         t = self._thread()
-        if t:
-            t.StepInstruction(True)
+        if not t or not self.target or not self.target.IsValid():
+            return
+        frame = t.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return
+        if self._is_call_at(frame.GetPC()):
+            self._pending_step_out_depth = t.GetNumFrames()
+        else:
+            self._pending_step_out_depth = None
+        t.StepInstruction(False)
+
+    def resume_pending_step_over(self) -> bool:
+        """Called on the stop that follows step_over stepping into a call. If we
+        did land one frame deeper, run back out to finish the step-over and
+        return True (the current stop is internal -- don't surface it). Returns
+        False when there is nothing pending or we didn't actually enter a call."""
+        depth = self._pending_step_out_depth
+        self._pending_step_out_depth = None
+        if depth is None:
+            return False
+        t = self._thread()
+        if t and t.GetFrameAtIndex(0).IsValid() and t.GetNumFrames() > depth:
+            t.StepOut()
+            return True
+        return False
 
     def step_in_source(self) -> None:
         t = self._thread()

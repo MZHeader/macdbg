@@ -392,6 +392,11 @@ class WrapperApp(App):
             self._resuming = False
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
+            if self.dbg.resume_pending_step_over():
+                # step_over stepped into a call; we've issued the StepOut that
+                # finishes it. Keep gating input until that real stop lands.
+                self._resuming = True
+                return
             if self.dbg.in_fork_shield():
                 # Parent has returned from the shielded fork; restore breakpoints
                 # and keep going without surfacing the internal stop.
