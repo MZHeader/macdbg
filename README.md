@@ -2,7 +2,7 @@
 
 A GUI for LLDB. Gives you a multi-pane view of the running process. Includes a lazy syscall & network tracer that works on forked processes, defeats anti-debugging checks, and lets you edit registers and memory in place.
 
-![Main view](docs/img/gui-main.png)
+<img src="docs/img/gui-main.png" alt="Main view" width="860">
 
 ## Who Is This For
 
@@ -27,13 +27,13 @@ Or, simply open `GUI/macdbg.app`
 
 Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
 
-![Trace tab](docs/img/gui-trace.png)
+<img src="docs/img/gui-trace.png" alt="Trace tab" width="780">
 
 ## Anti-anti-debug
 
 `⌘D` opens a menu of toggles, all off by default.
 
-![Defenses menu](docs/img/gui-defenses.png)
+<img src="docs/img/gui-defenses.png" alt="Defenses menu" width="440">
 
 **Anti-debug**
 
@@ -65,7 +65,7 @@ Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry
 * **Prompt each fork** stops on every fork and asks whether to stay in the parent or enter the child. Answer per site.
 * **Trace the whole fork tree** shows the syscalls of children lldb can't follow.
 
-![Fork decision prompt](docs/img/gui-fork.png)
+<img src="docs/img/gui-fork.png" alt="Fork decision prompt" width="520">
 
 **Exec**
 > For samples that call something like `killall Terminal`, we can just intercept it, say no, and spoof a success result.
@@ -73,29 +73,29 @@ Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry
 * **Intercept outbound exec** hooks `system`, `popen`, `execve`, `execvp`, `posix_spawn`, and `posix_spawnp`.
 * **Prompt each call** offers Allow, Fake success, Block, or Dump per call, otherwise auto-blocks.
 
-![Exec sandbox prompt](docs/img/gui-exec.png)
+<img src="docs/img/gui-exec.png" alt="Exec sandbox prompt" width="440">
 
 ## Breakpoint Scripting
 
 The Breakpoints tab shows id, address, symbol, attached-command count, condition, and enabled state. Right-click any breakpoint row → **Edit commands** and you get a multi-line editor for the lldb command list. Save (⌘Enter) or cancel (Esc). One lldb command per line, exactly as if you'd used the interactive `breakpoint command add` form without the multi-line prompt.
 
-![Breakpoint commands](docs/img/gui-breakpoint-commands.png)
+<img src="docs/img/gui-breakpoint-commands.png" alt="Breakpoint commands" width="440">
 
 ## Edit Registers and Memory
 
 Right-click any register row and pick **Edit value**. The prompt is prefilled with the current value so you can see what you're overwriting; select all (⌘A) to replace it.
 
-![Edit register](docs/img/gui-edit-register.png)
+<img src="docs/img/gui-edit-register.png" alt="Edit register" width="440">
 
 Right-click any memory or stack row and pick **Edit bytes**. Same idea, prefilled with the current 16 bytes as space-separated hex.
 
-![Edit memory](docs/img/gui-edit-memory.png)
+<img src="docs/img/gui-edit-memory.png" alt="Edit memory" width="440">
 
 ## Command Palette
 
 ⌘P opens a fuzzy palette over every lldb command, with lldb's own help text as the description.
 
-![Command palette](docs/img/gui-command-palette.png)
+<img src="docs/img/gui-command-palette.png" alt="Command palette" width="480">
 
 ## Headless / agentic
 
