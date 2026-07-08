@@ -18,14 +18,19 @@ Reverse engineers and malware analysts debugging macOS binaries who aren't very 
 
 ```sh
 git clone https://github.com/MZHeader/macdbg
-cd macdbg/GUI
-./run.sh /path/to/your/binary
 ```
-Or, simply open `GUI/macdbg.app`
+
+Then double-click **`macdbg.app`** — that's the whole install. Pick a binary from **File → Open**, or launch straight into one:
+
+```sh
+open macdbg.app --args /path/to/your/binary
+```
+
+Prefer a terminal? `GUI/run.sh /path/to/your/binary` is the CLI equivalent — it's the same launcher the app runs for you.
 
 ### Air-gapped machines
 
-`run.sh` opens the native window through pywebview. On a machine with no internet, grab the bundle for its Python version from the [native-deps release](https://github.com/MZHeader/macdbg/releases/tag/native-deps), copy it over, and install it locally:
+macdbg opens its native window through pywebview. On a machine with no internet, grab the bundle for its Python version from the [native-deps release](https://github.com/MZHeader/macdbg/releases/tag/native-deps), copy it over, and install it locally:
 
 ```sh
 GUI/get-native-deps.sh ./pywebview-macos-arm64-cp313.tar.gz

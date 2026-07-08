@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build GUI/macdbg.app — a double-clickable wrapper around the Tk GUI.
+# Build macdbg.app (at the repo root) — the double-clickable entry point.
 #
 # The bundle is a thin launcher: it hard-codes this checkout's path, sets
 # PYTHONPATH to the system LLDB Python bindings, and execs GUI/main.py under
@@ -9,7 +9,7 @@
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/.." && pwd)"
-APP="$DIR/macdbg.app"
+APP="$REPO/macdbg.app"
 CONTENTS="$APP/Contents"
 
 rm -rf "$APP"
@@ -24,8 +24,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key>     <string>macdbg</string>
     <key>CFBundleExecutable</key>      <string>macdbg</string>
     <key>CFBundleIdentifier</key>      <string>tech.mzheader.macdbg.gui</string>
-    <key>CFBundleVersion</key>         <string>1.0.0</string>
-    <key>CFBundleShortVersionString</key> <string>1.0.0</string>
+    <key>CFBundleVersion</key>         <string>1.1.0</string>
+    <key>CFBundleShortVersionString</key> <string>1.1.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
@@ -37,12 +37,12 @@ PLIST
 
 # Launcher delegates to run.sh. The repo path is resolved from the bundle's own
 # location at runtime (not baked in) so nothing about the build user is embedded
-# in the bundle. Keep macdbg.app inside GUI/ for this to resolve. All output is
-# appended to ~/.macdbg/launch.log so a failed launch leaves a trace.
+# in the bundle. Keep macdbg.app at the repo root for this to resolve. All output
+# is appended to ~/.macdbg/launch.log so a failed launch leaves a trace.
 cat > "$CONTENTS/MacOS/macdbg" <<'LAUNCH'
 #!/bin/bash
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/../../../.." && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
 mkdir -p "$HOME/.macdbg" 2>/dev/null
 exec >> "$HOME/.macdbg/launch.log" 2>&1
 echo "=== launch $(date '+%F %T') uname=$(uname -m) ==="
