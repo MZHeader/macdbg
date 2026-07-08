@@ -187,10 +187,6 @@ class Engine:
                                   self.dbg.state.sha256[:12], restored,
                                   len(self.dbg.state.comments), len(self.dbg.state.bookmarks),
                                   len(self.dbg.state.patches), len(self.dbg.state.watches)))
-            try:
-                self._strings_bin = self.dbg.extract_strings(min_len=5)
-            except Exception:
-                pass
             self._maybe_start_interpose_reader()
             p = self.dbg.process
             if p and p.IsValid():
@@ -198,10 +194,23 @@ class Engine:
                 if st == lldb.eStateStopped:
                     self._console("[entry] stopped at entry {:#x}".format(self.dbg.pc() or 0))
                     self._emit_state()
+                    # Scanning the whole binary's string sections can take a beat
+                    # on a large target; defer it so it never gates the first
+                    # paint of disasm/registers. It only feeds the (non-default)
+                    # Strings tab, which starts empty and fills on the re-emit.
+                    self.submit(self._extract_bin_strings)
                 elif st == lldb.eStateExited:
                     self._console(self._describe_exit(), error=True)
         except Exception as e:
             self._console("launch failed: {}".format(e), error=True)
+
+    def _extract_bin_strings(self) -> None:
+        try:
+            self._strings_bin = self.dbg.extract_strings(min_len=5)
+        except Exception:
+            return
+        if self._strings_bin:
+            self._emit_state()
 
     # ---- event fan-out -------------------------------------------------------
     def subscribe(self) -> "queue.Queue":
