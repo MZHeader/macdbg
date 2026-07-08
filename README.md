@@ -23,6 +23,16 @@ cd macdbg/GUI
 ```
 Or, simply open `GUI/macdbg.app`
 
+### Air-gapped machines
+
+`run.sh` opens the native window through pywebview. On a machine with no internet, grab the bundle for its Python version from the [native-deps release](https://github.com/MZHeader/macdbg/releases/tag/native-deps), copy it over, and install it locally:
+
+```sh
+GUI/get-native-deps.sh ./pywebview-macos-arm64-cp313.tar.gz
+```
+
+After that `run.sh` finds it and runs offline. The release notes cover picking the right version for your Python.
+
 ## Syscall and Network Tracer
 
 Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
