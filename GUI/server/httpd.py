@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -94,11 +95,24 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps(result).encode("utf-8"))
 
 
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # Clients drop connections constantly here — SSE unsubscribe, a page
+        # reload, a closed Safari tab — which surfaces as a reset/broken pipe
+        # while reading the request. That's normal for this UI, not a bug worth
+        # dumping a traceback to the log for; let everything else through.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(engine, host="127.0.0.1", port=0):
     """Start the server in a background thread; return (httpd, port)."""
     handler = type("Handler", (_Handler,), {"engine": engine})
-    httpd = ThreadingHTTPServer((host, port), handler)
-    httpd.daemon_threads = True
+    httpd = _Server((host, port), handler)
     actual_port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, name="httpd", daemon=True).start()
     return httpd, actual_port

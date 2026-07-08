@@ -28,17 +28,36 @@ if [ -z "${SDKROOT:-}" ]; then
     [ -n "$SDKROOT" ] && export SDKROOT
 fi
 
+# A Finder / double-click launch inherits a minimal PATH, so `command -v python3`
+# misses the pyenv/conda/venv Python the user set up in their shell — the very
+# one that has pywebview and that run.sh finds fine from a Terminal. Recover the
+# login shell's PATH (marker-delimited so a chatty rc file can't corrupt it) and
+# take its python3, so a double-click discovers the same interpreter a terminal
+# launch does.
+LOGIN_PY=""
+_login_raw="$("${SHELL:-/bin/zsh}" -ilc 'printf "__MACDBGPATH__%s__END__" "$PATH"' 2>/dev/null </dev/null || true)"
+LOGIN_PATH="$(printf '%s' "$_login_raw" | sed -n 's/.*__MACDBGPATH__\(.*\)__END__.*/\1/p')"
+if [ -n "$LOGIN_PATH" ]; then
+    LOGIN_PY="$(PATH="$LOGIN_PATH" command -v python3 2>/dev/null || true)"
+fi
+
 # Interpreters to try for the native window, best first. $MACDBG_PYTHON is an
 # explicit override; the venv paths are the easy answer when a global
 # `pip install` is blocked by an externally-managed Python (PEP 668) — put
 # pywebview in a venv here and it's found even from the double-clicked .app,
-# which has no activated shell. Then whatever's on PATH / the usual spots.
+# which has no activated shell. LOGIN_PY and the version-manager spots recover a
+# user's active Python from a Finder launch; then whatever's on PATH / usual spots.
 CANDIDATES=(
     "${MACDBG_PYTHON:-}"
     "$HOME/.macdbg/venv/bin/python3"
     "$REPO/.venv/bin/python3"
     "$DIR/.venv/bin/python3"
+    "${LOGIN_PY:-}"
     "$(command -v python3 2>/dev/null || true)"
+    "$HOME/.pyenv/shims/python3"
+    "$HOME/miniforge3/bin/python3"
+    "$HOME/miniconda3/bin/python3"
+    "$HOME/anaconda3/bin/python3"
     "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
     "/opt/homebrew/bin/python3"
     "/usr/local/bin/python3"

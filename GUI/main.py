@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import os
-import socket
+import signal
 import subprocess
 import sys
 import time
+import urllib.request
 
 LOCK = os.path.expanduser("~/.macdbg/gui.lock")
 
@@ -61,21 +62,28 @@ def _open_app_window(url: str):
 
 
 def _running_instance_url():
-    """If another macdbg GUI is already serving, return its URL, else None."""
+    """If another macdbg GUI is already serving, return its URL, else None. A
+    stale lock — dead port, or some unrelated service that grabbed it — is
+    ignored and removed so we start a fresh instance instead of trying to focus
+    a window that isn't there."""
     try:
         with open(LOCK) as f:
             port = int(f.read().strip())
     except (OSError, ValueError):
         return None
-    s = socket.socket()
-    s.settimeout(0.3)
+    url = "http://127.0.0.1:{}/".format(port)
     try:
-        s.connect(("127.0.0.1", port))
-        return "http://127.0.0.1:{}/".format(port)
+        # Verify it's actually us (index.html is titled 'macdbg'), not just any
+        # process that happens to hold the port.
+        if b"macdbg" in urllib.request.urlopen(url, timeout=0.5).read(4096):
+            return url
+    except Exception:
+        pass
+    try:
+        os.remove(LOCK)
     except OSError:
-        return None
-    finally:
-        s.close()
+        pass
+    return None
 
 
 def _open_fallback(url: str) -> None:
@@ -133,6 +141,15 @@ def main() -> int:
         with open(LOCK, "w") as f:
             f.write(str(port))
     except OSError:
+        pass
+
+    # Turn SIGTERM (logout, `pkill`, LaunchServices quit) into a clean exit so
+    # the `finally` below shuts the backend down and removes the lock — otherwise
+    # a killed instance leaves an orphaned backend and a stale lock that makes the
+    # next launch think it's "already running".
+    try:
+        signal.signal(signal.SIGTERM, lambda *_a: sys.exit(0))
+    except Exception:
         pass
 
     proc = _open_app_window(url)
