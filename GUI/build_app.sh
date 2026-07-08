@@ -47,9 +47,13 @@ PLIST
 # *bundle* unsigned. That matters: a real ad-hoc *bundle* signature makes
 # Gatekeeper reject a quarantined double-click, whereas an unsigned, un-
 # quarantined local app is allowed to run.
+# -mmacosx-version-min pins the binary's minimum-OS load command; without it
+# clang stamps the *build host's* macOS, and the app then refuses to launch on
+# any older macOS ("you can't use this version of the application with this
+# version of macOS"). 11.0 = the arm64 floor, matching LSMinimumSystemVersion.
 LAUNCHER_BIN="$(mktemp -t macdbg-launcher)"
-clang -arch arm64 -O2 -Wall -o "$LAUNCHER_BIN" "$DIR/launcher.c"
-codesign --force --sign - "$LAUNCHER_BIN" >/dev/null 2>&1 || true
+clang -arch arm64 -mmacosx-version-min=11.0 -O2 -Wall -o "$LAUNCHER_BIN" "$DIR/launcher.c"
+codesign --force --sign - --identifier tech.mzheader.macdbg.gui "$LAUNCHER_BIN" >/dev/null 2>&1 || true
 mv "$LAUNCHER_BIN" "$CONTENTS/MacOS/macdbg"
 chmod +x "$CONTENTS/MacOS/macdbg"
 
