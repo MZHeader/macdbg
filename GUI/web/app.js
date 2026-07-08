@@ -204,12 +204,25 @@
     if (!block) { el.innerHTML = '<div class="empty-note">no data</div>'; return; }
     let html = header ? `<div class="hrow"><span class="dim">${esc(header)}</span></div>` : '';
     for (const row of block.rows || []) {
-      html += `<div class="hrow" data-addr="${row.addr}" data-hex="${esc(row.hex)}">`
+      html += `<div class="hrow" data-addr="${row.addr}" data-hex="${esc(row.hex)}" data-ascii="${esc(row.ascii)}">`
         + `<span class="h-addr">${hx(row.addr)}</span>`
         + `<span class="h-hex">${hexSpans(row, block.width, block.focus)}</span>`
         + `<span class="h-ascii">${asciiSpans(row, block.focus)}</span></div>`;
     }
     el.innerHTML = html;
+    // Center the focused address in the pane, the way disasm snaps to PC — so
+    // following a value actually reveals it instead of just highlighting a row
+    // that's scrolled off. Skip hidden panes (bogus geometry when display:none).
+    if (block.focus && el.offsetParent !== null) {
+      const target = Array.from(el.querySelectorAll('.hrow')).find(r => {
+        const a = +r.dataset.addr;
+        return r.dataset.addr != null && block.focus.addr >= a && block.focus.addr < a + block.width;
+      });
+      if (target) {
+        const cr = el.getBoundingClientRect(), rr = target.getBoundingClientRect();
+        el.scrollTop += (rr.top - cr.top) - el.clientHeight / 2 + rr.height / 2;
+      }
+    }
   }
   function renderWatch(slot, w) {
     const el = $('#watch' + slot);
@@ -580,7 +593,8 @@
       ];
       if (qw) items.push({ label: 'Follow pointer here (' + qw + ')', fn: () => followMem(qw) });
       items.push(
-        { label: 'Edit bytes here…', fn: () => editBytes(addr) },
+        { label: 'Edit bytes here…', fn: () => editMem(row, addr, 'hex') },
+        { label: 'Edit ASCII here…', fn: () => editMem(row, addr, 'ascii') },
         { sep: 1 },
         { label: 'Set watchpoint on this address…', fn: () => setWatchAt(addr) },
         { label: 'Pin to Watch 1', fn: () => cmd('watch_set', { slot: 1, addr: addr, len: 32 }) },
@@ -681,9 +695,63 @@
     const v = await promptDialog({ title: 'Set ' + name, value: val, placeholder: 'new value (0x… or decimal)' });
     if (v !== null && v.trim()) cmd('write_reg', { name: name, value: v.trim() });
   }
-  async function editBytes(addr) {
-    const v = await promptDialog({ title: 'Write bytes @ ' + hx(addr), placeholder: '90 90  or  0x9090' });
+  // Map a hex-view pane back to its state block (memory / stack / watchN).
+  function blockForPane(id) {
+    if (!lastState) return null;
+    if (id === 'memory') return lastState.memory;
+    if (id === 'stack') return lastState.stack;
+    const m = /^watch(\d)$/.exec(id || '');
+    return m ? (lastState.watches || [])[+m[1] - 1] : null;
+  }
+  // Collect the bytes in [start, start+len) from a rendered block's rows,
+  // returning both a hex string and its ASCII rendering for dialog prefill.
+  function bytesInRange(block, start, len) {
+    const out = [];
+    for (const r of (block && block.rows) || []) {
+      const toks = (r.hex || '').trim().split(/\s+/);
+      for (let j = 0; j < toks.length; j++) {
+        const a = r.addr + j;
+        if (a >= start && a < start + len && /^[0-9a-fA-F]{2}$/.test(toks[j]))
+          out.push([a, parseInt(toks[j], 16)]);
+      }
+    }
+    out.sort((x, y) => x[0] - y[0]);
+    return {
+      hex: out.map(o => o[1].toString(16).padStart(2, '0')).join(' '),
+      ascii: out.map(o => (o[1] >= 32 && o[1] < 127) ? String.fromCharCode(o[1]) : '.').join('')
+    };
+  }
+  // Edit memory from a hex-view row. If a multi-byte region is highlighted
+  // (the focus span, e.g. a search hit), edit exactly that; otherwise default
+  // to two lines from the clicked row. Prefill with the range's current bytes.
+  function editMem(row, clickedAddr, kind) {
+    const pane = row.closest('.hexview');
+    const block = pane ? blockForPane(pane.id) : null;
+    const width = (block && block.width) || 16;
+    let start, len;
+    if (block && block.focus && block.focus.len > 1) {
+      start = block.focus.addr; len = block.focus.len;
+    } else {
+      start = clickedAddr; len = width * 2;
+    }
+    const cur = bytesInRange(block, start, len);
+    if (kind === 'hex') editBytes(start, cur.hex); else editAscii(start, cur.ascii);
+  }
+  async function editBytes(addr, cur) {
+    const v = await promptDialog({ title: 'Write bytes @ ' + hx(addr), value: (cur || '').trim(), placeholder: '90 90  or  0x9090' });
     if (v !== null && v.trim()) cmd('write_mem', { addr: addr, bytes: v.trim() });
+  }
+  async function editAscii(addr, cur) {
+    const v = await promptDialog({ title: 'Write ASCII @ ' + hx(addr),
+      value: cur || '',
+      placeholder: 'text — written as raw bytes from here',
+      hint: 'A dot (.) marks a non-printable byte. Overwrites byte-for-byte (UTF-8), not null-terminated.' });
+    if (v === null || v === '') return;
+    // encode the typed text to bytes and reuse the hex write path
+    const bytes = new TextEncoder().encode(v);
+    if (!bytes.length) return;
+    const hexStr = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join(' ');
+    cmd('write_mem', { addr: addr, bytes: hexStr });
   }
   async function setWatchAt(addr) {
     const s = await promptDialog({ title: 'Set watchpoint', value: hx(addr), placeholder: 'address', hint: 'Runs `watchpoint set expression`.' });

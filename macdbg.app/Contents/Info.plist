@@ -6,8 +6,8 @@
     <key>CFBundleDisplayName</key>     <string>macdbg</string>
     <key>CFBundleExecutable</key>      <string>macdbg</string>
     <key>CFBundleIdentifier</key>      <string>tech.mzheader.macdbg.gui</string>
-    <key>CFBundleVersion</key>         <string>1.0.0</string>
-    <key>CFBundleShortVersionString</key> <string>1.0.0</string>
+    <key>CFBundleVersion</key>         <string>1.1.0</string>
+    <key>CFBundleShortVersionString</key> <string>1.1.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
