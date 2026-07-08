@@ -33,15 +33,23 @@ else
     "$PY" -m pip install --target "$OUT" pywebview >&2
 fi
 
-# strip build noise that isn't needed at runtime
+# sanity-check it imports in isolation before shipping it. -B so the check
+# doesn't write .pyc files back into the tree we're about to strip.
+PYTHONPATH="$OUT" PYTHONNOUSERSITE=1 "$PY" -SB -c "import objc, webview" \
+    || { echo "built bundle failed to import objc+webview" >&2; rm -rf "$OUT"; exit 1; }
+
+# Drop anything not needed at runtime that could carry build-machine paths:
+#   bin/         console scripts whose shebang is this interpreter's abs path
+#                (leaks the build user's home); pywebview imports the modules,
+#                never these scripts.
+#   __pycache__  .pyc files embed compile-time source paths.
+#   .lock        uv's install lock.
+rm -rf "$OUT/bin" "$OUT/.lock"
 find "$OUT" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "$OUT" -name '*.pyc' -delete 2>/dev/null || true
 
-# sanity-check it imports in isolation before shipping it
-PYTHONPATH="$OUT" PYTHONNOUSERSITE=1 "$PY" -S -c "import objc, webview" \
-    || { echo "built bundle failed to import objc+webview" >&2; rm -rf "$OUT"; exit 1; }
-
+# Anonymise tar ownership so the headers carry no username/uid from this machine.
 ASSET="pywebview-macos-${ARCH}-${CPTAG}.tar.gz"
-tar czf "$DIR/$ASSET" -C "$OUT" .
+tar --uid 0 --gid 0 --uname '' --gname '' -czf "$DIR/$ASSET" -C "$OUT" .
 rm -rf "$OUT"
 echo "$DIR/$ASSET"
