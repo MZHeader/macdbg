@@ -6,4 +6,5 @@ __pycache__/
 .DS_Store
 test/
 TUI-backup/
-GUI/vendor313/
+GUI/vendor-*/
+GUI/pywebview-macos-*.tar.gz
