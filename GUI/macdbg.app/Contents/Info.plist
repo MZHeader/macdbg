@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>            <string>macdbg</string>
+    <key>CFBundleDisplayName</key>     <string>macdbg</string>
+    <key>CFBundleExecutable</key>      <string>macdbg</string>
+    <key>CFBundleIdentifier</key>      <string>tech.mzheader.macdbg.gui</string>
+    <key>CFBundleVersion</key>         <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key> <string>1.0.0</string>
+    <key>CFBundlePackageType</key>     <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>  <string>11.0</string>
+    <key>NSHighResolutionCapable</key> <true/>
+    <key>LSUIElement</key>             <false/>
+    <key>CFBundleIconFile</key>        <string>macdbg.icns</string>
+</dict>
+</plist>

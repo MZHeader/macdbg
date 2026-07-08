@@ -1,0 +1,28 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     'build/lib.macosx-10.13-universal2-cpython-313/PyObjCTest/corefoundation.cpython-313-darwin.so'
+relocations:
+  - { offset: 0x27, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation signatureForCFUUIDRef]', symObjAddr: 0x0, symBinAddr: 0xA40, symSize: 0xC }
+  - { offset: 0x4E, size: 0x8, addend: 0x0, symName: _mod_module, symObjAddr: 0x690, symBinAddr: 0x81E0, symSize: 0x0 }
+  - { offset: 0xD75, size: 0x8, addend: 0x0, symName: _mod_methods, symObjAddr: 0x5B08, symBinAddr: 0x8290, symSize: 0x0 }
+  - { offset: 0xD96, size: 0x8, addend: 0x0, symName: _mod_slots, symObjAddr: 0x6F8, symBinAddr: 0x8248, symSize: 0x0 }
+  - { offset: 0xDB7, size: 0x8, addend: 0x0, symName: _PyObjC_API, symObjAddr: 0x5B28, symBinAddr: 0x82B0, symSize: 0x0 }
+  - { offset: 0x1342, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation signatureForCFUUIDRef]', symObjAddr: 0x0, symBinAddr: 0xA40, symSize: 0xC }
+  - { offset: 0x1372, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation typeidForCFUUIDRef]', symObjAddr: 0xC, symBinAddr: 0xA4C, symSize: 0x4 }
+  - { offset: 0x13A5, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation typeidForCFUUIDRef]', symObjAddr: 0xC, symBinAddr: 0xA4C, symSize: 0x4 }
+  - { offset: 0x13C6, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation createUUID]', symObjAddr: 0x10, symBinAddr: 0xA50, symSize: 0x3C }
+  - { offset: 0x148C, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation anotherUUID]', symObjAddr: 0x4C, symBinAddr: 0xA8C, symSize: 0x2C }
+  - { offset: 0x14DE, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation runloop]', symObjAddr: 0x78, symBinAddr: 0xAB8, symSize: 0x4 }
+  - { offset: 0x1511, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation runloop]', symObjAddr: 0x78, symBinAddr: 0xAB8, symSize: 0x4 }
+  - { offset: 0x153B, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation formatUUID:]', symObjAddr: 0x7C, symBinAddr: 0xABC, symSize: 0x1C }
+  - { offset: 0x15D4, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation formatUUID2:]', symObjAddr: 0x98, symBinAddr: 0xAD8, symSize: 0x1C }
+  - { offset: 0x163C, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation signatureForCFDateRef]', symObjAddr: 0xB4, symBinAddr: 0xAF4, symSize: 0xC }
+  - { offset: 0x166C, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation typeidForCFDateRef]', symObjAddr: 0xC0, symBinAddr: 0xB00, symSize: 0x4 }
+  - { offset: 0x169F, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation typeidForCFDateRef]', symObjAddr: 0xC0, symBinAddr: 0xB00, symSize: 0x4 }
+  - { offset: 0x16B4, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation today]', symObjAddr: 0xC4, symBinAddr: 0xB04, symSize: 0x30 }
+  - { offset: 0x1764, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation formatDate:]', symObjAddr: 0xF4, symBinAddr: 0xB34, symSize: 0x70 }
+  - { offset: 0x18C7, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation shortStyle]', symObjAddr: 0x164, symBinAddr: 0xBA4, symSize: 0x8 }
+  - { offset: 0x18F7, size: 0x8, addend: 0x0, symName: '+[OC_TestCoreFoundation noStyle]', symObjAddr: 0x16C, symBinAddr: 0xBAC, symSize: 0x8 }
+  - { offset: 0x1927, size: 0x8, addend: 0x0, symName: _PyInit_corefoundation, symObjAddr: 0x174, symBinAddr: 0xBB4, symSize: 0xC }
+  - { offset: 0x19B5, size: 0x8, addend: 0x0, symName: _mod_exec_module, symObjAddr: 0x180, symBinAddr: 0xBC0, symSize: 0xFC }
+...

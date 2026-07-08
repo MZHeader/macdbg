@@ -1,0 +1,17 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     'build/lib.macosx-10.13-universal2-cpython-313/PyObjCTest/sequence.cpython-313-darwin.so'
+relocations:
+  - { offset: 0x27, size: 0x8, addend: 0x0, symName: '-[OC_TestSequence initWithArray:]', symObjAddr: 0x0, symBinAddr: 0xB30, symSize: 0x9C }
+  - { offset: 0x4E, size: 0x8, addend: 0x0, symName: _mod_module, symObjAddr: 0x7B0, symBinAddr: 0x82B0, symSize: 0x0 }
+  - { offset: 0xD75, size: 0x8, addend: 0x0, symName: _mod_methods, symObjAddr: 0x4BA8, symBinAddr: 0x8360, symSize: 0x0 }
+  - { offset: 0xD96, size: 0x8, addend: 0x0, symName: _mod_slots, symObjAddr: 0x818, symBinAddr: 0x8318, symSize: 0x0 }
+  - { offset: 0xDB7, size: 0x8, addend: 0x0, symName: _PyObjC_API, symObjAddr: 0x4BC8, symBinAddr: 0x8380, symSize: 0x0 }
+  - { offset: 0x1329, size: 0x8, addend: 0x0, symName: '-[OC_TestSequence initWithArray:]', symObjAddr: 0x0, symBinAddr: 0xB30, symSize: 0x9C }
+  - { offset: 0x137B, size: 0x8, addend: 0x0, symName: '-[OC_TestSequence dealloc]', symObjAddr: 0x9C, symBinAddr: 0xBCC, symSize: 0x70 }
+  - { offset: 0x13BA, size: 0x8, addend: 0x0, symName: '-[OC_TestSequence count]', symObjAddr: 0x10C, symBinAddr: 0xC3C, symSize: 0x8 }
+  - { offset: 0x13EE, size: 0x8, addend: 0x0, symName: '-[OC_TestSequence objectAtIndex:]', symObjAddr: 0x114, symBinAddr: 0xC44, symSize: 0x64 }
+  - { offset: 0x1431, size: 0x8, addend: 0x0, symName: '-[OC_TestMutableSequence setObject:atIndex:]', symObjAddr: 0x178, symBinAddr: 0xCA8, symSize: 0x7C }
+  - { offset: 0x147F, size: 0x8, addend: 0x0, symName: _PyInit_sequence, symObjAddr: 0x1F4, symBinAddr: 0xD24, symSize: 0xC }
+  - { offset: 0x150D, size: 0x8, addend: 0x0, symName: _mod_exec_module, symObjAddr: 0x200, symBinAddr: 0xD30, symSize: 0x13C }
+...

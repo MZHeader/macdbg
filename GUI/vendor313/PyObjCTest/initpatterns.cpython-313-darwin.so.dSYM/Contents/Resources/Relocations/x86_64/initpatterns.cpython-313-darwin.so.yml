@@ -1,0 +1,26 @@
+---
+triple:          'x86_64-apple-darwin'
+binary-path:     'build/lib.macosx-10.13-universal2-cpython-313/PyObjCTest/initpatterns.cpython-313-darwin.so'
+relocations:
+  - { offset: 0x27, size: 0x8, addend: 0x0, symName: '-[OC_InitReturnsSelf init]', symObjAddr: 0x0, symBinAddr: 0x990, symSize: 0x30 }
+  - { offset: 0x40, size: 0x8, addend: 0x0, symName: _singleton, symObjAddr: 0x5B40, symBinAddr: 0x2880, symSize: 0x0 }
+  - { offset: 0x94, size: 0x8, addend: 0x0, symName: _singleton_nil, symObjAddr: 0x5B48, symBinAddr: 0x2888, symSize: 0x0 }
+  - { offset: 0xCC, size: 0x8, addend: 0x0, symName: _mod_module, symObjAddr: 0xD10, symBinAddr: 0x27C0, symSize: 0x0 }
+  - { offset: 0xDF3, size: 0x8, addend: 0x0, symName: _mod_methods, symObjAddr: 0x5B50, symBinAddr: 0x2890, symSize: 0x0 }
+  - { offset: 0xE14, size: 0x8, addend: 0x0, symName: _mod_slots, symObjAddr: 0xD80, symBinAddr: 0x2830, symSize: 0x0 }
+  - { offset: 0xE35, size: 0x8, addend: 0x0, symName: _PyObjC_API, symObjAddr: 0x5B70, symBinAddr: 0x28B0, symSize: 0x0 }
+  - { offset: 0x135A, size: 0x8, addend: 0x0, symName: '-[OC_InitReturnsSelf init]', symObjAddr: 0x0, symBinAddr: 0x990, symSize: 0x30 }
+  - { offset: 0x138E, size: 0x8, addend: 0x0, symName: '-[OC_InitReturnsNil init]', symObjAddr: 0x30, symBinAddr: 0x9C0, symSize: 0x10 }
+  - { offset: 0x13D5, size: 0x8, addend: 0x0, symName: '-[OC_InitReturnsOther init]', symObjAddr: 0x40, symBinAddr: 0x9D0, symSize: 0x40 }
+  - { offset: 0x141C, size: 0x8, addend: 0x0, symName: '+[OC_AllocSingleton singletonRetainCount]', symObjAddr: 0x80, symBinAddr: 0xA10, symSize: 0x60 }
+  - { offset: 0x145B, size: 0x8, addend: 0x0, symName: '+[OC_AllocSingleton alloc]', symObjAddr: 0xE0, symBinAddr: 0xA70, symSize: 0x60 }
+  - { offset: 0x14A5, size: 0x8, addend: 0x0, symName: '+[OC_AllocSingleton allocsuper]', symObjAddr: 0x140, symBinAddr: 0xAD0, symSize: 0x30 }
+  - { offset: 0x14D9, size: 0x8, addend: 0x0, symName: '-[OC_AllocSingleton init]', symObjAddr: 0x170, symBinAddr: 0xB00, symSize: 0x50 }
+  - { offset: 0x152B, size: 0x8, addend: 0x0, symName: '+[OC_AllocSingletonInitNil singletonRetainCount]', symObjAddr: 0x1C0, symBinAddr: 0xB50, symSize: 0x60 }
+  - { offset: 0x156A, size: 0x8, addend: 0x0, symName: '+[OC_AllocSingletonInitNil alloc]', symObjAddr: 0x220, symBinAddr: 0xBB0, symSize: 0x60 }
+  - { offset: 0x15B4, size: 0x8, addend: 0x0, symName: '-[OC_AllocSingletonInitNil init]', symObjAddr: 0x280, symBinAddr: 0xC10, symSize: 0x10 }
+  - { offset: 0x15FB, size: 0x8, addend: 0x0, symName: '+[OC_InitPatterns newValueFor:]', symObjAddr: 0x290, symBinAddr: 0xC20, symSize: 0x20 }
+  - { offset: 0x1645, size: 0x8, addend: 0x0, symName: '+[OC_InitPatterns callInitOn:]', symObjAddr: 0x2B0, symBinAddr: 0xC40, symSize: 0x30 }
+  - { offset: 0x16A9, size: 0x8, addend: 0x0, symName: _PyInit_initpatterns, symObjAddr: 0x2E0, symBinAddr: 0xC70, symSize: 0x20 }
+  - { offset: 0x1737, size: 0x8, addend: 0x0, symName: _mod_exec_module, symObjAddr: 0x300, symBinAddr: 0xC90, symSize: 0x1EA }
+...

@@ -1,0 +1,26 @@
+---
+triple:          'x86_64-apple-darwin'
+binary-path:     'build/lib.macosx-10.13-universal2-cpython-313/PyObjCTest/opaque.cpython-313-darwin.so'
+relocations:
+  - { offset: 0x27, size: 0x8, addend: 0x0, symName: _PyInit_opaque, symObjAddr: 0x0, symBinAddr: 0x940, symSize: 0x20 }
+  - { offset: 0x4E, size: 0x8, addend: 0x0, symName: _mod_module, symObjAddr: 0x310, symBinAddr: 0x12A0, symSize: 0x0 }
+  - { offset: 0xD75, size: 0x8, addend: 0x0, symName: _mod_methods, symObjAddr: 0x380, symBinAddr: 0x1310, symSize: 0x0 }
+  - { offset: 0xD96, size: 0x8, addend: 0x0, symName: _mod_slots, symObjAddr: 0x3C0, symBinAddr: 0x1350, symSize: 0x0 }
+  - { offset: 0xDB7, size: 0x8, addend: 0x0, symName: _PyObjC_API, symObjAddr: 0x57D8, symBinAddr: 0x1398, symSize: 0x0 }
+  - { offset: 0x12D6, size: 0x8, addend: 0x0, symName: _PyInit_opaque, symObjAddr: 0x0, symBinAddr: 0x940, symSize: 0x20 }
+  - { offset: 0x131E, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest createFoo:]', symObjAddr: 0x20, symBinAddr: 0x960, symSize: 0x20 }
+  - { offset: 0x1390, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest nullFoo]', symObjAddr: 0x40, symBinAddr: 0x980, symSize: 0x10 }
+  - { offset: 0x13C0, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest deleteFoo:]', symObjAddr: 0x50, symBinAddr: 0x990, symSize: 0x20 }
+  - { offset: 0x1413, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest getValueOf:]', symObjAddr: 0x70, symBinAddr: 0x9B0, symSize: 0x10 }
+  - { offset: 0x1450, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest setValue:forFoo:]', symObjAddr: 0x80, symBinAddr: 0x9C0, symSize: 0x10 }
+  - { offset: 0x1496, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest createBarWithFirst:andSecond:]', symObjAddr: 0x90, symBinAddr: 0x9D0, symSize: 0x40 }
+  - { offset: 0x1506, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest nullBar]', symObjAddr: 0xD0, symBinAddr: 0xA10, symSize: 0x10 }
+  - { offset: 0x1536, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest getFirst:andSecond:of:]', symObjAddr: 0xE0, symBinAddr: 0xA20, symSize: 0x20 }
+  - { offset: 0x1589, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest setFirst:andSecond:of:]', symObjAddr: 0x100, symBinAddr: 0xA40, symSize: 0x10 }
+  - { offset: 0x15DC, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest deleteBar:]', symObjAddr: 0x110, symBinAddr: 0xA50, symSize: 0x20 }
+  - { offset: 0x1622, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest getFirst:]', symObjAddr: 0x130, symBinAddr: 0xA70, symSize: 0x10 }
+  - { offset: 0x165F, size: 0x8, addend: 0x0, symName: '+[OC_OpaqueTest getSecond:]', symObjAddr: 0x140, symBinAddr: 0xA80, symSize: 0x10 }
+  - { offset: 0x16FA, size: 0x8, addend: 0x0, symName: _do_traverse, symObjAddr: 0x150, symBinAddr: 0xA90, symSize: 0x90 }
+  - { offset: 0x1813, size: 0x8, addend: 0x0, symName: _do_visit, symObjAddr: 0x1E0, symBinAddr: 0xB20, symSize: 0x20 }
+  - { offset: 0x1895, size: 0x8, addend: 0x0, symName: _mod_exec_module, symObjAddr: 0x200, symBinAddr: 0xB40, symSize: 0x10A }
+...

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import struct
 import time
 from typing import Dict, List, Optional, Tuple
@@ -492,21 +493,47 @@ class Debugger:
             return
         cur = thread.GetNumFrames()
         remaining = []
-        for depth, kind, buf in self._pending_step_scrubs:
+        for depth, kind, buf, oldlenp in self._pending_step_scrubs:
             if cur < depth:
-                self._scrub_flag(kind, buf)
+                self._scrub_flag(kind, buf, oldlenp)
             else:
-                remaining.append((depth, kind, buf))
+                remaining.append((depth, kind, buf, oldlenp))
         self._pending_step_scrubs = remaining or None
 
     def _arm_step_scrub(self, thread, kind: str) -> None:
-        """Record a sysctl/csops output buffer to scrub once the call returns,
-        using the same entry-side argument checks as handle_flag_scrub_hit."""
+        """Record a sysctl/csops output buffer (from a direct libc symbol call) to
+        scrub once the call returns, using the same entry-side argument checks as
+        handle_flag_scrub_hit."""
         frame = thread.GetFrameAtIndex(0)
+        oldlenp = 0
         if kind == "sysctl":
             mib = frame.FindRegister("x0").GetValueAsUnsigned()
             namelen = frame.FindRegister("x1").GetValueAsUnsigned()
             oldp = frame.FindRegister("x2").GetValueAsUnsigned()
+            oldlenp = frame.FindRegister("x3").GetValueAsUnsigned()
+            buf = oldp
+        else:  # csops
+            ops = frame.FindRegister("x1").GetValueAsUnsigned()
+            useraddr = frame.FindRegister("x2").GetValueAsUnsigned()
+            oldp = useraddr
+            mib = namelen = 1  # unused for csops
+            buf = useraddr
+        self._queue_step_scrub(thread, kind, mib, namelen, oldp, oldlenp, buf,
+                               ops if kind == "csops" else 0)
+
+    def _arm_step_scrub_syscall(self, thread, kind: str) -> None:
+        """Same as _arm_step_scrub but for the syscall() wrapper, whose args are
+        stack-passed (mib/oldp/etc. come from the stack, not x0..)."""
+        frame = thread.GetFrameAtIndex(0)
+        if kind == "sysctl":
+            mib, namelen, oldp, oldlenp = self._syscall_args(frame, 4)
+            self._queue_step_scrub(thread, kind, mib, namelen, oldp, oldlenp, oldp, 0)
+        else:  # csops
+            _pid, ops, useraddr = self._syscall_args(frame, 3)
+            self._queue_step_scrub(thread, kind, 1, 1, useraddr, 0, useraddr, ops)
+
+    def _queue_step_scrub(self, thread, kind, mib, namelen, oldp, oldlenp, buf, ops) -> None:
+        if kind == "sysctl":
             if not (mib and oldp and namelen >= 3):
                 return
             err = lldb.SBError()
@@ -517,16 +544,12 @@ class Debugger:
             if not (name[0] == self._CTL_KERN and name[1] == self._KERN_PROC
                     and name[2] == self._KERN_PROC_PID):
                 return
-            buf = oldp
         else:  # csops
-            ops = frame.FindRegister("x1").GetValueAsUnsigned()
-            useraddr = frame.FindRegister("x2").GetValueAsUnsigned()
-            if not (useraddr and ops == self._CS_OPS_STATUS):
+            if not (buf and ops == self._CS_OPS_STATUS):
                 return
-            buf = useraddr
         if self._pending_step_scrubs is None:
             self._pending_step_scrubs = []
-        self._pending_step_scrubs.append((thread.GetNumFrames(), kind, buf))
+        self._pending_step_scrubs.append((thread.GetNumFrames(), kind, buf, oldlenp))
 
     def _defense_step_action(self, bp_id: int, thread) -> None:
         """Apply a defense whose breakpoint fired *inside a user step*, without a
@@ -566,9 +589,19 @@ class Debugger:
                 self.ci.HandleCommand("register write x0 0", ret, False)
                 self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
             return
-        if bp_id == self.anti_timing_bp_id:
+        if self.anti_timing_bp_ids and bp_id in self.anti_timing_bp_ids:
             self.ci.HandleCommand("thread return {}".format(self._advance_fake_clock()),
                                   ret, False)
+            return
+        if self.syscall_bp_ids and bp_id in self.syscall_bp_ids:
+            num = frame.FindRegister("x0").GetValueAsUnsigned()
+            if (num == self._SYS_PTRACE and self.anti_ptrace_bp_id
+                    and self._syscall_args(frame, 1)[0] == 31):
+                self.ci.HandleCommand("thread return 0", ret, False)  # avoid the kill
+            elif num == self._SYS_SYSCTL and (self._scrub_ptraced or self._scrub_parent):
+                self._arm_step_scrub_syscall(thread, "sysctl")
+            elif num == self._SYS_CSOPS and self.anti_csops_bp_id:
+                self._arm_step_scrub_syscall(thread, "csops")
             return
         if bp_id == self.anti_sysctl_bp_id:
             self._arm_step_scrub(thread, "sysctl")
@@ -579,9 +612,9 @@ class Debugger:
         if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
             # A return one-shot armed by a prior non-step hit fired during the
             # step; scrub now and retire it.
-            kind, buf = self._flag_scrub_returns.pop(bp_id)
+            kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
             self.target.BreakpointDelete(bp_id)
-            self._scrub_flag(kind, buf)
+            self._scrub_flag(kind, buf, oldlenp)
 
     def set_pc(self, addr: int) -> Tuple[bool, str]:
         """Redirect execution: point the program counter at `addr` (x64dbg's
@@ -753,13 +786,29 @@ class Debugger:
 
     hw_breakpoints: bool = False
     anti_ptrace_bp_id: int = 0
-    anti_sysctl_bp_id: int = 0
     anti_csops_bp_id: int = 0
-    anti_timing_bp_id: int = 0
-    # monotonic fake clock fed to mach_absolute_time() so a self-timing check
-    # can't see the milliseconds our stop/continue hooks actually cost.
+    anti_timing_bp_ids: Optional[List[int]] = None
+    # One shared sysctl breakpoint drives two independent scrubs, tracked by
+    # these owner flags: P_TRACED (anti_sysctl) and the parent-name scrub
+    # (anti_parent). The breakpoint is armed while either owner is on.
+    anti_sysctl_bp_id: int = 0
+    _scrub_ptraced: bool = False
+    _scrub_parent: bool = False
+    # not a breakpoint: a flag. When on, an EXC_BREAKPOINT (brk the target set
+    # on itself, not one of ours) is forwarded to the target's own SIGTRAP
+    # handler instead of stopping, defeating self-trap debugger checks.
+    anti_sigtrap_on: bool = False
+    # libc syscall()/__syscall() hook, auto-armed while any of the ptrace/flag
+    # defenses is on, so the same checks issued through the syscall() wrapper
+    # (bypassing the libc symbol and the __text svc scan) are still neutralised.
+    syscall_bp_ids: Optional[List[int]] = None
+    # monotonic fake clock fed to the hooked time sources so a self-timing check
+    # can't see the milliseconds our stop/continue hooks actually cost. (A
+    # "real-clock minus paused-time" version was tried and abandoned: LLDB's
+    # async event delivery leaves ~ms of stopped time unaccounted, so it hid
+    # latency worse than this does. See git history / the timing comment below.)
     _fake_clock: int = 0
-    _fake_clock_step: int = 100   # ticks added per mach_absolute_time() call
+    _fake_clock_step: int = 100
     _anti_timing_logged: bool = False
     # return-address one-shots waiting to scrub a flag out of a syscall's output
     # buffer once the call fills it: {ret_bp_id: (kind, buffer_addr)}.
@@ -809,6 +858,7 @@ class Debugger:
         if not bp.IsValid():
             return False, "ptrace symbol not found"
         self.anti_ptrace_bp_id = bp.GetID()
+        self._sync_syscall_bp()
         return True, "PT_DENY_ATTACH bypass armed (bp #{})".format(bp.GetID())
 
     def disable_anti_ptrace(self) -> Tuple[bool, str]:
@@ -816,7 +866,110 @@ class Debugger:
             return True, "already disabled"
         self.target.BreakpointDelete(self.anti_ptrace_bp_id)
         self.anti_ptrace_bp_id = 0
+        self._sync_syscall_bp()
         return True, "PT_DENY_ATTACH bypass disabled"
+
+    # -- parent-identity cloak ------------------------------------------------
+    # A sample that reads its parent's name -- via getppid() then
+    # sysctl(KERN_PROC_PID, ppid), or by pulling e_ppid straight out of its own
+    # kinfo_proc -- sees "debugserver"/"lldb" and knows it's debugged. Both paths
+    # end in a sysctl(KERN_PROC_PID) whose p_comm we can rewrite, so instead of
+    # faking getppid (which would lie to every legitimate caller) we scrub the
+    # debugger's *name* out of the sysctl result. getppid is left untouched.
+
+    def enable_anti_parent(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        self._scrub_parent = True
+        ok, why = self._ensure_sysctl_bp()
+        if not ok:
+            self._scrub_parent = False
+            return False, why
+        self._sync_syscall_bp()
+        return True, "parent cloak armed: debugger names scrubbed from sysctl(KERN_PROC) results"
+
+    def disable_anti_parent(self) -> Tuple[bool, str]:
+        self._scrub_parent = False
+        self._maybe_release_sysctl_bp()
+        self._sync_syscall_bp()
+        return True, "parent cloak disabled"
+
+    # -- SIGTRAP self-trap forwarder ------------------------------------------
+    # A sample installs its own SIGTRAP handler then executes brk #0. Undebugged,
+    # the kernel turns that into SIGTRAP and the handler runs; under a debugger
+    # the EXC_BREAKPOINT is caught and the handler never fires, so the sample
+    # knows it's watched (and we'd re-trap on the same brk forever). When armed,
+    # we do what the kernel would: run the target's own SIGTRAP handler. Not a
+    # breakpoint -- just a flag consulted on every exception stop.
+
+    def enable_anti_sigtrap(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        self.anti_sigtrap_on = True
+        return True, "self-trap forwarder armed: brk #0 routed to the target's SIGTRAP handler"
+
+    def disable_anti_sigtrap(self) -> Tuple[bool, str]:
+        self.anti_sigtrap_on = False
+        return True, "self-trap forwarder disabled"
+
+    def _read_signal_handler(self, signo: int) -> Optional[int]:
+        """The target's registered handler for `signo`, read via in-process
+        sigaction. None if unreadable; 0 == SIG_DFL, 1 == SIG_IGN.
+
+        Run through the command interpreter (which falls back to C++ for this C
+        frame, where SBFrame.EvaluateExpression does not) with breakpoints off so
+        the injected malloc/sigaction call can't re-enter a defense hook."""
+        expr = ("expression -l c++ --ignore-breakpoints true -- "
+                "void *b=(void*)malloc(16);"
+                "((int(*)(int,void*,void*))sigaction)({},(void*)0,b);"
+                "void *h=*(void**)b;((void(*)(void*))free)(b);h").format(signo)
+        ret = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand(expr, ret, False)
+        if not ret.Succeeded():
+            return None
+        m = re.search(r"=\s*(0x[0-9a-fA-F]+)", ret.GetOutput() or "")
+        if not m:
+            return None
+        return int(m.group(1), 16)
+
+    def handle_self_trap(self, thread) -> Optional[str]:
+        """If the target hit a brk it planted on itself (EXC_BREAKPOINT, not one
+        of our breakpoints) and anti_sigtrap is on, run its own SIGTRAP handler
+        the way the kernel would when undebugged. Returns a message if handled,
+        None otherwise (so the caller surfaces the stop normally)."""
+        if not self.anti_sigtrap_on or not self.process:
+            return None
+        if not thread or not thread.IsValid():
+            return None
+        if thread.GetStopReason() != lldb.eStopReasonException:
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return None
+        pc = frame.GetPC()
+        # Only act on a real brk instruction -- leave other exceptions alone.
+        insns = self.target.ReadInstructions(lldb.SBAddress(pc, self.target), 1)
+        if insns.GetSize() < 1:
+            return None
+        mn = (insns.GetInstructionAtIndex(0).GetMnemonic(self.target) or "").lower()
+        if mn != "brk":
+            return None
+        SIGTRAP = 5
+        handler = self._read_signal_handler(SIGTRAP)
+        ret = lldb.SBCommandReturnObject()
+        if handler is None or handler in (0, 1):
+            # SIG_DFL / SIG_IGN / unreadable: step past the brk so we don't trap
+            # on it forever. Keeps the session usable even if we can't forward.
+            self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
+            self.process.Continue()
+            return "self-trap: no SIGTRAP handler, skipped brk at {:#x}".format(pc)
+        # Deliver: x0 = signo, lr = after the brk (so a handler that returns
+        # normally resumes past it), pc = the handler.
+        self.ci.HandleCommand("register write x0 {}".format(SIGTRAP), ret, False)
+        self.ci.HandleCommand("register write lr {:#x}".format(pc + 4), ret, False)
+        self.ci.HandleCommand("register write pc {:#x}".format(handler), ret, False)
+        self.process.Continue()
+        return "self-trap: ran target SIGTRAP handler {:#x} for brk at {:#x}".format(handler, pc)
 
     def enable_anti_mach_ports(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
@@ -878,22 +1031,38 @@ class Debugger:
                 self.target.BreakpointDelete(bp_id)
         self._flag_scrub_returns = None
 
-    def enable_anti_sysctl(self) -> Tuple[bool, str]:
-        if not self.target or not self.target.IsValid():
-            return False, "no target"
+    def _ensure_sysctl_bp(self) -> Tuple[bool, str]:
+        """Arm the shared sysctl breakpoint if not already armed."""
         if self.anti_sysctl_bp_id:
-            return True, "already enabled"
+            return True, "already armed"
         bp = self.target.BreakpointCreateByName("sysctl")
         if not bp.IsValid():
             return False, "sysctl symbol not found"
         self.anti_sysctl_bp_id = bp.GetID()
-        return True, "sysctl(P_TRACED) scrub armed (bp #{})".format(bp.GetID())
+        return True, "armed"
+
+    def _maybe_release_sysctl_bp(self) -> None:
+        """Delete the shared sysctl breakpoint once no owner needs it."""
+        if (not self._scrub_ptraced and not self._scrub_parent
+                and self.anti_sysctl_bp_id and self.target):
+            self.target.BreakpointDelete(self.anti_sysctl_bp_id)
+            self.anti_sysctl_bp_id = 0
+
+    def enable_anti_sysctl(self) -> Tuple[bool, str]:
+        if not self.target or not self.target.IsValid():
+            return False, "no target"
+        self._scrub_ptraced = True
+        ok, why = self._ensure_sysctl_bp()
+        if not ok:
+            self._scrub_ptraced = False
+            return False, why
+        self._sync_syscall_bp()
+        return True, "sysctl(P_TRACED) scrub armed"
 
     def disable_anti_sysctl(self) -> Tuple[bool, str]:
-        if not self.target or not self.anti_sysctl_bp_id:
-            return True, "already disabled"
-        self.target.BreakpointDelete(self.anti_sysctl_bp_id)
-        self.anti_sysctl_bp_id = 0
+        self._scrub_ptraced = False
+        self._maybe_release_sysctl_bp()
+        self._sync_syscall_bp()
         return True, "sysctl(P_TRACED) scrub disabled"
 
     def enable_anti_csops(self) -> Tuple[bool, str]:
@@ -905,6 +1074,7 @@ class Debugger:
         if not bp.IsValid():
             return False, "csops symbol not found"
         self.anti_csops_bp_id = bp.GetID()
+        self._sync_syscall_bp()
         return True, "csops(CS_DEBUGGED) scrub armed (bp #{})".format(bp.GetID())
 
     def disable_anti_csops(self) -> Tuple[bool, str]:
@@ -912,9 +1082,13 @@ class Debugger:
             return True, "already disabled"
         self.target.BreakpointDelete(self.anti_csops_bp_id)
         self.anti_csops_bp_id = 0
+        self._sync_syscall_bp()
         return True, "csops(CS_DEBUGGED) scrub disabled"
 
-    def _arm_return_scrub(self, thread, kind: str, buf: int) -> None:
+    _DEBUGGER_NAMES = (b"debugserver", b"lldb", b"gdb")
+    _KINFO_PROC_SIZE = 648   # sizeof(struct kinfo_proc) on macOS arm64
+
+    def _arm_return_scrub(self, thread, kind: str, buf: int, oldlenp: int = 0) -> None:
         ret_addr = thread.GetFrameAtIndex(0).FindRegister("lr").GetValueAsUnsigned()
         if not ret_addr:
             return
@@ -923,20 +1097,53 @@ class Debugger:
         bp.SetThreadID(thread.GetThreadID())
         if self._flag_scrub_returns is None:
             self._flag_scrub_returns = {}
-        self._flag_scrub_returns[bp.GetID()] = (kind, buf)
+        self._flag_scrub_returns[bp.GetID()] = (kind, buf, oldlenp)
 
-    def _scrub_flag(self, kind: str, buf: int) -> Optional[str]:
+    def _scrub_debugger_name(self, buf: int, oldlenp: int) -> Optional[str]:
+        """Rewrite a debugger process name (p_comm) in a returned kinfo_proc to
+        'launchd'. Scans the buffer rather than trusting a hardcoded p_comm
+        offset, and only touches a name that actually matches a debugger."""
+        err = lldb.SBError()
+        length = self._KINFO_PROC_SIZE
+        if oldlenp:
+            n = self._read_uint(oldlenp, 8)
+            if n:
+                length = min(int(n), 4096)
+        data = self.process.ReadMemory(buf, length, err)
+        if not err.Success() or not data:
+            return None
+        for kw in self._DEBUGGER_NAMES:
+            idx = data.find(kw)
+            if idx >= 0 and idx + 8 <= len(data):
+                self.process.WriteMemory(buf + idx, b"launchd\x00", err)
+                return "scrubbed debugger name '{}' from sysctl(KERN_PROC) result".format(kw.decode())
+        return ""
+
+    def _read_uint(self, addr: int, size: int) -> Optional[int]:
+        err = lldb.SBError()
+        data = self.process.ReadMemory(addr, size, err)
+        if not err.Success() or not data:
+            return None
+        return int.from_bytes(data, "little")
+
+    def _scrub_flag(self, kind: str, buf: int, oldlenp: int = 0) -> Optional[str]:
         err = lldb.SBError()
         if kind == "sysctl":
-            addr = buf + self._KINFO_PROC_PFLAG_OFF
-            data = self.process.ReadMemory(addr, 4, err)
-            if not err.Success() or not data:
-                return None
-            flag = int.from_bytes(data, "little")
-            if not (flag & self._P_TRACED):
-                return ""
-            self.process.WriteMemory(addr, (flag & ~self._P_TRACED).to_bytes(4, "little"), err)
-            return "scrubbed P_TRACED from sysctl(KERN_PROC) result"
+            msgs = []
+            if self._scrub_ptraced:
+                addr = buf + self._KINFO_PROC_PFLAG_OFF
+                data = self.process.ReadMemory(addr, 4, err)
+                if err.Success() and data:
+                    flag = int.from_bytes(data, "little")
+                    if flag & self._P_TRACED:
+                        self.process.WriteMemory(
+                            addr, (flag & ~self._P_TRACED).to_bytes(4, "little"), err)
+                        msgs.append("scrubbed P_TRACED from sysctl(KERN_PROC) result")
+            if self._scrub_parent:
+                m = self._scrub_debugger_name(buf, oldlenp)
+                if m:
+                    msgs.append(m)
+            return "; ".join(msgs)
         if kind == "csops":
             data = self.process.ReadMemory(buf, 4, err)
             if not err.Success() or not data:
@@ -956,9 +1163,9 @@ class Debugger:
             return None
         # Return side: a tagged call has come back.
         if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
-            kind, buf = self._flag_scrub_returns.pop(bp_id)
+            kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
             self.target.BreakpointDelete(bp_id)
-            msg = self._scrub_flag(kind, buf)
+            msg = self._scrub_flag(kind, buf, oldlenp)
             self.process.Continue()
             return msg if msg else ""
         thread = self.process.GetSelectedThread()
@@ -971,18 +1178,19 @@ class Debugger:
             mib = frame.FindRegister("x0").GetValueAsUnsigned()
             namelen = frame.FindRegister("x1").GetValueAsUnsigned()
             oldp = frame.FindRegister("x2").GetValueAsUnsigned()
+            oldlenp = frame.FindRegister("x3").GetValueAsUnsigned()
             if mib and oldp and namelen >= 3:
                 err = lldb.SBError()
                 head = self.process.ReadMemory(mib, 12, err)
                 if err.Success() and head and len(head) == 12:
                     name = [int.from_bytes(head[i:i + 4], "little") for i in (0, 4, 8)]
                     # {CTL_KERN, KERN_PROC, KERN_PROC_PID, ...} is the per-process
-                    # query that carries P_TRACED. Even if we over-matched, the
-                    # scrub only fires when the bit is actually set, so this is
-                    # just to avoid arming a return on unrelated kern.* queries.
+                    # query that carries both P_TRACED and the parent's p_comm.
+                    # Both scrubs only act when their marker is present, so arming
+                    # on every such query (own pid or parent pid) is harmless.
                     if (name[0] == self._CTL_KERN and name[1] == self._KERN_PROC
                             and name[2] == self._KERN_PROC_PID):
-                        self._arm_return_scrub(thread, "sysctl", oldp)
+                        self._arm_return_scrub(thread, "sysctl", oldp, oldlenp)
             self.process.Continue()
             return ""
         if bp_id == self.anti_csops_bp_id:
@@ -994,34 +1202,124 @@ class Debugger:
             return ""
         return None
 
-    # -- mach_absolute_time timing cloak --------------------------------------
-    # A self-timing check reads the monotonic clock before and after a sensitive
+    # -- syscall() wrapper multiplexer ----------------------------------------
+    # ptrace / sysctl / csops issued via the libc syscall() wrapper skip both the
+    # symbol hooks above and the __text svc scan (the svc lives in libsystem).
+    # We hook syscall()/__syscall() itself; the BSD number is in x0 and the real
+    # args are shifted up one register (x0=number, x1=arg0, ...). We dispatch to
+    # the same neutralisations, gated on which defenses are actually on.
+    _SYS_PTRACE = 26
+    _SYS_CSOPS = 169
+    _SYS_SYSCTL = 202
+
+    def _syscall_wanted(self) -> bool:
+        return bool(self.anti_ptrace_bp_id or self._scrub_ptraced
+                    or self._scrub_parent or self.anti_csops_bp_id)
+
+    def _sync_syscall_bp(self) -> None:
+        """Arm the syscall()/__syscall() hook while any ptrace/flag defense is on,
+        release it once none are. Called from each of those enables/disables."""
+        if not self.target or not self.target.IsValid():
+            return
+        want = self._syscall_wanted()
+        if want and not self.syscall_bp_ids:
+            ids = []
+            for sym in ("syscall", "__syscall"):
+                bp = self.target.BreakpointCreateByName(sym, "libsystem_kernel.dylib")
+                if not bp.IsValid() or bp.GetNumLocations() == 0:
+                    bp = self.target.BreakpointCreateByName(sym)
+                if bp.IsValid() and bp.GetNumLocations() > 0:
+                    ids.append(bp.GetID())
+            self.syscall_bp_ids = ids or None
+        elif not want and self.syscall_bp_ids:
+            for bp_id in self.syscall_bp_ids:
+                self.target.BreakpointDelete(bp_id)
+            self.syscall_bp_ids = None
+
+    def _syscall_args(self, frame, n: int) -> List[int]:
+        """The first n arguments of a libc syscall() call. syscall(int, ...) is
+        variadic, and on arm64 Darwin variadic args are passed on the stack, so
+        arg i is *(uint64*)(sp + 8*i) -- not in x1.., which hold stale values."""
+        sp = frame.FindRegister("sp").GetValueAsUnsigned()
+        return [self._read_uint(sp + 8 * i, 8) or 0 for i in range(n)]
+
+    def handle_syscall_hit(self, bp_id: int) -> Optional[str]:
+        """A syscall()/__syscall() call: neutralise ptrace-deny / sysctl-P_TRACED
+        / csops-CS_DEBUGGED issued this way. Always resumes (returns "" for the
+        ones we let pass), so we never stop on an unrelated syscall()."""
+        if not self.syscall_bp_ids or bp_id not in self.syscall_bp_ids or not self.process:
+            return None
+        thread = self.process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return None
+        num = frame.FindRegister("x0").GetValueAsUnsigned()
+        if num == self._SYS_PTRACE and self.anti_ptrace_bp_id:
+            if self._syscall_args(frame, 1)[0] == 31:  # PT_DENY_ATTACH
+                ret = lldb.SBCommandReturnObject()
+                self.ci.HandleCommand("thread return 0", ret, False)
+                self.process.Continue()
+                return "blocked ptrace(PT_DENY_ATTACH) via syscall()"
+        elif num == self._SYS_SYSCTL and (self._scrub_ptraced or self._scrub_parent):
+            mib, namelen, oldp, oldlenp = self._syscall_args(frame, 4)
+            if mib and oldp and namelen >= 3:
+                err = lldb.SBError()
+                head = self.process.ReadMemory(mib, 12, err)
+                if err.Success() and head and len(head) == 12:
+                    name = [int.from_bytes(head[i:i + 4], "little") for i in (0, 4, 8)]
+                    if (name[0] == self._CTL_KERN and name[1] == self._KERN_PROC
+                            and name[2] == self._KERN_PROC_PID):
+                        self._arm_return_scrub(thread, "sysctl", oldp, oldlenp)
+        elif num == self._SYS_CSOPS and self.anti_csops_bp_id:
+            _pid, ops, useraddr = self._syscall_args(frame, 3)
+            if useraddr and ops == self._CS_OPS_STATUS:
+                self._arm_return_scrub(thread, "csops", useraddr)
+        self.process.Continue()
+        return ""
+
+    # -- timing cloak ---------------------------------------------------------
+    # A self-timing check reads a monotonic clock before and after a sensitive
     # call; a debugger that hooks that call adds milliseconds the check catches.
-    # We feed mach_absolute_time() a fake clock that advances a small fixed step
-    # per call, so any measured delta stays tiny no matter how long we were
-    # really stopped. Scoped to libsystem_kernel.dylib so dyld's private copy
-    # (used before our first stop anyway) is left alone.
+    # We feed the common monotonic clock sources a fake clock that advances a
+    # small fixed step per call, so any measured delta stays tiny no matter how
+    # long we were really stopped. Each returns a uint64 in x0, so one thread
+    # return covers them all. Scoped to libsystem_kernel.dylib. Limits: a direct
+    # `mrs x0, cntvct_el0` read can't be hooked, wall-clock `gettimeofday`
+    # returns a struct we don't fake, and the constant step is a uniform-clock
+    # fingerprint a sophisticated check could notice -- this hides latency from
+    # ordinary threshold checks, it is not a perfect clock emulation. (A
+    # real-clock-minus-paused-time version was tried and dropped: LLDB's async
+    # event delivery leaves ~ms of stopped time unaccounted, so it hid latency
+    # worse than this constant-step clock does.)
+    _TIMING_SYMBOLS = ("mach_absolute_time", "mach_continuous_time",
+                       "clock_gettime_nsec_np")
 
     def enable_anti_timing(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
             return False, "no target"
-        if self.anti_timing_bp_id:
+        if self.anti_timing_bp_ids:
             return True, "already enabled"
-        bp = self.target.BreakpointCreateByName("mach_absolute_time",
-                                                "libsystem_kernel.dylib")
-        if not bp.IsValid() or bp.GetNumLocations() == 0:
-            bp = self.target.BreakpointCreateByName("mach_absolute_time")
-        if not bp.IsValid():
-            return False, "mach_absolute_time symbol not found"
-        self.anti_timing_bp_id = bp.GetID()
+        ids = []
+        for sym in self._TIMING_SYMBOLS:
+            bp = self.target.BreakpointCreateByName(sym, "libsystem_kernel.dylib")
+            if not bp.IsValid() or bp.GetNumLocations() == 0:
+                bp = self.target.BreakpointCreateByName(sym)
+            if bp.IsValid() and bp.GetNumLocations() > 0:
+                ids.append(bp.GetID())
+        if not ids:
+            return False, "no monotonic clock symbols found"
+        self.anti_timing_bp_ids = ids
         self._anti_timing_logged = False
-        return True, "timing cloak armed: mach_absolute_time fake clock (bp #{})".format(bp.GetID())
+        return True, "timing cloak armed: fake clock for {} source(s)".format(len(ids))
 
     def disable_anti_timing(self) -> Tuple[bool, str]:
-        if not self.target or not self.anti_timing_bp_id:
+        if not self.target or not self.anti_timing_bp_ids:
             return True, "already disabled"
-        self.target.BreakpointDelete(self.anti_timing_bp_id)
-        self.anti_timing_bp_id = 0
+        for bp_id in self.anti_timing_bp_ids:
+            self.target.BreakpointDelete(bp_id)
+        self.anti_timing_bp_ids = None
         return True, "timing cloak disabled"
 
     def _advance_fake_clock(self) -> int:
@@ -1029,9 +1327,12 @@ class Debugger:
         return self._fake_clock
 
     def handle_anti_timing_hit(self, bp_id: int) -> Optional[str]:
-        """mach_absolute_time() called: return the next fake-clock value instead
-        of the real one, so timing checks can't see our stop/continue latency."""
-        if bp_id != self.anti_timing_bp_id or not self.process:
+        """A monotonic clock source was called: return the next fake-clock value
+        instead of the real one, so timing checks can't see our stop/continue
+        latency. All the hooked sources return a uint64 in x0."""
+        if not self.anti_timing_bp_ids or bp_id not in self.anti_timing_bp_ids:
+            return None
+        if not self.process:
             return None
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("thread return {}".format(self._advance_fake_clock()),
@@ -1039,8 +1340,8 @@ class Debugger:
         self.process.Continue()
         if not self._anti_timing_logged:
             self._anti_timing_logged = True
-            return "timing cloak: feeding mach_absolute_time() a fake monotonic clock"
-        return ""  # silent thereafter; this fires on every call
+            return "timing cloak: feeding monotonic clock sources a fake clock"
+        return ""
 
     def enable_direct_syscall_scan(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():

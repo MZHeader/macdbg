@@ -1,0 +1,19 @@
+---
+triple:          'x86_64-apple-darwin'
+binary-path:     'build/lib.macosx-10.13-universal2-cpython-313/PyObjCTest/exceptions.cpython-313-darwin.so'
+relocations:
+  - { offset: 0x27, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseSimple]', symObjAddr: 0x0, symBinAddr: 0x990, symSize: 0x30 }
+  - { offset: 0x4E, size: 0x8, addend: 0x0, symName: _mod_module, symObjAddr: 0x9E0, symBinAddr: 0x23B0, symSize: 0x0 }
+  - { offset: 0xD75, size: 0x8, addend: 0x0, symName: _mod_methods, symObjAddr: 0x5030, symBinAddr: 0x2470, symSize: 0x0 }
+  - { offset: 0xD96, size: 0x8, addend: 0x0, symName: _mod_slots, symObjAddr: 0xA50, symBinAddr: 0x2420, symSize: 0x0 }
+  - { offset: 0xDB7, size: 0x8, addend: 0x0, symName: _PyObjC_API, symObjAddr: 0x5050, symBinAddr: 0x2490, symSize: 0x0 }
+  - { offset: 0x12ED, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseSimple]', symObjAddr: 0x0, symBinAddr: 0x990, symSize: 0x30 }
+  - { offset: 0x1324, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseWithString:]', symObjAddr: 0x30, symBinAddr: 0x9C0, symSize: 0x30 }
+  - { offset: 0x1377, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseSimpleWithInfo]', symObjAddr: 0x60, symBinAddr: 0x9F0, symSize: 0x90 }
+  - { offset: 0x1410, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseUnicodeName]', symObjAddr: 0xF0, symBinAddr: 0xA80, symSize: 0x70 }
+  - { offset: 0x147F, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseUnicodeReason]', symObjAddr: 0x160, symBinAddr: 0xAF0, symSize: 0x70 }
+  - { offset: 0x14EE, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseUnicodeWithInfo]', symObjAddr: 0x1D0, symBinAddr: 0xB60, symSize: 0x190 }
+  - { offset: 0x170B, size: 0x8, addend: 0x0, symName: '-[PyObjCTestExceptions raiseAString]', symObjAddr: 0x360, symBinAddr: 0xCF0, symSize: 0x10 }
+  - { offset: 0x1737, size: 0x8, addend: 0x0, symName: _PyInit_exceptions, symObjAddr: 0x370, symBinAddr: 0xD00, symSize: 0x20 }
+  - { offset: 0x17C5, size: 0x8, addend: 0x0, symName: _mod_exec_module, symObjAddr: 0x390, symBinAddr: 0xD20, symSize: 0xBD }
+...

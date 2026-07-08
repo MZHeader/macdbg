@@ -149,8 +149,8 @@ Strings:
   Default `budget_bytes` is 512 MiB.
 
 Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
-`anti_csops`, `anti_timing`, `anti_mach_ports`, `direct_syscall`,
-`fork_identity`, `exec_sandbox`):
+`anti_csops`, `anti_timing`, `anti_parent`, `anti_sigtrap`,
+`anti_mach_ports`, `direct_syscall`, `fork_identity`, `exec_sandbox`):
 - `defense_enable {"name": "…"}` / `defense_disable {"name": "…"}`.
 - `anti_sysctl` clears `P_TRACED` from `sysctl(KERN_PROC)` results and
   `anti_csops` clears `CS_DEBUGGED` from `csops(CS_OPS_STATUS)` results --
@@ -164,6 +164,29 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   single-stepping. Pair it with `anti_sysctl`/`anti_csops`. It intercepts
   *every* `mach_absolute_time` call, so it slows timing-heavy targets --
   leave it off unless a timing check needs it.
+- `anti_timing` covers `mach_absolute_time`, `mach_continuous_time`, and
+  `clock_gettime_nsec_np`. It cannot cover a direct `mrs cntvct_el0`
+  register read or wall-clock `gettimeofday`.
+- `anti_parent` scrubs a debugger `p_comm` (`debugserver`/`lldb`/`gdb`) to
+  `launchd` in `sysctl(KERN_PROC)` results, defeating a parent-name check
+  whether it used `getppid` or read `e_ppid` from its own `kinfo_proc`. It
+  does not hook `getppid`, so legitimate callers get the real value. Shares
+  the sysctl breakpoint with `anti_sysctl`.
+- `anti_sigtrap` forwards a self-planted `brk #0` (EXC_BREAKPOINT that is
+  not one of your breakpoints) to the target's own SIGTRAP handler, the way
+  the kernel would with no debugger. Defeats self-trap checks that install a
+  SIGTRAP handler and execute `brk #0` to see whether the handler runs. It
+  reads the handler via an in-process `sigaction` call, so it needs a live
+  process; off by default. Limits: it only handles `brk`/SIGTRAP (not SIGILL
+  `udf` or Mach-exception-port self-handlers), and delivers the signal
+  without a real `siginfo`/`ucontext`, so a handler that inspects those
+  won't see valid values.
+- ptrace / sysctl-P_TRACED / csops-CS_DEBUGGED issued through the libc
+  `syscall()` wrapper (e.g. `syscall(SYS_ptrace, PT_DENY_ATTACH, …)`) are
+  neutralised automatically whenever the corresponding symbol defense is on
+  -- no separate toggle. Not covered: the raw syscall from an inline `svc`
+  in the sample's own code (only ptrace is svc-scanned), or the self-attach
+  ptrace trick.
 - All defenses now apply whether you `continue` past the checked call or
   single-step *through* it; stepping no longer bypasses a defense.
 

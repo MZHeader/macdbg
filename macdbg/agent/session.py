@@ -69,6 +69,8 @@ _DEFENSES = {
     "anti_sysctl": ("enable_anti_sysctl", "disable_anti_sysctl"),
     "anti_csops": ("enable_anti_csops", "disable_anti_csops"),
     "anti_timing": ("enable_anti_timing", "disable_anti_timing"),
+    "anti_parent": ("enable_anti_parent", "disable_anti_parent"),
+    "anti_sigtrap": ("enable_anti_sigtrap", "disable_anti_sigtrap"),
     "anti_mach_ports": ("enable_anti_mach_ports", "disable_anti_mach_ports"),
     "direct_syscall": ("enable_direct_syscall_scan", "disable_direct_syscall_scan"),
     "fork_identity": ("enable_fork_identity", "disable_fork_identity"),
@@ -874,6 +876,12 @@ class AgentSession:
         thread = process.GetSelectedThread()
         if not thread or not thread.IsValid():
             return False
+        # A self-trap (brk #0) surfaces as an exception, not a breakpoint, so
+        # check it before the breakpoint-only path below.
+        trap_msg = self.dbg.handle_self_trap(thread)
+        if trap_msg is not None:
+            self._log("[anti-debug] " + trap_msg)
+            return True
         if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
             return False
         bp_ids = self._stop_bp_ids(thread)
@@ -881,6 +889,7 @@ class AgentSession:
             return False
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_flag_scrub_hit,
+                        self.dbg.handle_syscall_hit,
                         self.dbg.handle_anti_timing_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
@@ -965,8 +974,10 @@ class AgentSession:
             ids.add(self.dbg.anti_sysctl_bp_id)
         if self.dbg.anti_csops_bp_id:
             ids.add(self.dbg.anti_csops_bp_id)
-        if self.dbg.anti_timing_bp_id:
-            ids.add(self.dbg.anti_timing_bp_id)
+        if self.dbg.anti_timing_bp_ids:
+            ids.update(self.dbg.anti_timing_bp_ids)
+        if self.dbg.syscall_bp_ids:
+            ids.update(self.dbg.syscall_bp_ids)
         if self.dbg._flag_scrub_returns:
             ids.update(self.dbg._flag_scrub_returns.keys())
         if self.dbg.anti_mach_bp_id:

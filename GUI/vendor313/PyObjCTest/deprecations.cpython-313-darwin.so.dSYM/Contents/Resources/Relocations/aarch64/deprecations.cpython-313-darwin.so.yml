@@ -1,0 +1,46 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     'build/lib.macosx-10.13-universal2-cpython-313/PyObjCTest/deprecations.cpython-313-darwin.so'
+relocations:
+  - { offset: 0x27, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method1]', symObjAddr: 0x0, symBinAddr: 0xA40, symSize: 0x8 }
+  - { offset: 0x4E, size: 0x8, addend: 0x0, symName: _mod_module, symObjAddr: 0x658, symBinAddr: 0x81C8, symSize: 0x0 }
+  - { offset: 0xD75, size: 0x8, addend: 0x0, symName: _mod_methods, symObjAddr: 0x5878, symBinAddr: 0x8338, symSize: 0x0 }
+  - { offset: 0xD96, size: 0x8, addend: 0x0, symName: _mod_slots, symObjAddr: 0x6C0, symBinAddr: 0x8230, symSize: 0x0 }
+  - { offset: 0xDB7, size: 0x8, addend: 0x0, symName: _PyObjC_API, symObjAddr: 0x5898, symBinAddr: 0x8358, symSize: 0x0 }
+  - { offset: 0x12E2, size: 0x8, addend: 0x0, symName: _gFunctionMap, symObjAddr: 0x700, symBinAddr: 0x8270, symSize: 0x0 }
+  - { offset: 0x1333, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method1]', symObjAddr: 0x0, symBinAddr: 0xA40, symSize: 0x8 }
+  - { offset: 0x1363, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method2]', symObjAddr: 0x8, symBinAddr: 0xA48, symSize: 0x8 }
+  - { offset: 0x1393, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method3]', symObjAddr: 0x10, symBinAddr: 0xA50, symSize: 0x8 }
+  - { offset: 0x13C3, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method4]', symObjAddr: 0x18, symBinAddr: 0xA58, symSize: 0x8 }
+  - { offset: 0x13F3, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method5]', symObjAddr: 0x20, symBinAddr: 0xA60, symSize: 0x8 }
+  - { offset: 0x1423, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method6]', symObjAddr: 0x28, symBinAddr: 0xA68, symSize: 0x8 }
+  - { offset: 0x1453, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method7]', symObjAddr: 0x30, symBinAddr: 0xA70, symSize: 0x8 }
+  - { offset: 0x1483, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method8]', symObjAddr: 0x38, symBinAddr: 0xA78, symSize: 0x8 }
+  - { offset: 0x14B3, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method9]', symObjAddr: 0x40, symBinAddr: 0xA80, symSize: 0x8 }
+  - { offset: 0x14E3, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method10]', symObjAddr: 0x48, symBinAddr: 0xA88, symSize: 0x8 }
+  - { offset: 0x1513, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method11]', symObjAddr: 0x50, symBinAddr: 0xA90, symSize: 0x8 }
+  - { offset: 0x1543, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method1:]', symObjAddr: 0x58, symBinAddr: 0xA98, symSize: 0xC }
+  - { offset: 0x1580, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method2:]', symObjAddr: 0x64, symBinAddr: 0xAA4, symSize: 0xC }
+  - { offset: 0x15BD, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method3:]', symObjAddr: 0x70, symBinAddr: 0xAB0, symSize: 0xC }
+  - { offset: 0x15FA, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method4:]', symObjAddr: 0x7C, symBinAddr: 0xABC, symSize: 0xC }
+  - { offset: 0x1637, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method5:]', symObjAddr: 0x88, symBinAddr: 0xAC8, symSize: 0xC }
+  - { offset: 0x1674, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method6:]', symObjAddr: 0x94, symBinAddr: 0xAD4, symSize: 0xC }
+  - { offset: 0x16B1, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method7:]', symObjAddr: 0xA0, symBinAddr: 0xAE0, symSize: 0xC }
+  - { offset: 0x16EE, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method8:]', symObjAddr: 0xAC, symBinAddr: 0xAEC, symSize: 0xC }
+  - { offset: 0x172B, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method9:]', symObjAddr: 0xB8, symBinAddr: 0xAF8, symSize: 0xC }
+  - { offset: 0x1768, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method10:]', symObjAddr: 0xC4, symBinAddr: 0xB04, symSize: 0xC }
+  - { offset: 0x17A5, size: 0x8, addend: 0x0, symName: '-[OCTestDeprecations method11:]', symObjAddr: 0xD0, symBinAddr: 0xB10, symSize: 0xC }
+  - { offset: 0x17E2, size: 0x8, addend: 0x0, symName: _PyInit_deprecations, symObjAddr: 0xDC, symBinAddr: 0xB1C, symSize: 0xC }
+  - { offset: 0x1871, size: 0x8, addend: 0x0, symName: _mod_exec_module, symObjAddr: 0xE8, symBinAddr: 0xB28, symSize: 0x134 }
+  - { offset: 0x19CE, size: 0x8, addend: 0x0, symName: _func1, symObjAddr: 0x21C, symBinAddr: 0xC5C, symSize: 0x8 }
+  - { offset: 0x19E7, size: 0x8, addend: 0x0, symName: _func2, symObjAddr: 0x224, symBinAddr: 0xC64, symSize: 0x8 }
+  - { offset: 0x1A00, size: 0x8, addend: 0x0, symName: _func3, symObjAddr: 0x22C, symBinAddr: 0xC6C, symSize: 0x8 }
+  - { offset: 0x1A19, size: 0x8, addend: 0x0, symName: _func4, symObjAddr: 0x234, symBinAddr: 0xC74, symSize: 0x8 }
+  - { offset: 0x1A32, size: 0x8, addend: 0x0, symName: _func5, symObjAddr: 0x23C, symBinAddr: 0xC7C, symSize: 0x8 }
+  - { offset: 0x1A4B, size: 0x8, addend: 0x0, symName: _func6, symObjAddr: 0x244, symBinAddr: 0xC84, symSize: 0x8 }
+  - { offset: 0x1A64, size: 0x8, addend: 0x0, symName: _func7, symObjAddr: 0x24C, symBinAddr: 0xC8C, symSize: 0x8 }
+  - { offset: 0x1A7D, size: 0x8, addend: 0x0, symName: _func8, symObjAddr: 0x254, symBinAddr: 0xC94, symSize: 0x8 }
+  - { offset: 0x1A96, size: 0x8, addend: 0x0, symName: _func9, symObjAddr: 0x25C, symBinAddr: 0xC9C, symSize: 0x8 }
+  - { offset: 0x1AAF, size: 0x8, addend: 0x0, symName: _func10, symObjAddr: 0x264, symBinAddr: 0xCA4, symSize: 0x8 }
+  - { offset: 0x1AC8, size: 0x8, addend: 0x0, symName: _func11, symObjAddr: 0x26C, symBinAddr: 0xCAC, symSize: 0x8 }
+...

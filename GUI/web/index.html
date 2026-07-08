@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>macdbg — x64 Debugger</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Toolbar (the native window supplies the menu bar) -->
+    <div class="toolbar">
+      <button class="tb" data-act="open" title="Open target (F3)"><svg viewBox="0 0 24 24"><path d="M4 5h6l2 2h8v11H4z"/></svg></button>
+      <button class="tb" data-act="attach" title="Attach to process"><svg viewBox="0 0 24 24"><path d="M13 3a4 4 0 0 0-4 4v6a2 2 0 0 0 4 0V7h2v6a4 4 0 0 1-8 0V7a6 6 0 0 1 12 0v8h-2V7a4 4 0 0 0-4-4z"/></svg></button>
+      <span class="tb-sep"></span>
+      <button class="tb" data-act="restart" title="Restart (⌘R)"><svg viewBox="0 0 24 24"><path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg></button>
+      <button class="tb tb-run" data-act="cont" title="Continue (F9)"><svg viewBox="0 0 24 24"><path d="M7 5v14l11-7z"/></svg></button>
+      <button class="tb tb-pause" data-act="interrupt" title="Break / interrupt (⌘B)"><svg viewBox="0 0 24 24"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg></button>
+      <button class="tb tb-stop" data-act="stop" title="Kill process"><svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg></button>
+      <span class="tb-sep"></span>
+      <button class="tb tb-step" data-act="step_in" title="Step into (F7)"><svg viewBox="0 0 24 24"><path d="M12 4v9m0 0l-4-4m4 4l4-4M6 19h12" fill="none" stroke="currentColor" stroke-width="2"/></svg><em>into</em></button>
+      <button class="tb tb-step" data-act="step_over" title="Step over (F8)"><svg viewBox="0 0 24 24"><path d="M6 8a6 5 0 0 1 12 0v3m0 0l-3-3m3 3l3-3M12 15v4" fill="none" stroke="currentColor" stroke-width="2"/></svg><em>over</em></button>
+      <button class="tb tb-step" data-act="step_out" title="Step out (F6)"><svg viewBox="0 0 24 24"><path d="M12 20v-9m0 0l-4 4m4-4l4 4M6 5h12" fill="none" stroke="currentColor" stroke-width="2"/></svg><em>out</em></button>
+      <span class="tb-sep"></span>
+      <button class="tb" data-act="toggle_bp" title="Toggle breakpoint at the selected line / PC (F2)"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="6"/></svg></button>
+      <button class="tb" data-act="snap_pc" title="Snap disassembly to PC (F5)"><svg viewBox="0 0 24 24"><path d="M12 4l4 6h-3v6h-2v-6H8z"/></svg></button>
+      <span class="tb-sep"></span>
+      <div class="tb-search">
+        <svg viewBox="0 0 24 24"><path d="M10 4a6 6 0 1 0 3.5 10.9l4.3 4.3 1.4-1.4-4.3-4.3A6 6 0 0 0 10 4z"/></svg>
+        <input id="goto" placeholder="Go to address / symbol / expression…  (⌘G)" spellcheck="false" autocomplete="off" />
+      </div>
+      <span class="tb-sep"></span>
+      <button class="tb tb-wide" data-act="defenses" title="Defenses menu (⌘D)"><svg viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.4 8.5-8 11-4.6-2.5-8-6-8-11V5z"/></svg><em>Defenses</em></button>
+      <button class="tb tb-wide" id="tb-tracer" data-act="trace_toggle" title="Toggle tracer (⌘T)"><svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4" fill="none" stroke="currentColor" stroke-width="2"/></svg><em>Tracer <b id="tracer-state">off</b></em></button>
+      <button class="tb" id="tb-scope" data-act="trace_scope" title="Cycle trace scope (⌘Y)"><em class="mono" id="scope-label">balanced</em></button>
+      <span class="tb-sep"></span>
+      <div class="tb-target" title="current target">
+        <span class="mono" id="menu-target">—</span>
+        <span id="state-pill" class="pill pill-none">No process</span>
+      </div>
+    </div>
+
+    <!-- Resizable workspace -->
+    <div id="main">
+      <!-- Top row: disassembly | registers + memory tabs -->
+      <div id="top">
+        <section class="panel panel-disasm col-left" data-pane="disasm">
+          <header class="panel-head">
+            <span class="dot"></span> Disassembly
+            <span class="head-sub mono" id="disasm-status"></span>
+          </header>
+          <div class="disasm scroll" id="disasm" tabindex="0"></div>
+        </section>
+
+        <div class="splitter split-v" title="drag to resize"></div>
+
+        <aside class="col-right">
+          <section class="panel panel-regs" data-pane="regs">
+            <header class="panel-head"><span class="dot"></span> Registers</header>
+            <div class="regs scroll" id="regs"></div>
+            <div class="flags" id="flags"></div>
+          </section>
+
+          <div class="splitter split-h" title="drag to resize"></div>
+
+          <section class="panel panel-mem">
+            <div class="tabstrip" id="mem-tabs">
+              <div class="tab active" data-memtab="memory">Memory</div>
+              <div class="tab" data-memtab="stack">Stack</div>
+              <div class="tab" data-memtab="watch1">Watch 1</div>
+              <div class="tab" data-memtab="watch2">Watch 2</div>
+              <div class="tab" data-memtab="watch3">Watch 3</div>
+            </div>
+            <div class="mem-addrbar" id="mem-addrbar">
+              <span class="mono dim">follow</span>
+              <input id="mem-addr" class="mono" placeholder="address / expression" spellcheck="false" autocomplete="off" />
+              <span class="mono head-sub" id="mem-follow-info"></span>
+            </div>
+            <div class="hexview scroll" id="memory" data-pane="memory"></div>
+            <div class="hexview scroll hidden" id="stack" data-pane="stack"></div>
+            <div class="hexview scroll hidden" id="watch1" data-pane="watch1" data-slot="1"></div>
+            <div class="hexview scroll hidden" id="watch2" data-pane="watch2" data-slot="2"></div>
+            <div class="hexview scroll hidden" id="watch3" data-pane="watch3" data-slot="3"></div>
+          </section>
+        </aside>
+      </div>
+
+      <div class="splitter split-h" id="split-main" title="drag to resize"></div>
+
+      <!-- Bottom row: tab group | console -->
+      <div id="bot">
+        <section class="panel panel-tabs">
+          <div class="tabstrip" id="bot-tabs">
+            <div class="tab active" data-bottab="breakpoints">Breakpoints</div>
+            <div class="tab" data-bottab="callstack">Call Stack</div>
+            <div class="tab" data-bottab="threads">Threads</div>
+            <div class="tab" data-bottab="modules">Modules</div>
+            <div class="tab" data-bottab="strings">Strings</div>
+            <div class="tab" data-bottab="patches">Patches</div>
+            <div class="tab" data-bottab="trace">Trace <span class="badge" id="trace-badge">0</span></div>
+          </div>
+          <div class="tabbody">
+            <div class="table-wrap scroll" id="tb-breakpoints" data-pane="breakpoints"><table class="grid" id="bp-table"></table></div>
+            <div class="table-wrap scroll hidden" id="tb-callstack" data-pane="callstack"><table class="grid" id="cs-table"></table></div>
+            <div class="table-wrap scroll hidden" id="tb-threads" data-pane="threads"><table class="grid" id="th-table"></table></div>
+            <div class="table-wrap scroll hidden" id="tb-modules" data-pane="modules"><table class="grid" id="mod-table"></table></div>
+            <div class="table-wrap scroll hidden" id="tb-strings" data-pane="strings"><table class="grid" id="str-table"></table></div>
+            <div class="table-wrap scroll hidden" id="tb-patches" data-pane="patches"><table class="grid" id="patch-table"></table></div>
+            <div class="trace-wrap hidden" id="tb-trace" data-pane="trace">
+              <div class="trace-toolbar">
+                <span class="mono head-sub" id="trace-info">tracer off</span>
+                <span class="tt-spacer"></span>
+                <label class="tt-filter" data-cat="FILE"><input type="checkbox" checked> <b class="cat-FILE">FILE</b></label>
+                <label class="tt-filter" data-cat="NET"><input type="checkbox" checked> <b class="cat-NET">NET</b></label>
+                <label class="tt-filter" data-cat="PROC"><input type="checkbox" checked> <b class="cat-PROC">PROC</b></label>
+                <button class="mini" data-act="trace_clear">Clear</button>
+              </div>
+              <div class="table-wrap scroll" id="trace-scroll"><table class="grid" id="trace-table"></table></div>
+            </div>
+          </div>
+        </section>
+
+        <div class="splitter split-v" title="drag to resize"></div>
+
+        <section class="panel panel-console" data-pane="console">
+          <header class="panel-head"><span class="dot"></span> Console <span class="head-sub">lldb command interpreter</span></header>
+          <div class="console-log scroll" id="console"></div>
+          <div class="console-input">
+            <span class="cmd-prompt mono">lldb&gt;</span>
+            <input id="cmd" class="mono" placeholder="lldb command — ↑/↓ history · Tab complete · ⌘P palette" spellcheck="false" autocomplete="off" />
+            <div class="completions hidden" id="completions"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- Priority keyboard-shortcut bar (x64dbg / Textual style) -->
+    <div class="keybar" id="keybar"></div>
+
+    <!-- Status bar -->
+    <div class="statusbar">
+      <div class="st st-state"><span class="st-dot"></span><span id="st-msg">starting…</span></div>
+      <div class="st-spacer"></div>
+      <div class="st mono" id="st-addr"></div>
+      <div class="st mono" id="st-triple"></div>
+      <div class="st mono" id="st-time">00:00:00</div>
+    </div>
+
+    <!-- Context menu + modal host (populated by app.js) -->
+    <div id="ctxmenu" class="ctxmenu hidden"></div>
+    <div id="modal-backdrop" class="modal-backdrop hidden"></div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
