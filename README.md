@@ -20,13 +20,13 @@ Reverse engineers and malware analysts debugging macOS binaries who aren't very 
 git clone https://github.com/MZHeader/macdbg
 ```
 
-Then double-click **`macdbg.app`** — that's the whole install. Pick a binary from **File → Open**, or launch straight into one:
+Then double-click **`macdbg.app`**. Pick a binary from **File > Open**, or launch straight into one:
 
 ```sh
 open macdbg.app --args /path/to/your/binary
 ```
 
-Prefer a terminal? `GUI/run.sh /path/to/your/binary` is the CLI equivalent — it's the same launcher the app runs for you.
+Prefer a terminal? `GUI/run.sh /path/to/your/binary` is the CLI equivalent - it's the same launcher the app runs for you.
 
 ### Air-gapped machines
 
