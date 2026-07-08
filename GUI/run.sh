@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Launcher for the macdbg GUI.
 #
-# Prefers a native window (pywebview). Vendored deps in vendor313 make that work
-# with no pip install (offline / air-gapped VMs). Falls back to the browser UI.
+# Prefers a native window (pywebview); install it with `pip install pywebview`.
+# Falls back to a chromeless browser window when pywebview isn't available.
 #
 # Two macOS-launch quirks are handled here so double-clicking works like a
 # terminal launch:
@@ -14,7 +14,6 @@
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/.." && pwd)"
-VENDOR="$DIR/vendor313"
 
 if sysctl -n hw.optional.arm64 2>/dev/null | grep -q 1; then NATIVE=arm64; else NATIVE=x86_64; fi
 
@@ -31,24 +30,25 @@ CANDIDATES=(
     "/opt/homebrew/bin/python3"
     "/usr/local/bin/python3"
 )
-# -S + a clean PYTHONPATH make the front-end use ONLY the vendored deps and
-# ignore any user/system site-packages. A duplicate pyobjc in the user's
-# site-packages otherwise gets mixed with the vendored one and fails to import
-# ("cannot import _objc / circular import") when launched from Finder.
-# The vendored pyobjc is built for CPython 3.13, so the interpreter must be able
-# to actually load it — test `import objc`, not just `import webview` (pywebview
-# is pure Python and imports fine even under the system 3.9, which then can't
-# load the 3.13 pyobjc .so). Finder's minimal PATH makes `python3` resolve to
-# 3.9, so this check is what steers us to a compatible 3.13.
+# Use the first interpreter that can import pywebview. Test `import objc` (not
+# just webview): pywebview is pure Python and imports even where its pyobjc
+# backend can't run, and pyobjc's native extensions are built per CPython minor
+# version — so this picks a Python whose installed pywebview/pyobjc match it.
 for c in "${CANDIDATES[@]}"; do
     [ -n "$c" ] && [ -x "$c" ] || continue
-    if PYTHONPATH="$VENDOR" PYTHONNOUSERSITE=1 "$c" -S -c "import objc, webview" >/dev/null 2>&1; then
-        export PYTHONPATH="$VENDOR"
-        export PYTHONNOUSERSITE=1
-        exec /usr/bin/arch -"$NATIVE" "$c" -S "$DIR/gui.py" "$@"
+    if "$c" -c "import objc, webview" >/dev/null 2>&1; then
+        exec /usr/bin/arch -"$NATIVE" "$c" "$DIR/gui.py" "$@"
     fi
 done
 
-# Fallback: browser UI under system python (needs lldb bindings).
+# Fallback: no pywebview -> browser UI under system python (needs lldb bindings).
+# Nudge the user toward the nicer native window. This self-limits: once pywebview
+# is installed we take the native path above and never reach here. Backgrounded
+# so the dialog doesn't hold up the launch.
+osascript -e 'display dialog "macdbg is running in a browser window.
+
+For the full native app — its own window, menu bar, and dock icon — install pywebview, then relaunch:
+
+    python3 -m pip install pywebview" buttons {"OK"} default button "OK" with title "macdbg" with icon note' >/dev/null 2>&1 &
 export PYTHONPATH="$(/usr/bin/lldb -P):$REPO${PYTHONPATH:+:$PYTHONPATH}"
 exec /usr/bin/arch -"$NATIVE" /usr/bin/python3 "$DIR/main.py" "$@"
