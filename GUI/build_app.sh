@@ -35,19 +35,22 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Launcher delegates to run.sh. The repo path is resolved from the bundle's own
-# location at runtime (not baked in) so nothing about the build user is embedded
-# in the bundle. Keep macdbg.app at the repo root for this to resolve. All output
-# is appended to ~/.macdbg/launch.log so a failed launch leaves a trace.
-cat > "$CONTENTS/MacOS/macdbg" <<'LAUNCH'
-#!/bin/bash
-HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
-mkdir -p "$HOME/.macdbg" 2>/dev/null
-exec >> "$HOME/.macdbg/launch.log" 2>&1
-echo "=== launch $(date '+%F %T') uname=$(uname -m) ==="
-exec "$REPO/GUI/run.sh" "$@"
-LAUNCH
+# The bundle executable is a NATIVE arm64 launcher, not a shell script: macOS
+# launches script-based .app bundles under Rosetta/x86_64 by default on Apple
+# Silicon, so a script here makes a double-click demand Rosetta (LaunchServices
+# error -10669) even though macdbg is arm64-only. A native Mach-O is launched
+# arm64 directly. It resolves the repo from its own path and execs GUI/run.sh
+# (see GUI/launcher.c). Keep macdbg.app at the repo root for that to resolve.
+# Compile + ad-hoc sign the Mach-O OUTSIDE the bundle, then move it in. An arm64
+# binary needs an ad-hoc signature to run at all (AMFI); signing it as a bare
+# file (not via its in-bundle path) signs only the executable and leaves the
+# *bundle* unsigned. That matters: a real ad-hoc *bundle* signature makes
+# Gatekeeper reject a quarantined double-click, whereas an unsigned, un-
+# quarantined local app is allowed to run.
+LAUNCHER_BIN="$(mktemp -t macdbg-launcher)"
+clang -arch arm64 -O2 -Wall -o "$LAUNCHER_BIN" "$DIR/launcher.c"
+codesign --force --sign - "$LAUNCHER_BIN" >/dev/null 2>&1 || true
+mv "$LAUNCHER_BIN" "$CONTENTS/MacOS/macdbg"
 chmod +x "$CONTENTS/MacOS/macdbg"
 
 # App icon (generated, ships in the repo as GUI/macdbg.icns).
@@ -55,11 +58,9 @@ if [ -f "$DIR/macdbg.icns" ]; then
     cp "$DIR/macdbg.icns" "$CONTENTS/Resources/macdbg.icns"
 fi
 
-# Deliberately NOT code-signed: an ad-hoc signature makes Gatekeeper (spctl)
-# *reject* the bundle on Finder double-click (bounce + vanish), whereas an
-# unsigned, locally-built app is allowed to run. Strip any stale signature and
-# the quarantine flag so a rebuilt bundle launches cleanly from Finder.
-codesign --remove-signature "$APP" >/dev/null 2>&1 || true
+# The launcher is ad-hoc signed above and the bundle is intentionally left
+# unsigned. Strip the quarantine flag so a freshly built bundle launches cleanly
+# from Finder.
 xattr -dr com.apple.quarantine "$APP" >/dev/null 2>&1 || true
 
 # Refresh LaunchServices so Finder picks up the new bundle.
