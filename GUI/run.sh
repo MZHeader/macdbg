@@ -51,31 +51,69 @@ CANDIDATES=(
 #   1. an offline bundle downloaded by get-native-deps.sh into vendor-cp<XY>/
 #      (loaded isolated with -S so it can't clash with a site-packages pyobjc),
 #   2. a pip/venv-installed pywebview in that interpreter's own environment.
+# Probe each candidate for pywebview (its pyobjc backend must import too). When a
+# candidate can't, capture WHY — so if we fall through to the browser we can tell
+# the user where we looked and what went wrong instead of silently opening Safari.
+# Each line also goes to ~/.macdbg/launch.log via stderr.
+PROBE=""
 for c in "${CANDIDATES[@]}"; do
-    [ -n "$c" ] && [ -x "$c" ] || continue
+    [ -n "$c" ] || continue
+    if [ ! -x "$c" ]; then
+        echo "[pywebview] not found: $c" >&2
+        continue
+    fi
+    ver="$("$c" -c 'import sys;print(".".join(map(str,sys.version_info[:3])))' 2>/dev/null || echo '?')"
     tag="$("$c" -c 'import sys;print("cp%d%d"%sys.version_info[:2])' 2>/dev/null || true)"
     vd="$DIR/vendor-$tag"
-    if [ -n "$tag" ] && [ -d "$vd" ] \
-       && PYTHONPATH="$vd" PYTHONNOUSERSITE=1 "$c" -S -c "import objc, webview" >/dev/null 2>&1; then
-        export PYTHONPATH="$vd"; export PYTHONNOUSERSITE=1
-        exec /usr/bin/arch -"$NATIVE" "$c" -S "$DIR/gui.py" "$@"
+
+    # 1) offline vendored bundle for this exact Python version (isolated with -S)
+    if [ -n "$tag" ] && [ -d "$vd" ]; then
+        err="$(PYTHONPATH="$vd" PYTHONNOUSERSITE=1 "$c" -S -c 'import objc, webview' 2>&1)" && ok=1 || ok=0
+        if [ "$ok" = 1 ]; then
+            echo "[pywebview] $c via offline bundle $vd" >&2
+            export PYTHONPATH="$vd"; export PYTHONNOUSERSITE=1
+            exec /usr/bin/arch -"$NATIVE" "$c" -S "$DIR/gui.py" "$@"
+        fi
+        echo "[pywebview] $c + $vd -> $(printf '%s' "$err" | tail -n1)" >&2
     fi
-    if "$c" -c "import objc, webview" >/dev/null 2>&1; then
+
+    # 2) pywebview installed in the interpreter's own environment
+    err="$("$c" -c 'import objc, webview' 2>&1)" && ok=1 || ok=0
+    if [ "$ok" = 1 ]; then
+        echo "[pywebview] $c (has pywebview)" >&2
         exec /usr/bin/arch -"$NATIVE" "$c" "$DIR/gui.py" "$@"
     fi
+    last="$(printf '%s' "$err" | tail -n1)"
+    echo "[pywebview] $c (Python $ver) -> $last" >&2
+    PROBE="${PROBE}• ${c} (Python ${ver})
+      ${last}
+"
 done
+[ -n "$PROBE" ] || PROBE="(no usable Python interpreter was found)
+"
 
-# Fallback: no pywebview -> browser UI under system python (needs lldb bindings).
-# Nudge the user toward the nicer native window. This self-limits: once pywebview
-# is installed we take the native path above and never reach here. Backgrounded
-# so the dialog doesn't hold up the launch.
-osascript -e 'display dialog "macdbg is running in a browser window.
+# Fallback: no pywebview anywhere -> browser UI under system python (needs lldb
+# bindings). Tell the user where we looked, why each Python failed, and how to
+# fix it. Backgrounded so the dialog doesn't hold up the launch.
+MSG="macdbg is running in a browser window because it couldn't load pywebview (its native-window toolkit) in any Python it found.
 
-For the full native app — its own window, menu bar, and dock icon — install pywebview in a venv, then relaunch:
+Where it looked:
+${PROBE}
+Fix — do ONE of these, then relaunch:
 
-    python3 -m venv ~/.macdbg/venv
-    ~/.macdbg/venv/bin/pip install pywebview
+1)  Install it in a venv (run.sh finds this automatically):
+       python3 -m venv ~/.macdbg/venv
+       ~/.macdbg/venv/bin/pip install pywebview
 
-run.sh finds that venv automatically." buttons {"OK"} default button "OK" with title "macdbg" with icon note' >/dev/null 2>&1 &
+2)  Offline machine — grab the bundle for your Python from the native-deps
+     release, then install it locally:
+       GUI/get-native-deps.sh <bundle>.tar.gz
+
+3)  Already have pywebview somewhere — point macdbg at that interpreter:
+       export MACDBG_PYTHON=/path/to/python3
+
+Details are in ~/.macdbg/launch.log"
+ESC="$(printf '%s' "$MSG" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+osascript -e "display dialog \"$ESC\" buttons {\"OK\"} default button \"OK\" with title \"macdbg — no native window\" with icon caution" >/dev/null 2>&1 &
 export PYTHONPATH="$(/usr/bin/lldb -P):$REPO${PYTHONPATH:+:$PYTHONPATH}"
 exec /usr/bin/arch -"$NATIVE" /usr/bin/python3 "$DIR/main.py" "$@"
