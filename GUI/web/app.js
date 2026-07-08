@@ -150,7 +150,7 @@
     const el = $('#regs');
     el.innerHTML = (st.registers || []).map(r => {
       const annot = r.annot ? ` <span class="r-annot">${esc(r.annot)}</span>` : '';
-      return `<div class="rrow${r.changed ? ' changed' : ''}" data-reg="${esc(r.name)}" data-val="${esc(r.value)}">`
+      return `<div class="rrow${r.changed ? ' changed' : ''}" data-reg="${esc(r.name)}" data-val="${esc(r.value)}" data-annot="${esc(r.annot || '')}">`
         + `<span class="r-name">${esc(r.name)}</span><span class="r-val">${esc(r.value)}</span>${annot}</div>`;
     }).join('') || '<div class="empty-note">no registers</div>';
     renderFlags(st);
@@ -355,12 +355,7 @@
   function wireChrome() {
     $$('.tb[data-act]').forEach(b => b.onclick = () => doAct(b.dataset.act));
 
-    $$('#mem-tabs .tab').forEach(t => t.onclick = () => {
-      $$('#mem-tabs .tab').forEach(x => x.classList.toggle('active', x === t));
-      const which = t.dataset.memtab;
-      ['memory', 'stack', 'watch1', 'watch2', 'watch3'].forEach(p => $('#' + p).classList.toggle('hidden', p !== which));
-      $('#mem-addrbar').classList.toggle('hidden', which !== 'memory');
-    });
+    $$('#mem-tabs .tab').forEach(t => t.onclick = () => selectMemTab(t.dataset.memtab));
     $$('#bot-tabs .tab').forEach(t => t.onclick = () => selectBottomTab(t.dataset.bottab));
 
     // goto (browse disasm) — numeric => follow_disasm, else lldb symbol lookup
@@ -398,13 +393,38 @@
     wireContextMenus();
     wireRowActivate();
     wireSplitters();
+    wirePaneFocus();
     renderKeybar();
+  }
+
+  // Highlight whichever workspace pane was last clicked. CSS can only do this
+  // for panes holding a focusable element (:focus-within), which is why disasm /
+  // memory / console lit up but registers, stack and the tables never did — so
+  // drive it from the click instead, uniformly for every pane.
+  function wirePaneFocus() {
+    document.addEventListener('mousedown', e => {
+      const panel = e.target.closest('#main .panel');
+      if (!panel) return;   // clicks on the toolbar/keybar keep the current pane lit
+      $$('#main .panel').forEach(p => p.classList.toggle('pane-focus', p === panel));
+    });
   }
 
   function selectBottomTab(name) {
     $$('#bot-tabs .tab').forEach(x => x.classList.toggle('active', x.dataset.bottab === name));
     ['breakpoints', 'callstack', 'threads', 'modules', 'strings', 'patches', 'trace']
       .forEach(p => $('#tb-' + p).classList.toggle('hidden', p !== name));
+  }
+
+  function selectMemTab(which) {
+    $$('#mem-tabs .tab').forEach(x => x.classList.toggle('active', x.dataset.memtab === which));
+    ['memory', 'stack', 'watch1', 'watch2', 'watch3'].forEach(p => $('#' + p).classList.toggle('hidden', p !== which));
+    $('#mem-addrbar').classList.toggle('hidden', which !== 'memory');
+  }
+  // Follow an address in the memory view AND surface it: switch to the Memory
+  // sub-tab so the update isn't lost behind the Stack / Watch panes.
+  function followMem(addr) {
+    selectMemTab('memory');
+    return cmd('follow_mem', { addr: addr });
   }
 
   // double-click a disasm line toggles a breakpoint; a table pc row follows it
@@ -426,7 +446,7 @@
       const tr = e.target.closest('tr'); if (tr && tr.dataset.addr) cmd('follow_disasm', { addr: tr.dataset.addr });
     });
     $('#str-table').addEventListener('dblclick', e => {
-      const tr = e.target.closest('tr'); if (tr && tr.dataset.addr) cmd('follow_mem', { addr: tr.dataset.addr });
+      const tr = e.target.closest('tr'); if (tr && tr.dataset.addr) followMem(tr.dataset.addr);
     });
   }
 
@@ -510,7 +530,7 @@
       selectDisasm(addr);
       return [
         { label: 'Follow operand in Disassembly', fn: () => cmd('follow_disasm', { addr: oa }) },
-        { label: 'Follow operand in Memory', fn: () => cmd('follow_mem', { addr: oa }) },
+        { label: 'Follow operand in Memory', fn: () => followMem(oa) },
         { sep: 1 },
         { label: 'Toggle breakpoint here', fn: () => cmd('toggle_bp', { addr: addr }) },
         { label: 'Set PC to here (jump execution)', fn: () => cmd('set_pc', { addr: addr }) },
@@ -527,19 +547,29 @@
 
     on('#regs', e => {
       const row = e.target.closest('.rrow'); if (!row) return [];
-      const name = row.dataset.reg, val = row.dataset.val;
-      return [
+      const name = row.dataset.reg, val = row.dataset.val, annot = row.dataset.annot || '';
+      const items = [
         { label: 'Follow value in Disassembly', fn: () => cmd('follow_disasm', { addr: val }) },
-        { label: 'Follow value in Memory', fn: () => cmd('follow_mem', { addr: val }) },
+        { label: 'Follow value in Memory', fn: () => followMem(val) },
         { label: 'Breakpoint at value', fn: () => cmd('toggle_bp', { addr: val }) },
         { sep: 1 },
         { label: 'Edit value…', fn: () => editReg(name, val) },
-        { label: 'Copy value', fn: () => copy(val) },
+        { label: 'Copy value', fn: () => copy(val) }
+      ];
+      if (annot) {
+        // The annotation is the dereferenced value (e.g. a C2 domain string);
+        // let it be copied — the quoted string on its own, and the full text.
+        const q = annot.match(/"([^"]*)"/);
+        if (q) items.push({ label: 'Copy dereferenced string', fn: () => copy(q[1]) });
+        items.push({ label: 'Copy annotation', fn: () => copy(annot) });
+      }
+      items.push(
         { sep: 1 },
         { label: 'Pin value to Watch 1', fn: () => cmd('watch_set', { slot: 1, addr: val, len: 32 }) },
         { label: 'Pin value to Watch 2', fn: () => cmd('watch_set', { slot: 2, addr: val, len: 32 }) },
         { label: 'Pin value to Watch 3', fn: () => cmd('watch_set', { slot: 3, addr: val, len: 32 }) }
-      ];
+      );
+      return items;
     });
 
     const hexMenu = e => {
@@ -548,7 +578,7 @@
       const items = [
         { label: 'Follow in Disassembly', fn: () => cmd('follow_disasm', { addr: addr }) }
       ];
-      if (qw) items.push({ label: 'Follow pointer here (' + qw + ')', fn: () => cmd('follow_mem', { addr: qw }) });
+      if (qw) items.push({ label: 'Follow pointer here (' + qw + ')', fn: () => followMem(qw) });
       items.push(
         { label: 'Edit bytes here…', fn: () => editBytes(addr) },
         { sep: 1 },
@@ -588,7 +618,7 @@
     on('#cs-table', e => {
       const tr = e.target.closest('tr'); if (!tr || !tr.dataset.addr) return [];
       return [{ label: 'Follow in Disassembly', fn: () => cmd('follow_disasm', { addr: tr.dataset.addr }) },
-      { label: 'Follow in Memory', fn: () => cmd('follow_mem', { addr: tr.dataset.addr }) },
+      { label: 'Follow in Memory', fn: () => followMem(tr.dataset.addr) },
       { label: 'Copy address', fn: () => copy(tr.dataset.addr) }];
     });
     on('#th-table', e => {
@@ -598,13 +628,13 @@
     });
     on('#mod-table', e => {
       const tr = e.target.closest('tr'); if (!tr) return [];
-      return [{ label: 'Follow base in Memory', fn: () => cmd('follow_mem', { addr: tr.dataset.addr }) },
+      return [{ label: 'Follow base in Memory', fn: () => followMem(tr.dataset.addr) },
       { label: 'Copy base', fn: () => copy(tr.dataset.addr) }];
     });
     on('#str-table', e => {
       const tr = e.target.closest('tr'); if (!tr) return [
         { label: 'Rescan heap/stack for strings', fn: () => cmd('scan_strings') }];
-      return [{ label: 'Follow in Memory', fn: () => cmd('follow_mem', { addr: tr.dataset.addr }) },
+      return [{ label: 'Follow in Memory', fn: () => followMem(tr.dataset.addr) },
       { label: 'Follow in Disassembly', fn: () => cmd('follow_disasm', { addr: tr.dataset.addr }) },
       { label: 'Copy address', fn: () => copy(tr.dataset.addr) },
       { label: 'Copy string', fn: () => copy(tr.dataset.str) },
@@ -612,7 +642,7 @@
     });
     on('#patch-table', e => {
       const tr = e.target.closest('tr'); if (!tr || !tr.dataset.addr) return [];
-      return [{ label: 'Follow in Memory', fn: () => cmd('follow_mem', { addr: tr.dataset.addr }) },
+      return [{ label: 'Follow in Memory', fn: () => followMem(tr.dataset.addr) },
       { label: 'Revert (write original bytes)', fn: () => cmd('write_mem', { addr: tr.dataset.addr, bytes: tr.dataset.orig }) },
       { label: 'Copy address', fn: () => copy(tr.dataset.addr) }];
     });

@@ -181,7 +181,7 @@ body.resizing, body.resizing * { -webkit-user-select: none !important; user-sele
 .panel.panel-mem { flex: 1 1 0; }
 .panel.panel-tabs { flex: 3 1 0; }
 .panel.panel-console { flex: 2 1 0; min-width: 300px; }
-.panel:focus-within { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.panel.pane-focus { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 
 .panel-head {
   display: flex; align-items: center; gap: 8px;
@@ -191,8 +191,7 @@ body.resizing, body.resizing * { -webkit-user-select: none !important; user-sele
   font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .09em;
   color: var(--text-dim); flex: none;
 }
-.panel-head .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-mute); flex: none; transition: background .15s, box-shadow .15s; }
-.panel:focus-within .panel-head .dot { background: var(--accent); box-shadow: 0 0 7px var(--accent); }
+.panel-head .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-mute); flex: none; }
 .head-sub { color: var(--text-mute); font-weight: 400; font-size: 10.5px; text-transform: none; letter-spacing: 0; }
 
 /* ---- tab strips ---- */
