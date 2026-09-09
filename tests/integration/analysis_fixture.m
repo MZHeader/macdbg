@@ -10,6 +10,8 @@
 #include <IOKit/IOKitLib.h>
 #include <libproc.h>
 #include <mach-o/dyld.h>
+#include <mach/mach_time.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -227,8 +229,129 @@ __attribute__((noinline)) static int check_slow_integrity(const char *digest) {
     return check_integrity(digest);
 }
 
+static int check_timing(void) {
+    mach_timebase_info_data_t timebase;
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.denom)
+        return 2;
+    struct kinfo_proc info = {0};
+    size_t n = sizeof(info);
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    uint64_t start = mach_absolute_time();
+    int rc = sysctl(mib, 4, &info, &n, NULL, 0);
+    uint64_t end = mach_absolute_time();
+    uint64_t ns = (end - start) * timebase.numer / timebase.denom;
+    int bad = rc != 0 || ns > 5000000;
+    printf("TIMING:%s delta_ns=%llu\n", bad ? "DETECTED" : "clean",
+           (unsigned long long)ns);
+    return bad;
+}
+
+static int check_ptraced(void) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct kinfo_proc info = {0};
+    size_t n = sizeof(info);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    long rc = syscall(202, mib, 4, &info, &n, NULL, 0);
+#pragma clang diagnostic pop
+    int bad = rc != 0 || n < sizeof(info) || (info.kp_proc.p_flag & P_TRACED) != 0;
+    printf("P_TRACED:%s rc=%ld\n", bad ? "DETECTED" : "clean", rc);
+    return bad;
+}
+
+static int check_exec(void) {
+    /* Harmless even if interception regresses; its final marker proves that
+       disk dumps preserve bytes beyond the preview's 200-byte limit. */
+    char command[512] = "printf '%s\\n' '";
+    for (int i = 0; i < 32; i++) strcat(command, "0123456789");
+    strcat(command, "-COMMAND-END'");
+    int rc = system(command);
+    printf("EXEC:%s rc=%d\n", rc == 0 ? "fake-or-allowed" : "blocked", rc);
+    return rc == 0 ? 0 : 1;
+}
+
+static uint32_t rotl32(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+#define QR(a,b,c,d) do { \
+    a += b; d ^= a; d = rotl32(d,16); \
+    c += d; b ^= c; b = rotl32(b,12); \
+    a += b; d ^= a; d = rotl32(d, 8); \
+    c += d; b ^= c; b = rotl32(b, 7); \
+} while (0)
+
+static uint32_t load32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static void store32(uint8_t *p, uint32_t v) {
+    p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24;
+}
+static void chacha20_block(uint8_t out[64], const uint8_t key[32],
+                           uint32_t counter, const uint8_t nonce[12]) {
+    static const uint32_t c[4] = {0x61707865,0x3320646e,0x79622d32,0x6b206574};
+    uint32_t s[16], x[16];
+    memcpy(s, c, sizeof c);
+    for (int i = 0; i < 8; i++) s[4+i] = load32(key + 4*i);
+    s[12] = counter;
+    for (int i = 0; i < 3; i++) s[13+i] = load32(nonce + 4*i);
+    memcpy(x, s, sizeof x);
+    for (int i = 0; i < 10; i++) {
+        QR(x[0],x[4],x[8],x[12]); QR(x[1],x[5],x[9],x[13]);
+        QR(x[2],x[6],x[10],x[14]); QR(x[3],x[7],x[11],x[15]);
+        QR(x[0],x[5],x[10],x[15]); QR(x[1],x[6],x[11],x[12]);
+        QR(x[2],x[7],x[8],x[13]); QR(x[3],x[4],x[9],x[14]);
+    }
+    for (int i = 0; i < 16; i++) store32(out + 4*i, x[i] + s[i]);
+}
+static void chacha20_xor(uint8_t *data, size_t n, const uint8_t key[32]) {
+    const uint8_t nonce[12] = {0};
+    uint8_t stream[64];
+    for (uint32_t block = 0; n; block++) {
+        chacha20_block(stream, key, block + 1, nonce);
+        size_t take = n < sizeof stream ? n : sizeof stream;
+        for (size_t i = 0; i < take; i++) data[i] ^= stream[i];
+        data += take; n -= take;
+    }
+}
+
+static int check_combined(const char *digest, const char *dylib) {
+    static const char plaintext[] = "macdbg analysis cloak recovered this payload";
+    const uint8_t password[32] = "macdbg-fixture-password-v1";
+    uint8_t candidate[32], key[32], payload[sizeof(plaintext) - 1];
+    memcpy(candidate, password, sizeof(candidate));
+    memcpy(payload, plaintext, sizeof(payload));
+    CC_SHA256(password, sizeof(password), key);
+    chacha20_xor(payload, sizeof(payload), key);
+
+    int failures[8];
+    failures[0] = check_environment();
+    printf("ENV:%s\n", failures[0] ? "DETECTED" : "clean");
+    failures[1] = check_parent();
+    printf("PARENT:%s\n", failures[1] ? "DETECTED" : "clean");
+    failures[2] = check_sysctl();
+    failures[3] = check_iokit();
+    failures[4] = check_images(dylib);
+    failures[5] = check_integrity(digest);
+    failures[6] = check_timing();
+    failures[7] = check_ptraced();
+    for (int i = 0; i < 8; i++)
+        if (failures[i]) candidate[i] ^= (uint8_t)(0x31 + i);
+    CC_SHA256(candidate, sizeof(candidate), key);
+    chacha20_xor(payload, sizeof(payload), key);
+    if (memcmp(payload, plaintext, sizeof(payload)) != 0) {
+        puts("PAYLOAD:unavailable");
+        return 1;
+    }
+    printf("PAYLOAD:%.*s\n", (int)sizeof(payload), payload);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (strcmp(argv[1], "timing") == 0) return check_timing();
+    if (strcmp(argv[1], "ptraced") == 0) return check_ptraced();
+    if (strcmp(argv[1], "exec") == 0) return check_exec();
+    if (strcmp(argv[1], "combined") == 0)
+        return argc == 4 ? check_combined(argv[2], argv[3]) : 64;
     if (strcmp(argv[1], "integrity") == 0)
         return argc == 3 ? check_integrity(argv[2]) : 64;
     if (strcmp(argv[1], "integrity_slow") == 0)

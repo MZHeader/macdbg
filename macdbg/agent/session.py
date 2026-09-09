@@ -432,8 +432,13 @@ class AgentSession:
     # -- read-only introspection ------------------------------------------
 
     def cmd_status(self) -> dict:
-        p = self.dbg.process
+        d = self.dbg
+        p = d.process
         state = lldb.SBDebugger.StateAsCString(p.GetState()) if p and p.IsValid() else "none"
+        cloak = d.analysis_cloak.status()
+        safe, error = d.analysis_cloak.validate_resume()
+        if safe:
+            safe, error = d.analysis_cloak.validate_integrity(self.tracer.hardware_bp_ids)
         return {
             "ok": True,
             "program": self.program,
@@ -443,6 +448,23 @@ class AgentSession:
             "pending_decision": self._pending,
             "tracer_enabled": self.tracer.enabled,
             "trace_hit_count": self._trace_count,
+            "defenses": {
+                "analysis_cloak": cloak["enabled"],
+                "analysis_cloak_safe": bool(cloak["enabled"] and safe),
+                "analysis_cloak_resolved": cloak["resolved"],
+                "analysis_cloak_deferred": cloak["deferred"],
+                "analysis_cloak_error": None if safe else error,
+                "anti_ptrace": bool(d.anti_ptrace_bp_id),
+                "anti_sysctl": bool(d._scrub_ptraced),
+                "anti_parent": bool(d._scrub_parent),
+                "anti_csops": bool(d.anti_csops_bp_id),
+                "anti_timing": bool(d.anti_timing_bp_ids),
+                "anti_sigtrap": bool(d.anti_sigtrap_on),
+                "anti_mach_ports": bool(d.anti_mach_bp_id),
+                "direct_syscall": bool(d.direct_syscall_bp_ids),
+                "fork_identity": d.fork_mode == "identity",
+                "exec_sandbox": bool(d.exec_bp_ids),
+            },
         }
 
     def _process_stopped(self) -> bool:

@@ -2,6 +2,7 @@ import json
 import re
 import subprocess
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from . import support
@@ -16,6 +17,121 @@ from .support import (
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def assert_cloak_status(self, agent):
+        status = agent.cmd("status")
+        defenses = status["defenses"]
+        self.assertTrue(defenses["analysis_cloak"], status)
+        self.assertTrue(defenses["analysis_cloak_safe"], status)
+        self.assertIsNone(defenses["analysis_cloak_error"], status)
+        self.assertIs(type(defenses["analysis_cloak_resolved"]), int)
+        self.assertIs(type(defenses["analysis_cloak_deferred"]), int)
+        for name in ("anti_sysctl", "anti_parent", "anti_timing"):
+            self.assertTrue(defenses[name], status)
+
+    def test_timing_hides_real_sysctl_breakpoint_latency(self):
+        with AgentProcess(FIXTURE, "timing") as agent:
+            self.assertTrue(agent.cmd("defense_enable", {"name": "anti_sysctl"})["ok"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 1, result)
+            self.assertIn("TIMING:DETECTED", result["console"])
+        with AgentProcess(FIXTURE, "timing") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("TIMING:clean", result["console"])
+
+    def test_syscall_202_ptraced_is_scrubbed(self):
+        direct = run_fixture_direct("ptraced")
+        self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        self.assertIn("P_TRACED:clean rc=0", direct.stdout)
+        for cloak in (False, True):
+            with self.subTest(cloak=cloak), AgentProcess(FIXTURE, "ptraced") as agent:
+                if cloak:
+                    self.assertTrue(agent.enable_cloak()["ok"])
+                result = agent.continue_to_exit()
+                self.assertEqual(result["event"], "exited", result)
+                self.assertEqual(result["exit"]["code"], 0 if cloak else 1, result)
+                self.assertIn("P_TRACED:{} rc=0".format("clean" if cloak else "DETECTED"),
+                              result["console"])
+
+    def test_cloak_status_and_existing_defense_ownership(self):
+        with AgentProcess(FIXTURE, "timing") as agent:
+            self.assertTrue(agent.cmd("defense_enable", {"name": "anti_sysctl"})["ok"])
+            self.assertTrue(agent.enable_cloak()["ok"])
+            self.assert_cloak_status(agent)
+            self.assertTrue(agent.cmd("defense_disable", {"name": "analysis_cloak"})["ok"])
+            defenses = agent.cmd("status")["defenses"]
+            self.assertFalse(defenses["analysis_cloak"])
+            self.assertTrue(defenses["anti_sysctl"])
+            self.assertFalse(defenses["anti_parent"])
+            self.assertFalse(defenses["anti_timing"])
+
+    def test_exec_prompt_dumps_full_command_then_fakes_success(self):
+        with AgentProcess(FIXTURE, "exec") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            self.assertTrue(agent.cmd("defense_enable", {"name": "exec_sandbox"})["ok"])
+            self.assertTrue(agent.cmd("exec_mode", {"interactive": True})["ok"])
+            pending = agent.continue_to_exit()
+            self.assertEqual(pending["event"], "pending_decision", pending)
+            self.assertEqual(pending["decision"]["kind"], "exec", pending)
+            dumped = agent.cmd("dump_exec")
+            self.assertTrue(dumped["ok"], dumped)
+            body = Path(dumped["path"]).read_text()
+            self.assertEqual(body, support.EXEC_DUMP_BODY)
+            self.assertEqual(dumped["bytes"], len(body.encode()))
+            self.assertEqual(agent.cmd("status")["pending_decision"]["kind"], "exec")
+            result = agent.cmd("decide_exec", {"decision": "fake", "timeout": 15})
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("EXEC:fake-or-allowed rc=0", result["console"])
+            self.assertNotIn("0123456789", result["console"])
+
+    def test_exec_automatic_dump_preserves_oversized_command(self):
+        with AgentProcess(FIXTURE, "exec") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            self.assertTrue(agent.cmd("defense_enable", {"name": "exec_sandbox"})["ok"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 1, result)
+            self.assertIn("EXEC:blocked rc=-1", result["console"])
+            match = re.search(r"full payload \((\d+) B\) → ([^\r\n]+?\.txt)", result["console"])
+            self.assertIsNotNone(match, result)
+            body = Path(match[2]).read_text()
+            self.assertEqual(body, support.EXEC_DUMP_BODY)
+            self.assertEqual(int(match[1]), len(body.encode()))
+
+    def test_combined_checks_recover_exact_chacha20_payload(self):
+        args = [support.fixture_text_digest(), str(FRIDA_FIXTURE.resolve())]
+        hostile = {"DYLD_PRINT_BINDINGS": "1", "NSZombieEnabled": "YES"}
+        for cloak in (False, True):
+            with self.subTest(cloak=cloak), AgentProcess(
+                    FIXTURE, "combined", extra_args=args, env=hostile) as agent:
+                if cloak:
+                    self.assertTrue(agent.enable_cloak()["ok"])
+                    self.assert_cloak_status(agent)
+                result = agent.continue_to_exit()
+                self.assertEqual(result["event"], "exited", result)
+                self.assertEqual(result["exit"]["code"], 0 if cloak else 1, result)
+                payload = "PAYLOAD:macdbg analysis cloak recovered this payload"
+                if cloak:
+                    self.assertIn(payload, result["console"].splitlines())
+                    for check in ("ENV", "PARENT", "SYSCTL", "IOKIT", "IMAGES",
+                                  "INTEGRITY", "TIMING", "P_TRACED"):
+                        self.assertIn(check + ":clean", result["console"])
+                    self.assertNotIn("DETECTED", result["console"])
+                    restarted = agent.cmd("restart")
+                    self.assertEqual(restarted["event"], "stop", restarted)
+                    self.assert_cloak_status(agent)
+                    rerun = agent.continue_to_exit()
+                    self.assertEqual(rerun["event"], "exited", rerun)
+                    self.assertEqual(rerun["exit"]["code"], 0, rerun)
+                    self.assertIn(payload, rerun["console"].splitlines())
+                else:
+                    self.assertIn("PAYLOAD:unavailable", result["console"])
+                    self.assertNotIn(payload, result["console"])
+
     def test_shared_hardware_site_keeps_foreign_hook_after_matched_one_shot_is_deleted(self):
         with AgentProcess(FIXTURE, "parent") as agent:
             def script_json(source):
@@ -181,8 +297,11 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
             self.assertTrue(agent.enable_cloak()["ok"])
             info = agent.cmd("raw", {"command": "image lookup -v -n check_integrity"})
             blocks = info["output"].split("Address:")[1:]
+            # Combined mode introduces another inlined copy in main. Select
+            # the direct integrity-mode call exercised by this process.
             main_block = next(block for block in blocks if re.search(
-                r"Summary:.*`main.*\[inlined\] check_integrity", block))
+                r"Summary:.*`main.*\[inlined\] check_integrity", block)
+                and "[inlined] check_combined" not in block)
             address = int(re.search(r"\[(0x[0-9a-fA-F]+)", main_block).group(1), 16)
             bp = agent.cmd("breakpoint_toggle", {"addr": address})
             self.assertTrue(bp["ok"], bp)
@@ -312,7 +431,12 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
             result = agent.continue_to_exit()
             self.assertFalse(result["ok"], result)
             self.assertIn("software breakpoint modifies target __text", result["error"])
-            self.assertEqual(agent.cmd("status")["process_state"], "stopped")
+            status = agent.cmd("status")
+            self.assertEqual(status["process_state"], "stopped")
+            self.assertTrue(status["defenses"]["analysis_cloak"])
+            self.assertFalse(status["defenses"]["analysis_cloak_safe"])
+            self.assertIn("software breakpoint modifies target __text",
+                          status["defenses"]["analysis_cloak_error"])
 
     def test_blacklisted_loaded_images_are_cloaked(self):
         dylib = str(FRIDA_FIXTURE.resolve())

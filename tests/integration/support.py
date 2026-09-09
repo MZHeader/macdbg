@@ -14,6 +14,8 @@ STRIPPED_FIXTURE = FIXTURE_DIR / "analysis_fixture_stripped"
 OPTIMIZED_FIXTURE = FIXTURE_DIR / "analysis_fixture_optimized"
 LATE_IOKIT_FIXTURE = FIXTURE_DIR / "late_iokit_fixture"
 FRIDA_FIXTURE = FIXTURE_DIR / "FridaGadget.dylib"
+EXEC_COMMAND = "printf '%s\\n' '" + "0123456789" * 32 + "-COMMAND-END'"
+EXEC_DUMP_BODY = "symbol: system\ncommand:\n" + EXEC_COMMAND + "\n"
 
 
 def fixture_text_digest(fixture=FIXTURE):
