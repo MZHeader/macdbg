@@ -947,18 +947,43 @@ class Engine:
         for m in msgs:
             self._console("[anti-debug] " + m)
 
+    def _refresh_after_analysis_cloak(self, result):
+        ok, message = result
+        self._console(
+            "[anti-analysis] " + message if ok else message,
+            error=not ok,
+        )
+        return ok
+
     def _t_all_anti(self):
         d = self.dbg
-        on = bool(d.anti_ptrace_bp_id and d.direct_syscall_bp_ids and d.anti_mach_bp_id
+        on = bool(d.analysis_cloak.enabled
+                  and d.anti_ptrace_bp_id and d.direct_syscall_bp_ids and d.anti_mach_bp_id
                   and d.anti_sysctl_bp_id and d.anti_csops_bp_id and d.anti_timing_bp_ids
                   and d._scrub_parent and d.anti_sigtrap_on)
-        seq = ([d.disable_anti_ptrace, d.disable_direct_syscall_scan, d.disable_anti_mach_ports,
-                d.disable_anti_sysctl, d.disable_anti_csops, d.disable_anti_timing,
-                d.disable_anti_parent, d.disable_anti_sigtrap] if on else
-               [d.enable_anti_ptrace, d.enable_direct_syscall_scan, d.enable_anti_mach_ports,
-                d.enable_anti_sysctl, d.enable_anti_csops, d.enable_anti_timing,
-                d.enable_anti_parent, d.enable_anti_sigtrap])
+        if on:
+            self._refresh_after_analysis_cloak(d.disable_analysis_cloak())
+            seq = [d.disable_anti_ptrace, d.disable_direct_syscall_scan,
+                   d.disable_anti_mach_ports, d.disable_anti_sysctl,
+                   d.disable_anti_csops, d.disable_anti_timing,
+                   d.disable_anti_parent, d.disable_anti_sigtrap]
+            self._refresh_after_defense([f()[1] for f in seq])
+            return
+        seq = [d.enable_anti_ptrace, d.enable_direct_syscall_scan,
+               d.enable_anti_mach_ports, d.enable_anti_sysctl,
+               d.enable_anti_csops, d.enable_anti_timing,
+               d.enable_anti_parent, d.enable_anti_sigtrap]
         self._refresh_after_defense([f()[1] for f in seq])
+        # Arm the composite last so it observes the existing defenses as
+        # independently owned. Disabling ALL can then release the cloak first
+        # without it tearing down those individual toggles itself.
+        self._refresh_after_analysis_cloak(d.enable_analysis_cloak())
+
+    def _t_analysis_cloak(self):
+        d = self.dbg
+        operation = (d.disable_analysis_cloak if d.analysis_cloak.enabled
+                     else d.enable_analysis_cloak)
+        return self._refresh_after_analysis_cloak(operation())
 
     def _t_deny_attach(self):
         d = self.dbg
@@ -1026,10 +1051,21 @@ class Engine:
 
     def _defense_states(self) -> dict:
         d = self.dbg
+        cloak = d.analysis_cloak.status()
+        cloak_safe, cloak_error = d.analysis_cloak.validate_resume()
+        if cloak_safe:
+            cloak_safe, cloak_error = d.analysis_cloak.validate_integrity(
+                self.tracer.hardware_bp_ids)
         return {
-            "all_anti": bool(d.anti_ptrace_bp_id and d.direct_syscall_bp_ids and d.anti_mach_bp_id
+            "all_anti": bool(d.analysis_cloak.enabled
+                             and d.anti_ptrace_bp_id and d.direct_syscall_bp_ids and d.anti_mach_bp_id
                              and d.anti_sysctl_bp_id and d.anti_csops_bp_id and d.anti_timing_bp_ids
                              and d._scrub_parent and d.anti_sigtrap_on),
+            "analysis_cloak": cloak["enabled"],
+            "analysis_cloak_safe": bool(cloak["enabled"] and cloak_safe),
+            "analysis_cloak_resolved": cloak["resolved"],
+            "analysis_cloak_deferred": cloak["deferred"],
+            "analysis_cloak_error": None if cloak_safe else cloak_error,
             "deny_attach": bool(d.anti_ptrace_bp_id) or bool(d.direct_syscall_bp_ids),
             "mach": bool(d.anti_mach_bp_id),
             "flag_scrubs": bool(d.anti_sysctl_bp_id) or bool(d.anti_csops_bp_id),
@@ -1081,6 +1117,13 @@ class Engine:
         self._console("[trace] cleared")
 
     def _c_fork_trace(self, a):
+        if self.dbg.analysis_cloak.enabled:
+            self._console(
+                "analysis cloak is incompatible with fork-tree tracing in v1",
+                error=True,
+            )
+            self._emit_state()
+            return
         if self.attach_pid:
             self._console("[fork-trace] not available for an attached process", error=True)
             return
@@ -1345,7 +1388,9 @@ Engine._COMMANDS = {
 }
 Engine._SYNC = {"complete", "list_processes"}
 Engine._DEFENSE_TOGGLES = {
-    "all_anti": Engine._t_all_anti, "deny_attach": Engine._t_deny_attach,
+    "all_anti": Engine._t_all_anti,
+    "analysis_cloak": Engine._t_analysis_cloak,
+    "deny_attach": Engine._t_deny_attach,
     "flag_scrubs": Engine._t_flag_scrubs, "timing": Engine._t_timing,
     "parent": Engine._t_parent, "sigtrap": Engine._t_sigtrap, "mach": Engine._t_mach,
     "hw_bps": Engine._t_hw_bps, "tracer_hw": Engine._t_tracer_hw,

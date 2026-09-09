@@ -817,6 +817,7 @@
   const DEF_SECTIONS = [
     ['Anti-debug', [
       ['all_anti', 'Enable ALL anti-debug bypasses', 'ptrace · sysctl · csops · mach · parent · sigtrap · timing · direct-syscall'],
+      ['analysis_cloak', 'Analysis cloak', 'environment · parent · VM/hardware · images · text integrity · timing'],
       ['deny_attach', 'Defeat PT_DENY_ATTACH', 'libc ptrace hook + inline svc #0x80 scan'],
       ['mach', 'Cloak Mach exception ports', 'report none — look unattached'],
       ['flag_scrubs', 'Scrub debugger flags', 'P_TRACED (sysctl) + CS_DEBUGGED (csops)'],
@@ -856,8 +857,16 @@
       html += `<div class="toggle-section">${esc(title)}</div><div class="toggle-list">`;
       for (const [key, label, sub] of rows) {
         const on = !!st[key];
-        html += `<div class="toggle-row${on ? ' on' : ''}" data-key="${key}"><div class="tg-box"></div>`
-          + `<div class="tg-text"><b>${esc(label)}</b><span>${esc(sub)}</span></div></div>`;
+        const unsafe = key === 'analysis_cloak' && on && st.analysis_cloak_safe === false;
+        let detail = sub;
+        if (key === 'analysis_cloak' && on) {
+          detail = unsafe
+            ? 'unsafe · ' + (st.analysis_cloak_error || 'integrity validation failed')
+            : 'ready · ' + (+st.analysis_cloak_resolved || 0) + ' resolved · '
+              + (+st.analysis_cloak_deferred || 0) + ' deferred';
+        }
+        html += `<div class="toggle-row${on ? ' on' : ''}${unsafe ? ' unsafe' : ''}" data-key="${key}"><div class="tg-box"></div>`
+          + `<div class="tg-text"><b>${esc(label)}</b><span>${esc(detail)}</span></div></div>`;
       }
       html += '</div>';
     }
