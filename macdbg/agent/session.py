@@ -179,6 +179,9 @@ class AgentSession:
 
     def _dispatch_resume(self, cmd: str, args: dict, poll_cb) -> dict:
         timeout = args.get("timeout")
+        cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_resume()
+        if not cloak_ok:
+            return {"ok": False, "error": cloak_error}
         if self._pending is not None and cmd not in ("decide_fork", "decide_exec"):
             # A resume issued while a fork/exec decision is pending would
             # otherwise just call dbg.cont()/step_*() directly, letting the
@@ -893,6 +896,10 @@ class AgentSession:
             if msg is not None:
                 if msg:
                     self._log("[anti-analysis] " + msg)
+                cloak_ok, _cloak_error = (
+                    self.dbg.analysis_cloak.validate_resume())
+                if not cloak_ok:
+                    return False
                 return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_flag_scrub_hit,

@@ -486,8 +486,13 @@ class Engine:
         for bp_id in bp_ids:
             msg = self.dbg.handle_analysis_cloak_hit(bp_id)
             if msg is not None:
+                cloak_ok, _cloak_error = (
+                    self.dbg.analysis_cloak.validate_resume())
                 if msg:
-                    self._console("[anti-analysis] " + msg)
+                    self._console("[anti-analysis] " + msg,
+                                  error=not cloak_ok)
+                if not cloak_ok:
+                    self._emit_state()
                 return True
         for handler in (self.dbg.handle_anti_ptrace_hit, self.dbg.handle_flag_scrub_hit,
                         self.dbg.handle_syscall_hit, self.dbg.handle_anti_timing_hit,
@@ -581,6 +586,11 @@ class Engine:
             return False
         p = self.dbg.process
         if not (p and p.IsValid() and p.GetState() == lldb.eStateStopped):
+            return False
+        cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_resume()
+        if not cloak_ok:
+            self._console("[anti-analysis] " + cloak_error, error=True)
+            self._emit_state()
             return False
         self._resuming = True
         if self._disasm_follow is not None:

@@ -234,7 +234,7 @@ class SysctlEntrySafetyTests(unittest.TestCase):
         self.assertEqual(cloak.last_error, message)
         self.assertEqual(cloak._return_hooks, {})
         self.assertEqual(cloak.validate_resume(), (False, cloak.last_error))
-        self.assertEqual(process.continues, 1)
+        self.assertEqual(process.continues, 0)
 
     def test_unresolved_return_breakpoint_records_critical_error(self):
         name_address = 0x1000
@@ -261,7 +261,7 @@ class SysctlEntrySafetyTests(unittest.TestCase):
         self.assertEqual(cloak.last_error, message)
         self.assertEqual(cloak._return_hooks, {})
         self.assertEqual(debugger.target.deleted, [70])
-        self.assertEqual(process.continues, 1)
+        self.assertEqual(process.continues, 0)
 
 
 class SysctlReturnSafetyTests(unittest.TestCase):
@@ -294,6 +294,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
         self.assertEqual(
             message, "spoofed sysctlbyname(kern.hv_vmm_present)"
         )
+        self.assertEqual(process.continues, 1)
 
     def test_failed_real_syscall_preserves_result_and_error_state(self):
         cloak, process, buffer_address, size_address = make_return_cloak(
@@ -325,6 +326,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
         self.assertEqual(cloak.last_error, expected)
         self.assertEqual(process.writes, [])
         self.assertEqual(cloak.validate_resume(), (False, expected))
+        self.assertEqual(process.continues, 0)
 
     def test_partial_buffer_write_rolls_back_and_records_critical_error(self):
         payload_size = len(b"Mac14,6\0")
@@ -342,6 +344,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
         self.assertEqual(bytes(process.memory[buffer_address]), before_buffer)
         self.assertEqual(bytes(process.memory[size_address]), before_size)
         self.assertEqual(cloak.validate_resume(), (False, message))
+        self.assertEqual(process.continues, 0)
 
     def test_partial_size_write_rolls_back_both_outputs(self):
         payload_size = len(b"Mac14,6\0")
@@ -362,6 +365,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
         self.assertEqual(bytes(process.memory[buffer_address]), before_buffer)
         self.assertEqual(bytes(process.memory[size_address]), before_size)
         self.assertEqual(cloak.validate_resume(), (False, message))
+        self.assertEqual(process.continues, 0)
 
     def test_failed_rollback_is_included_in_critical_error(self):
         cloak, process, buffer_address, _size_address = make_return_cloak(
@@ -379,6 +383,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
             bytes(process.memory[buffer_address])[:len(b"Mac14,6\0")],
             original,
         )
+        self.assertEqual(process.continues, 0)
 
     def test_size_rollback_is_attempted_if_buffer_rollback_fails(self):
         payload_size = len(b"Mac14,6\0")
@@ -399,6 +404,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
         size_writes = [write for write in process.writes
                        if write[0] == size_address]
         self.assertEqual(len(size_writes), 2)
+        self.assertEqual(process.continues, 0)
 
     def test_relaunch_state_reset_clears_return_hooks_and_critical_error(self):
         cloak, _process, _buffer_address, _size_address = make_return_cloak()

@@ -275,7 +275,8 @@ class AnalysisCloak:
                                     "cloak failed{}".format(name, rollback))
                             else:
                                 message = "spoofed sysctlbyname({})".format(name)
-            process.Continue()
+            if self.last_error is None:
+                process.Continue()
             return message
 
         if bp_id not in self._bp_ids:
@@ -332,7 +333,8 @@ class AnalysisCloak:
             entry_message = self._critical(
                 "sysctlbyname({}) could not arm return hook; cloak failed"
                 .format(hook[1]))
-        process.Continue()
+        if self.last_error is None:
+            process.Continue()
         return entry_message
 
     def _read_exact(self, address: int, size: int, lldb_module):
