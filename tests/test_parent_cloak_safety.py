@@ -50,6 +50,9 @@ class FakeThread:
     def GetFrameAtIndex(self, _index):
         return self.frame
 
+    def GetThreadID(self):
+        return 0x1234
+
 
 class FakeProcess:
     def __init__(self, memory, return_value, *, capacity,
@@ -110,6 +113,7 @@ def handle_proc_pidpath_return(process):
     cloak = AnalysisCloak(FakeCloakDebugger(process))
     cloak._return_hooks[9] = ("proc_pidpath", process.base,
                               process.capacity)
+    cloak._return_hook_threads[9] = 0x1234
     with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
         message = cloak.handle_hit(9)
     return message, cloak

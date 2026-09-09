@@ -71,7 +71,8 @@ class Target:
         return self.bps[index]
 
     def FindBreakpointByID(self, bp_id):
-        return next(bp for bp in self.bps if bp.id == bp_id)
+        return next((bp for bp in self.bps if bp.id == bp_id),
+                    types.SimpleNamespace(IsValid=lambda: False))
 
     def GetExecutable(self):
         return "main"
@@ -289,6 +290,7 @@ class StepHookOwnershipTests(unittest.TestCase):
         self.dbg.target.bps.append(bp)
         self.dbg.hardware_bp_ids.add(99)
         self.cloak._return_hooks[99] = ("proc_pidpath", 0x2000, 1024)
+        self.cloak._return_hook_threads[99] = 111
 
         self.dbg._process_cloak_step_stop(self.thread)
         self.assertIn(99, self.cloak._return_hooks)
@@ -300,6 +302,54 @@ class StepHookOwnershipTests(unittest.TestCase):
         self.assertEqual(self.cloak._return_hooks, {})
         self.assertEqual(self.dbg.target.bps, [])
         self.assertEqual(self.dbg.hardware_bp_ids, set())
+        self.assertEqual(self.cloak._return_hook_threads, {})
+
+    def test_explicit_shared_site_ids_keep_foreign_hook_after_owner_one_shot_deletion(self):
+        foreign = Breakpoint(99, [Location(0x1000)], hardware=True, thread_id=111)
+        # LLDB has already auto-deleted the matching BP 100, but reports both
+        # constituent IDs in the shared site's breakpoint stop reason.
+        self.dbg.target.bps.append(foreign)
+        self.dbg.hardware_bp_ids.update((99, 100))
+        self.cloak._return_hooks.update({
+            99: ("proc_pidpath", 0x2000, 1024),
+            100: ("proc_pidpath", 0x3000, 1024),
+        })
+        self.cloak._return_hook_threads.update({99: 111, 100: 222})
+        self.thread.GetStopReason.return_value = 3
+        self.thread.GetStopReasonDataCount.return_value = 4
+        self.thread.GetStopReasonDataAtIndex.side_effect = [99, 1, 100, 1].__getitem__
+
+        self.dbg._process_cloak_step_stop(self.thread)
+        self.assertEqual(set(self.cloak._return_hooks), {99})
+        self.assertEqual(self.cloak._return_hook_threads, {99: 111})
+        self.assertEqual(self.dbg.hardware_bp_ids, {99})
+        self.assertEqual(self.dbg.target.bps, [foreign])
+
+    def test_ordinary_dispatch_also_preserves_foreign_return_hook(self):
+        self.cloak._return_hooks[99] = ("proc_pidpath", 0x2000, 1024)
+        self.cloak._return_hook_threads[99] = 111
+        self.assertIsNone(self.cloak.handle_hit(99, resume=False))
+        self.assertIn(99, self.cloak._return_hooks)
+        self.assertEqual(self.cloak._return_hook_threads, {99: 111})
+
+    def test_return_hook_without_retained_owner_fails_closed(self):
+        self.cloak._return_hooks[99] = ("proc_pidpath", 0x2000, 1024)
+        message = self.cloak.handle_hit(99, resume=False)
+        self.assertIn("missing thread ownership", message)
+        self.assertEqual(self.cloak.last_error, message)
+        self.assertIn(99, self.cloak._return_hooks)
+
+    def test_hook_cleanup_removes_ownership_on_reset_disable_and_explicit_delete(self):
+        for operation in ("clear_return_hooks", "disable", "_delete_breakpoints"):
+            with self.subTest(operation=operation):
+                self.cloak._return_hooks[99] = ("proc_pidpath", 0x2000, 1024)
+                self.cloak._return_hook_threads[99] = 111
+                self.dbg.hardware_bp_ids.add(99)
+                args = ([99],) if operation == "_delete_breakpoints" else ()
+                getattr(self.cloak, operation)(*args)
+                self.assertEqual(self.cloak._return_hooks, {})
+                self.assertEqual(self.cloak._return_hook_threads, {})
+                self.assertEqual(self.dbg.hardware_bp_ids, set())
 
     def test_global_entry_creates_separate_return_hooks_for_both_threads(self):
         entry = Breakpoint(98, [Location(0x1000)])
@@ -320,6 +370,7 @@ class StepHookOwnershipTests(unittest.TestCase):
             self.dbg._process_cloak_step_stop(self.thread)
         self.assertEqual(set(self.cloak._return_hooks), {99, 100})
         self.assertEqual([bp.GetThreadID() for bp in self.dbg.target.bps], [0, 111, 222])
+        self.assertEqual(self.cloak._return_hook_threads, {99: 111, 100: 222})
 
 
 if __name__ == "__main__":

@@ -48,6 +48,9 @@ class FakeThread:
     def GetFrameAtIndex(self, _index):
         return self.frame
 
+    def GetThreadID(self):
+        return 0x1234
+
 
 class FakeProcess:
     def __init__(self, register, cstrings):
@@ -109,9 +112,11 @@ class ImageReturnSafetyTests(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
             cloak._return_hooks[9] = ("image",)
+            cloak._return_hook_threads[9] = 0x1234
             first = cloak.handle_hit(9)
             register.value = 0x1000
             cloak._return_hooks[10] = ("image",)
+            cloak._return_hook_threads[10] = 0x1234
             second = cloak.handle_hit(10)
             disabled = cloak.disable()
 
@@ -137,6 +142,7 @@ class ImageReturnSafetyTests(unittest.TestCase):
         cloak = AnalysisCloak(debugger)
         cloak.enabled = True
         cloak._return_hooks[9] = ("image",)
+        cloak._return_hook_threads[9] = 0x1234
 
         with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
             message = cloak.handle_hit(9)
@@ -153,6 +159,7 @@ class ImageReturnSafetyTests(unittest.TestCase):
         cloak = AnalysisCloak(debugger)
         cloak.enabled = True
         cloak._return_hooks[9] = ("image",)
+        cloak._return_hook_threads[9] = 0x1234
 
         with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
             message = cloak.handle_hit(9)

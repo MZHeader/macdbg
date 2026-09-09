@@ -16,6 +16,56 @@ from .support import (
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_shared_hardware_site_keeps_foreign_hook_after_matched_one_shot_is_deleted(self):
+        with AgentProcess(FIXTURE, "parent") as agent:
+            def script_json(source):
+                result = agent.cmd("raw", {"command": "script exec(" + repr(source) + ")"})
+                self.assertTrue(result["ok"], result)
+                return json.loads(result["output"].strip().splitlines()[-1])
+
+            tid = script_json("import json\nprint(json.dumps(lldb.debugger.GetSelectedTarget().GetProcess().GetSelectedThread().GetThreadID()))")
+            site = support.fixture_symbol("check_parent")
+            ids = []
+            for owner in (tid + 1000000000, tid):
+                result = agent.cmd("raw", {"command":
+                    "breakpoint set -H -a {:#x} -o true --thread-id {}".format(site, owner)})
+                self.assertTrue(result["ok"], result)
+                ids.append(int(re.search(r"Breakpoint (\d+)", result["output"]).group(1)))
+            foreign, matched = ids
+            stopped = agent.continue_to_exit()
+            self.assertEqual(stopped.get("event"), "stop", stopped)
+            # Exercise the real wrapper dispatch against LLDB's actual shared
+            # stop data and already-removed matching one-shot, without changing
+            # the running agent's internal defenses or arming target code patches.
+            result = script_json("\n".join([
+                "from macdbg.core.debugger import Debugger",
+                "from macdbg.core.anti_analysis import AnalysisCloak",
+                "d = Debugger.__new__(Debugger)",
+                "d.target = lldb.debugger.GetSelectedTarget()",
+                "d.process = d.target.GetProcess()",
+                "thread = d.process.GetSelectedThread()",
+                "before = {'reason': thread.GetStopReason(), 'ids': [thread.GetStopReasonDataAtIndex(i) for i in range(0, thread.GetStopReasonDataCount(), 2)]}",
+                "before['valid'] = [d.target.FindBreakpointByID(i).IsValid() for i in {!r}]".format(ids),
+                "before['foreign_hardware'] = d.target.FindBreakpointByID({}).IsHardware()".format(foreign),
+                "d.hardware_bp_ids = set({!r})".format(ids),
+                "d._step_cloak_handled_stop = None",
+                "d._step_cloak_messages = []",
+                "d.analysis_cloak = c = AnalysisCloak(d)",
+                "c.enabled = True",
+                "c._return_hooks = {{i: ('proc_pidpath', 0, 0) for i in {!r}}}".format(ids),
+                "c._return_hook_threads = {!r}".format({foreign: tid + 1000000000, matched: tid}),
+                "thread.GetFrameAtIndex(0).FindRegister('x0').SetValueFromCString('0')",
+                "d._process_cloak_step_stop(thread)",
+                "print(json.dumps({'before': before, 'pending': sorted(c._return_hooks), 'owners': c._return_hook_threads, 'tracked': sorted(d.hardware_bp_ids)}))",
+            ]))
+            self.assertEqual(result["before"]["reason"], 3)
+            self.assertEqual(set(result["before"]["ids"]), set(ids))
+            self.assertEqual(result["before"]["valid"], [True, False])
+            self.assertTrue(result["before"]["foreign_hardware"])
+            self.assertEqual(result["pending"], [foreign], result)
+            self.assertEqual(result["owners"], {str(foreign): tid + 1000000000})
+            self.assertEqual(result["tracked"], [foreign])
+
     def test_user_breakpoint_cancels_private_step_plan_and_restores_policy(self):
         digest = support.fixture_text_digest()
         with AgentProcess(FIXTURE, "integrity_slow", extra_args=[digest]) as agent:

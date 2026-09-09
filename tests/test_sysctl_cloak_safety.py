@@ -164,6 +164,7 @@ def make_return_cloak(name="hw.model", *, returned=0, capacity=128,
     cloak._return_hooks[9] = (
         "cstring", name, buffer_address, size_address, capacity
     )
+    cloak._return_hook_threads[9] = 0x1234
     return cloak, process, buffer_address, size_address
 
 
@@ -285,6 +286,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
             "u32", "kern.hv_vmm_present",
             buffer_address, size_address, 8,
         )
+        cloak._return_hook_threads[9] = 0x1234
 
         with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
             message = cloak.handle_hit(9)

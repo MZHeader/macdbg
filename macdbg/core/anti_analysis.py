@@ -90,6 +90,9 @@ class AnalysisCloak:
         self._bp_ids: set[int] = set()
         self._entry_hooks: dict[int, str] = {}
         self._return_hooks: dict[int, ReturnHook] = {}
+        # LLDB may delete a matching one-shot before its stop is delivered,
+        # and reports foreign-thread IDs at shared breakpoint sites as well.
+        self._return_hook_threads: dict[int, int] = {}
         self._cfstring_cache: dict[str, int] = {}
         self._cstring_cache: dict[str, int] = {}
         self._owned_existing = set()
@@ -171,6 +174,7 @@ class AnalysisCloak:
         self._bp_ids.clear()
         self._entry_hooks.clear()
         self._return_hooks.clear()
+        self._return_hook_threads.clear()
         for name in reversed([item[0] for item in self._EXISTING_DEFENSES]):
             if name in self._owned_existing:
                 getattr(self.debugger, "disable_" + name)()
@@ -228,11 +232,12 @@ class AnalysisCloak:
 
     def _delete_breakpoints(self, bp_ids):
         target = getattr(self.debugger, "target", None)
-        if target is None:
-            return
-        for bp_id in bp_ids:
-            target.BreakpointDelete(bp_id)
+        for bp_id in list(bp_ids):
+            if target is not None:
+                target.BreakpointDelete(bp_id)
             getattr(self.debugger, "hardware_bp_ids", set()).discard(bp_id)
+            self._return_hooks.pop(bp_id, None)
+            self._return_hook_threads.pop(bp_id, None)
 
     def filter_launch_environment(self, entries) -> list[str]:
         return filter_environment(entries) if self.enabled else list(entries)
@@ -260,13 +265,19 @@ class AnalysisCloak:
         if process is None or target is None:
             return None
 
-        hook = self._return_hooks.pop(bp_id, None)
+        hook = self._return_hooks.get(bp_id)
         if hook is not None:
-            target.BreakpointDelete(bp_id)
-            getattr(self.debugger, "hardware_bp_ids", set()).discard(bp_id)
+            owner = self._return_hook_threads.get(bp_id)
+            if owner is None:
+                return self._critical("return hook missing thread ownership; cloak failed")
+            thread = process.GetSelectedThread()
+            if thread.GetThreadID() != owner:
+                return None
+            # Validate before consuming, using metadata retained even when
+            # LLDB has already auto-deleted the actual one-shot breakpoint.
+            self._delete_breakpoints((bp_id,))
             import lldb
             message = ""
-            thread = process.GetSelectedThread()
             frame = thread.GetFrameAtIndex(0)
             result = frame.FindRegister("x0")
             returned = result.GetValueAsUnsigned()
@@ -373,6 +384,7 @@ class AnalysisCloak:
                     bp.SetOneShot(True)
                     bp.SetThreadID(thread.GetThreadID())
                     self._return_hooks[bp.GetID()] = ("image",)
+                    self._return_hook_threads[bp.GetID()] = thread.GetThreadID()
                 else:
                     if bp.IsValid():
                         target.BreakpointDelete(bp.GetID())
@@ -421,6 +433,7 @@ class AnalysisCloak:
                 bp.SetOneShot(True)
                 bp.SetThreadID(thread.GetThreadID())
                 self._return_hooks[bp.GetID()] = hook
+                self._return_hook_threads[bp.GetID()] = thread.GetThreadID()
             else:
                 if bp.IsValid():
                     target.BreakpointDelete(bp.GetID())
@@ -687,6 +700,7 @@ class AnalysisCloak:
     def clear_return_hooks(self) -> None:
         self._delete_breakpoints(self._return_hooks)
         self._return_hooks.clear()
+        self._return_hook_threads.clear()
         self._release_cfstrings()
         self._release_cstrings()
         self.last_error = None
