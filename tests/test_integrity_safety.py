@@ -217,6 +217,30 @@ class IntegritySafetyTests(unittest.TestCase):
         self.assertEqual(result, {"ok": False, "error": "unsafe text"})
         resume.assert_not_called()
 
+    def test_gui_allocation_failure_clears_running_state_and_allows_retry(self):
+        from tests.test_sysctl_cloak_orchestration import GuiCloakFailureTests
+        for command, operation in (("_c_step_out", "step_out"),
+                                   ("_c_step_over", "step_over"),
+                                   ("_c_run_to", "run_to_address")):
+            with self.subTest(command=command):
+                engine = GuiCloakFailureTests().make_engine()
+                engine.dbg.analysis_cloak = mock.Mock()
+                engine.dbg.analysis_cloak.validate_resume.return_value = (True, "ready")
+                engine.dbg.analysis_cloak.validate_integrity.return_value = (True, "ready")
+                engine.tracer.hardware_bp_ids = set()
+                engine.dbg.cancel_user_step = mock.Mock()
+                engine._addr = lambda _: 0x1000
+                action = mock.Mock(side_effect=RuntimeError("hardware breakpoint slots exhausted"))
+                setattr(engine.dbg, operation, action)
+                getattr(engine, command)({"addr": 0x1000})
+                self.assertFalse(engine._resuming)
+                engine.dbg.cancel_user_step.assert_called_once_with()
+                engine._emit_state.assert_called_once_with()
+                action.side_effect = None
+                action.return_value = (True, "running") if command == "_c_run_to" else None
+                getattr(engine, command)({"addr": 0x1000})
+                self.assertTrue(engine._resuming)
+
 
 if __name__ == "__main__":
     unittest.main()

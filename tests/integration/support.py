@@ -11,13 +11,14 @@ AGENT = ROOT / "agent.sh"
 FIXTURE_DIR = ROOT / "tests" / "integration" / "build"
 FIXTURE = FIXTURE_DIR / "analysis_fixture"
 STRIPPED_FIXTURE = FIXTURE_DIR / "analysis_fixture_stripped"
+OPTIMIZED_FIXTURE = FIXTURE_DIR / "analysis_fixture_optimized"
 LATE_IOKIT_FIXTURE = FIXTURE_DIR / "late_iokit_fixture"
 FRIDA_FIXTURE = FIXTURE_DIR / "FridaGadget.dylib"
 
 
-def fixture_text_digest():
+def fixture_text_digest(fixture=FIXTURE):
     """Independent on-disk baseline for the thin ARM64 fixture's text."""
-    data = FIXTURE.read_bytes()
+    data = fixture.read_bytes()
     magic, = struct.unpack_from("<I", data)
     if magic != 0xfeedfacf:
         raise AssertionError("expected a thin little-endian Mach-O 64 fixture")

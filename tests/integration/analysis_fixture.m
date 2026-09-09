@@ -191,7 +191,11 @@ __attribute__((used, noinline)) void integrity_syscall_site(void) {
     __asm__ volatile("svc #0x80");
 }
 
+#ifdef CLOAK_INLINE_INTEGRITY
+__attribute__((always_inline)) static inline int check_integrity(const char *expected) {
+#else
 static int check_integrity(const char *expected) {
+#endif
     const struct mach_header_64 *header =
         (const struct mach_header_64 *)_dyld_get_image_header(0);
     const struct load_command *command = (const void *)(header + 1);
@@ -218,10 +222,17 @@ static int check_integrity(const char *expected) {
     return 66;
 }
 
+__attribute__((noinline)) static int check_slow_integrity(const char *digest) {
+    sleep(3);
+    return check_integrity(digest);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
     if (strcmp(argv[1], "integrity") == 0)
         return argc == 3 ? check_integrity(argv[2]) : 64;
+    if (strcmp(argv[1], "integrity_slow") == 0)
+        return argc == 3 ? check_slow_integrity(argv[2]) : 64;
     if (strcmp(argv[1], "env") == 0) {
         int bad = check_environment();
         printf("ENV:%s\n", bad ? "DETECTED" : "clean");

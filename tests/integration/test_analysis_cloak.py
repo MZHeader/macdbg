@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import unittest
 from unittest import mock
@@ -15,6 +16,155 @@ from .support import (
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_user_breakpoint_cancels_private_step_plan_and_restores_policy(self):
+        digest = support.fixture_text_digest()
+        with AgentProcess(FIXTURE, "integrity_slow", extra_args=[digest]) as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            outer = agent.cmd("breakpoint_toggle", {"addr": support.fixture_symbol("check_slow_integrity")})
+            self.assertTrue(outer["ok"], outer)
+            self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+            agent.cmd("breakpoint_delete", {"bp_id": outer["bp_id"]})
+            user = agent.cmd("breakpoint_toggle", {"addr": support.fixture_symbol("check_integrity")})
+            self.assertTrue(user["ok"], user)
+            result = agent.cmd("step_out", {"timeout": 15})
+            self.assertEqual(result.get("event"), "stop", result)
+            self.assertEqual(result["stop"]["bp_id"], user["bp_id"], result)
+            policy = agent.cmd("raw", {"command": "settings show target.require-hardware-breakpoint"})
+            self.assertIn("false", policy["output"])
+            agent.cmd("breakpoint_delete", {"bp_id": user["bp_id"]})
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("INTEGRITY:clean", result["console"])
+
+    def test_step_policy_remains_active_until_restart(self):
+        digest = support.fixture_text_digest()
+        with AgentProcess(FIXTURE, "integrity_slow", extra_args=[digest]) as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            bp = agent.cmd("breakpoint_toggle", {"addr": support.fixture_symbol("check_slow_integrity")})
+            self.assertTrue(bp["ok"], bp)
+            self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+            agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})
+            running = agent.cmd("step_out", {"timeout": 0})
+            self.assertEqual(running.get("event"), "running", running)
+            policy = agent.cmd("raw", {"command": "settings show target.require-hardware-breakpoint"})
+            self.assertIn("true", policy["output"])
+            restarted = agent.cmd("restart")
+            self.assertEqual(restarted.get("event"), "stop", restarted)
+            policy = agent.cmd("raw", {"command": "settings show target.require-hardware-breakpoint"})
+            self.assertIn("false", policy["output"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("INTEGRITY:clean", result["console"])
+
+    def test_critical_hook_error_during_step_restores_policy_and_stays_stopped(self):
+        with AgentProcess(FIXTURE, "parent") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            bp = agent.cmd("breakpoint_toggle", {"addr": support.fixture_symbol("check_parent")})
+            self.assertTrue(bp["ok"], bp)
+            self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+            agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})
+            capacity = int(subprocess.check_output(["/usr/sbin/sysctl", "-n", "hw.optional.breakpoint"], text=True))
+            marker = support.fixture_symbol("integrity_breakpoint_site")
+            for index in range(capacity - 1):
+                self.assertTrue(agent.cmd("breakpoint_toggle", {"addr": marker + index * 4})["ok"])
+            result = agent.cmd("step_out", {"timeout": 15})
+            self.assertFalse(result["ok"], result)
+            self.assertIn("slots", result["error"])
+            self.assertEqual(agent.cmd("status")["process_state"], "stopped")
+            policy = agent.cmd("raw", {"command": "settings show target.require-hardware-breakpoint"})
+            self.assertIn("false", policy["output"])
+            self.assertFalse(agent.continue_to_exit()["ok"])
+
+    def test_step_over_applies_cloak_at_api_calls(self):
+        cases = (("parent", "check_parent", "proc_pidpath", 0),
+                 ("sysctl", "check_sysctl", "sysctlbyname", 1),
+                 ("iokit", "copy_cfstring_property", "IORegistryEntryCreateCFProperty", 0),
+                 ("images", "check_images", "_dyld_get_image_name", 0))
+        for mode, function, api, index in cases:
+            with self.subTest(mode=mode):
+                extra = [str(FRIDA_FIXTURE)] if mode == "images" else []
+                with AgentProcess(FIXTURE, mode, extra_args=extra) as agent:
+                    self.assertTrue(agent.enable_cloak()["ok"])
+                    text = agent.cmd("raw", {"command": "disassemble -n " + function})["output"]
+                    sites = re.findall(r"^\s*(0x[0-9a-f]+).*\bbl\s+.*symbol stub for: " + re.escape(api) + r"\s*$", text, re.M)
+                    site = int(sites[index], 16)
+                    bp = agent.cmd("breakpoint_toggle", {"addr": site})
+                    self.assertTrue(bp["ok"], bp)
+                    self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+                    self.assertTrue(agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})["ok"])
+                    stepped = agent.cmd("step_over", {"timeout": 15})
+                    self.assertEqual(stepped.get("event"), "stop", stepped)
+                    self.assertEqual(stepped["stop"]["pc"], site + 4, stepped)
+                    result = agent.continue_to_exit()
+                    self.assertEqual(result.get("event"), "exited", result)
+                    self.assertEqual(result["exit"]["code"], 0, (stepped, result))
+
+    def test_instruction_step_landing_on_hook_is_intercepted(self):
+        with AgentProcess(FIXTURE, "parent") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            listing = agent.cmd("breakpoint_list", {"hide_internal": False})
+            hook = next(bp["addr"] for bp in listing["breakpoints"] if bp["symbol"] == "proc_pidpath")
+            text = agent.cmd("raw", {"command": "disassemble -n check_parent"})["output"]
+            site = int(re.search(r"^\s*(0x[0-9a-f]+).*\bbl\s+.*symbol stub for: proc_pidpath\s*$", text, re.M).group(1), 16)
+            bp = agent.cmd("breakpoint_toggle", {"addr": site})
+            self.assertTrue(bp["ok"], bp)
+            self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+            self.assertTrue(agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})["ok"])
+            for _ in range(8):
+                stepped = agent.cmd("step_in", {"timeout": 15})
+                self.assertEqual(stepped.get("event"), "stop", stepped)
+                if stepped["stop"]["pc"] == hook:
+                    break
+            else:
+                self.fail("instruction steps did not reach proc_pidpath hook")
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("PARENT:clean", result["console"])
+
+    def test_optimized_inline_step_out_is_rejected_before_text_changes(self):
+        fixture = support.OPTIMIZED_FIXTURE
+        digest = support.fixture_text_digest(fixture)
+        with AgentProcess(fixture, "integrity", extra_args=[digest]) as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            info = agent.cmd("raw", {"command": "image lookup -v -n check_integrity"})
+            blocks = info["output"].split("Address:")[1:]
+            main_block = next(block for block in blocks if re.search(
+                r"Summary:.*`main.*\[inlined\] check_integrity", block))
+            address = int(re.search(r"\[(0x[0-9a-fA-F]+)", main_block).group(1), 16)
+            bp = agent.cmd("breakpoint_toggle", {"addr": address})
+            self.assertTrue(bp["ok"], bp)
+            self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+            self.assertTrue(agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})["ok"])
+            before = agent.cmd("status")["pc"]
+            result = agent.cmd("step_out", {"timeout": 15})
+            self.assertFalse(result["ok"], result)
+            self.assertIn("inline step-out", result["error"])
+            self.assertEqual(agent.cmd("status")["pc"], before)
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertIn("INTEGRITY:clean", result["console"])
+            self.assertEqual(result["exit"]["code"], 0, result)
+
+    def test_step_out_applies_all_cloak_hook_families(self):
+        for mode in ("parent", "sysctl", "iokit", "images"):
+            with self.subTest(mode=mode):
+                extra = [str(FRIDA_FIXTURE)] if mode == "images" else []
+                with AgentProcess(FIXTURE, mode, extra_args=extra) as agent:
+                    self.assertTrue(agent.enable_cloak()["ok"])
+                    bp = agent.cmd("breakpoint_toggle", {"addr": support.fixture_symbol("check_" + mode)})
+                    self.assertTrue(bp["ok"], bp)
+                    self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+                    self.assertTrue(agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})["ok"])
+                    stepped = agent.cmd("step_out", {"timeout": 15})
+                    self.assertEqual(stepped.get("event"), "stop", stepped)
+                    result = agent.continue_to_exit()
+                    self.assertEqual(result.get("event"), "exited", result)
+                    self.assertEqual(result["exit"]["code"], 0, (stepped, result))
+                    self.assertIn(mode.upper() + ":clean", stepped["console"] + result["console"])
+
     def test_integrity_step_out_preserves_text(self):
         digest = support.fixture_text_digest()
         with AgentProcess(FIXTURE, "integrity", extra_args=[digest]) as agent:

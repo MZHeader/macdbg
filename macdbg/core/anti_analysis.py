@@ -254,7 +254,7 @@ class AnalysisCloak:
         return (set(self._bp_ids) | set(self._return_hooks)
                 | owned_existing)
 
-    def handle_hit(self, bp_id: int) -> Optional[str]:
+    def handle_hit(self, bp_id: int, resume: bool = True) -> Optional[str]:
         process = getattr(self.debugger, "process", None)
         target = getattr(self.debugger, "target", None)
         if process is None or target is None:
@@ -344,7 +344,7 @@ class AnalysisCloak:
                                     "cloak failed{}".format(name, rollback))
                             else:
                                 message = "spoofed sysctlbyname({})".format(name)
-            if self.last_error is None:
+            if self.last_error is None and resume:
                 self.debugger.cont()
             return message
 
@@ -360,7 +360,7 @@ class AnalysisCloak:
         if entry_kind is None:
             return None
         if entry_kind == "IORegistryEntryCreateCFProperty":
-            return self._handle_iokit_entry(frame)
+            return self._handle_iokit_entry(frame, resume=resume)
         if entry_kind == "_dyld_get_image_name":
             return_address = frame.FindRegister("lr").GetValueAsUnsigned()
             entry_message = ""
@@ -382,7 +382,7 @@ class AnalysisCloak:
             else:
                 entry_message = self._critical(
                     "_dyld_get_image_name has no return address; cloak failed")
-            if self.last_error is None:
+            if self.last_error is None and resume:
                 self.debugger.cont()
             return entry_message
         buffer = frame.FindRegister("x1").GetValueAsUnsigned()
@@ -431,7 +431,7 @@ class AnalysisCloak:
             entry_message = self._critical(
                 "sysctlbyname({}) could not arm return hook; cloak failed"
                 .format(hook[1]))
-        if self.last_error is None:
+        if self.last_error is None and resume:
             self.debugger.cont()
         return entry_message
 
@@ -467,7 +467,7 @@ class AnalysisCloak:
         basename = path.rsplit("/", 1)[-1]
         return "cloaked loaded image {}".format(basename)
 
-    def _handle_iokit_entry(self, frame) -> str:
+    def _handle_iokit_entry(self, frame, resume: bool = True) -> str:
         process = self.debugger.process
         key_pointer = frame.FindRegister("x1").GetValueAsUnsigned()
         key = self._cfstring_text(key_pointer)
@@ -475,7 +475,8 @@ class AnalysisCloak:
             return self._critical(
                 "could not read IOKit property key; cloak failed")
         if key not in IOKIT_SPOOFS:
-            self.debugger.cont()
+            if resume:
+                self.debugger.cont()
             return ""
 
         replacement = self._cfstring_cache.get(key)
@@ -508,7 +509,8 @@ class AnalysisCloak:
                 "could not return replacement for {}; cloak failed: {}"
                 .format(key, err.strip()))
 
-        self.debugger.cont()
+        if resume:
+            self.debugger.cont()
         return "spoofed IORegistryEntryCreateCFProperty({})".format(key)
 
     def _eval_pointer(self, expression: str) -> Optional[int]:

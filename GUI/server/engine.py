@@ -363,13 +363,21 @@ class Engine:
             cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
                 self.tracer.hardware_bp_ids)
             if not cloak_ok:
+                self.dbg.cancel_user_step()
                 self._console("[anti-analysis] " + cloak_error, error=True)
                 self._emit_state()
                 return
             if self.dbg.in_user_step():
                 if self.tracer.enabled:
                     self._log_trace_hit()
-                if self.dbg.advance_user_step(self._hidden_bp_ids()) == "more":
+                try:
+                    step_state = self.dbg.advance_user_step(self._hidden_bp_ids())
+                    for message in self.dbg.drain_step_cloak_messages():
+                        self._console(message)
+                except Exception as error:
+                    self._resume_failed(error)
+                    return
+                if step_state == "more":
                     self._resuming = True
                     return
                 self._console(self._describe_stop())
@@ -567,6 +575,7 @@ class Engine:
     def _hidden_bp_ids(self) -> set:
         ids = set(self.tracer._bp_to_name)
         d = self.dbg
+        ids.update(d.analysis_cloak.hidden_bp_ids())
         for attr in ("anti_ptrace_bp_id", "anti_sysctl_bp_id", "anti_csops_bp_id",
                      "anti_mach_bp_id"):
             v = getattr(d, attr, 0)
@@ -635,21 +644,31 @@ class Engine:
         return int(v)
 
     # -- execution
+    def _resume_failed(self, error):
+        self._resuming = False
+        self.dbg.cancel_user_step()
+        self._console("[resume] " + str(error), error=True)
+        self._emit_state()
+
+    def _resume_action(self, action):
+        if not self._begin_resume():
+            return
+        try:
+            return action()
+        except Exception as error:
+            self._resume_failed(error)
+
     def _c_step_in(self, a):
-        if self._begin_resume():
-            self.dbg.step_in()
+        self._resume_action(self.dbg.step_in)
 
     def _c_step_over(self, a):
-        if self._begin_resume():
-            self.dbg.step_over()
+        self._resume_action(self.dbg.step_over)
 
     def _c_step_out(self, a):
-        if self._begin_resume():
-            self.dbg.step_out()
+        self._resume_action(self.dbg.step_out)
 
     def _c_cont(self, a):
-        if self._begin_resume():
-            self.dbg.cont()
+        self._resume_action(self.dbg.cont)
 
     def _c_interrupt(self, a):
         p = self.dbg.process
@@ -704,9 +723,12 @@ class Engine:
 
     def _c_run_to(self, a):
         addr = self._addr(a)
-        if addr is None or not self._begin_resume():
+        if addr is None:
             return
-        ok, msg = self.dbg.run_to_address(addr)
+        result = self._resume_action(lambda: self.dbg.run_to_address(addr))
+        if result is None:
+            return
+        ok, msg = result
         self._console("[run-to] " + (msg or "running to {:#x}".format(addr)))
         if not ok:
             self._resuming = False

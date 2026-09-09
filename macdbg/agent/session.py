@@ -176,6 +176,8 @@ class AgentSession:
             # error", which reads as a bug in us instead of the request.
             return {"ok": False, "error": "invalid arguments: {}: {}".format(type(e).__name__, e)}
         except Exception as e:
+            if cmd in _RESUME_COMMANDS:
+                self.dbg.cancel_user_step()
             return {"ok": False, "error": "internal error: {}: {}".format(type(e).__name__, e)}
 
     def _dispatch_resume(self, cmd: str, args: dict, poll_cb) -> dict:
@@ -706,6 +708,8 @@ class AgentSession:
             if not cloak_ok:
                 return {"ok": False, "error": cloak_error}
             resume()
+            for message in self.dbg.drain_step_cloak_messages():
+                self._log(message)
         event = lldb.SBEvent()
         wait_timeout = max(1, int(wait_timeout))
         # Wall-clock deadline, checked every iteration regardless of whether
@@ -782,6 +786,7 @@ class AgentSession:
                 cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
                     self.tracer.hardware_bp_ids)
                 if not cloak_ok:
+                    self.dbg.cancel_user_step()
                     return {"ok": False, "error": cloak_error,
                             "console": self._drain_console()}
                 if self.dbg.in_user_step():
@@ -790,7 +795,10 @@ class AgentSession:
                     # auto-continue hijack it into a free run.
                     if self.tracer.enabled:
                         self._log_trace_hit()
-                    if self.dbg.advance_user_step(self._hidden_bp_ids()) == "more":
+                    step_state = self.dbg.advance_user_step(self._hidden_bp_ids())
+                    for message in self.dbg.drain_step_cloak_messages():
+                        self._log(message)
+                    if step_state == "more":
                         hit = _deadline_hit()
                         if hit is not None:
                             return hit
@@ -824,10 +832,12 @@ class AgentSession:
                 return {"ok": True, "event": "stop", "stop": self._describe_stop(),
                         "console": self._drain_console()}
             if state == lldb.eStateExited:
+                self.dbg.cancel_user_step()
                 self._pending = None
                 return {"ok": True, "event": "exited", "exit": self._describe_exit(),
                         "console": self._drain_console()}
             if state in (lldb.eStateCrashed, lldb.eStateDetached, lldb.eStateInvalid):
+                self.dbg.cancel_user_step()
                 self._pending = None
                 return {"ok": True, "event": "terminated",
                         "lldb_state": lldb.SBDebugger.StateAsCString(state),

@@ -54,6 +54,11 @@ class Debugger:
         self.analysis_cloak = AnalysisCloak(self)
         self.hardware_bp_ids: set[int] = set()
         self.extra_hardware_bp_ids = lambda: set()
+        self._step_hardware_policy = None
+        self._step_plan_active = False
+        self._step_plan_depth = None
+        self._step_cloak_messages = []
+        self._step_cloak_handled_stop = None
 
     def read_output(self, max_bytes: int = 4096) -> str:
         try:
@@ -192,6 +197,9 @@ class Debugger:
         ]
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
+        self.cancel_user_step()
+        self._step_cloak_messages.clear()
+        self._step_cloak_handled_stop = None
         assert self.target is not None
         # Drop any step-in-progress state from a prior run so the first stop of
         # the fresh process can't be mistaken for a step to complete.
@@ -366,6 +374,7 @@ class Debugger:
                 self.process.Detach()
             else:
                 self.process.Kill()
+        self.cancel_user_step()
         try:
             self._out_w_file.close()
         except Exception:
@@ -408,12 +417,17 @@ class Debugger:
         t = self._thread()
         if t:
             bp.SetThreadID(t.GetThreadID())
-        self.cont()
+        try:
+            self.cont()
+        except Exception:
+            self.delete_breakpoint(bp.GetID())
+            raise
         return True, "running to {:#x}".format(addr)
 
     def step_in(self) -> None:
         t = self._thread()
         if t:
+            self._process_cloak_step_stop(t)
             # Single instruction, no depth target: whatever it lands on is the
             # stop, even if that is a traced libSystem entry.
             self._step_active = True
@@ -425,6 +439,8 @@ class Debugger:
         """Run until the current frame returns (gdb's 'finish')."""
         t = self._thread()
         if t:
+            self._check_step_out_frame(t)
+            self._process_cloak_step_stop(t)
             self._require_step_slot()
             self._step_active = True
             self._step_target_depth = t.GetNumFrames() - 1
@@ -436,13 +452,28 @@ class Debugger:
             from .breakpoints import validate_hardware_capacity
             validate_hardware_capacity(self.target, reserve=1)
 
+    def _check_step_out_frame(self, thread):
+        if self.analysis_cloak.enabled and thread.GetFrameAtIndex(0).IsInlined():
+            raise RuntimeError("inline step-out cannot bound private hardware breakpoints; use instruction stepping")
+
     def _hardware_step_out(self, thread):
         if not self.analysis_cloak.enabled:
             thread.StepOut()
             return
+        self._check_step_out_frame(thread)
         self._require_step_slot()
         # LLDB's private return breakpoint is absent from GetNumBreakpoints().
         # Require hardware for this plan and reserve its slot until it lands.
+        if self._step_plan_active:
+            # The original caller-return plan remains active across our hooks.
+            # Resume that plan instead of stacking a new StepOut at every API.
+            self.cont()
+            return
+        if self._step_hardware_policy is not None:
+            self._step_plan_depth = thread.GetNumFrames() - 1
+            self._step_plan_active = True
+            thread.StepOut()
+            return
         values = self.dbg.GetInternalVariableValue(
             "target.require-hardware-breakpoint", self.dbg.GetInstanceName())
         previous = values.GetStringAtIndex(0)
@@ -452,11 +483,14 @@ class Debugger:
         self.ci.HandleCommand("settings set target.require-hardware-breakpoint true", result, False)
         if not result.Succeeded():
             raise RuntimeError("could not require hardware stepping: " + (result.GetError() or ""))
+        self._step_hardware_policy = previous
         try:
+            self._step_plan_depth = thread.GetNumFrames() - 1
+            self._step_plan_active = True
             thread.StepOut()
-        finally:
-            self.ci.HandleCommand("settings set target.require-hardware-breakpoint " + previous,
-                                  result, False)
+        except Exception:
+            self.cancel_user_step()
+            raise
 
     _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
 
@@ -487,6 +521,7 @@ class Debugger:
         frame = t.GetFrameAtIndex(0)
         if not frame or not frame.IsValid():
             return
+        self._process_cloak_step_stop(t)
         if self._is_call_at(frame.GetPC()):
             self._require_step_slot()
         self._step_active = True
@@ -512,38 +547,46 @@ class Debugger:
             return "inactive"
         t = self._thread()
         if not t or not t.GetFrameAtIndex(0).IsValid():
-            self._step_active = False
-            self._step_target_depth = None
-            self._pending_step_scrubs = None
+            self.cancel_user_step()
             return "done"
+        hit = ({t.GetStopReasonDataAtIndex(i)
+                for i in range(0, t.GetStopReasonDataCount(), 2)}
+               if t.GetStopReason() == lldb.eStopReasonBreakpoint else set())
+        # LLDB's private plan IDs are negative, exposed here as uint64. A
+        # private step-out BP may share the cloak's return address and report
+        # alongside its public one-shot; it is not an unrelated user stop.
+        hit = {bp_id for bp_id in hit if bp_id < (1 << 63)}
+        self._process_cloak_step_stop(t)
+        if (self._step_plan_depth is not None
+                and t.GetNumFrames() <= self._step_plan_depth):
+            self._step_plan_active = False
         # A sysctl/csops call we let run during this step may have just returned;
         # scrub its now-filled buffer before doing anything else.
         self._resolve_pending_step_scrubs(t)
         # Single-instruction step (step-in, or step-over of a non-call): done.
         if self._step_target_depth is None:
-            self._step_active = False
+            self.cancel_user_step()
             return "done"
         # Still inside the callee. Stopping on a breakpoint here is either a
         # genuine user breakpoint (end the step, x64dbg-style) or a defense
         # breakpoint we must neutralise transparently so stepping *through* an
         # anti-debug call still gets the same protection a plain continue would.
-        if t.GetStopReason() == lldb.eStopReasonBreakpoint:
+        if hit:
             auto = set(auto_bp_ids or ())
-            hit = {t.GetStopReasonDataAtIndex(i)
-                   for i in range(0, t.GetStopReasonDataCount(), 2)}
             if hit - auto:
-                self._step_active = False
-                self._step_target_depth = None
+                self.cancel_user_step()
                 return "done"
+            depth_before = t.GetNumFrames()
             for bp_id in hit:
                 self._defense_step_action(bp_id, t)
+            if t.GetNumFrames() < depth_before:
+                self._step_plan_active = False
         # Complete once we're back at or above the target frame depth. This is
         # re-checked *after* _defense_step_action because a fake-the-call defense
         # (ptrace/mach/setsid) pops the callee frame via `thread return`, which
         # can itself finish the step -- StepOut-ing again would overshoot.
         if t.GetNumFrames() <= self._step_target_depth:
-            self._step_active = False
-            self._step_target_depth = None
+            self.cancel_user_step()
             return "done"
         self._hardware_step_out(t)
         return "more"
@@ -611,6 +654,9 @@ class Debugger:
                 return
         if self._pending_step_scrubs is None:
             self._pending_step_scrubs = []
+        if self.analysis_cloak.enabled:
+            self._arm_return_scrub(thread, kind, buf, oldlenp)
+            return
         self._pending_step_scrubs.append((thread.GetNumFrames(), kind, buf, oldlenp))
 
     def _defense_step_action(self, bp_id: int, thread) -> None:
@@ -699,6 +745,61 @@ class Debugger:
         self._step_active = False
         self._step_target_depth = None
         self._pending_step_scrubs = None
+        self._step_plan_active = False
+        self._step_plan_depth = None
+        previous = getattr(self, "_step_hardware_policy", None)
+        if previous is not None:
+            result = lldb.SBCommandReturnObject()
+            if self.process and self.process.GetState() == lldb.eStateStopped:
+                # Discard a suspended wrapper step (including private children)
+                # before restoring the policy. Completed plans have no index 1.
+                self.ci.HandleCommand("thread plan discard 1", result, False)
+            self.ci.HandleCommand("settings set target.require-hardware-breakpoint " + previous,
+                                  result, False)
+            self._step_hardware_policy = None
+
+    def drain_step_cloak_messages(self):
+        messages = self._step_cloak_messages
+        self._step_cloak_messages = []
+        return messages
+
+    def _process_cloak_step_stop(self, thread):
+        """Apply entry/return rewrites without starting an unrelated continue."""
+        cloak = self.analysis_cloak
+        if not cloak.enabled:
+            return
+        ids = set()
+        if thread.GetStopReason() == lldb.eStopReasonBreakpoint:
+            ids.update(thread.GetStopReasonDataAtIndex(i)
+                       for i in range(0, thread.GetStopReasonDataCount(), 2))
+        # Instruction steps may land at the same PC with a plan-complete stop,
+        # rather than a breakpoint stop. Those calls still need interception.
+        pc = thread.GetFrameAtIndex(0).GetPC()
+        stop_key = (self.process.GetStopID(), thread.GetThreadID(), pc)
+        if self._step_cloak_handled_stop == stop_key:
+            return
+        for bp_id in set(cloak._entry_hooks) | set(cloak._return_hooks):
+            bp = self.target.FindBreakpointByID(bp_id)
+            if bp.IsValid() and bp.IsEnabled() and any(
+                    bp.GetLocationAtIndex(i).IsEnabled()
+                    and bp.GetLocationAtIndex(i).GetLoadAddress() == pc
+                    for i in range(bp.GetNumLocations())):
+                ids.add(bp_id)
+        for bp_id in sorted(ids):
+            depth_before = thread.GetNumFrames()
+            message = cloak.handle_hit(bp_id, resume=False)
+            if thread.GetNumFrames() < depth_before:
+                # `thread return` used by IOKit invalidates LLDB's active plan.
+                self._step_plan_active = False
+            if message:
+                self._step_cloak_messages.append("[anti-analysis] " + message)
+            ok, error = cloak.validate_resume()
+            if not ok:
+                self.cancel_user_step()
+                raise RuntimeError(error)
+        self._step_cloak_handled_stop = (
+            self.process.GetStopID(), thread.GetThreadID(),
+            thread.GetFrameAtIndex(0).GetPC())
 
     def step_in_source(self) -> None:
         if self.analysis_cloak.enabled:
