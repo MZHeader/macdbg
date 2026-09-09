@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import lldb
 
+from .anti_analysis import AnalysisCloak
 from .state import BinaryState, StoredBP, Patch, load_for, STATE_DIR
 
 
@@ -50,6 +51,7 @@ class Debugger:
 
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("settings set target.disable-aslr true", ret, False)
+        self.analysis_cloak = AnalysisCloak(self)
 
     def read_output(self, max_bytes: int = 4096) -> str:
         try:
@@ -213,6 +215,7 @@ class Debugger:
             env += self._interpose_env(info)
         else:
             self.interpose_trace_path = None
+        env = self.analysis_cloak.filter_launch_environment(env)
         info.SetEnvironmentEntries(env, True)
         was_async = self.dbg.GetAsync()
         self.dbg.SetAsync(False)
@@ -227,6 +230,19 @@ class Debugger:
             self.dbg.SetAsync(was_async)
         self._hook_listener(self.process)
         return self.process
+
+    def is_stopped_at_entry_point(self) -> bool:
+        if (not self.process or not self.process.IsValid()
+                or self.process.GetState() != lldb.eStateStopped):
+            return False
+        entry = self.entry_point_address()
+        return entry is not None and self.pc() == entry
+
+    def enable_analysis_cloak(self) -> Tuple[bool, str]:
+        return self.analysis_cloak.enable()
+
+    def disable_analysis_cloak(self) -> Tuple[bool, str]:
+        return self.analysis_cloak.disable()
 
     def entry_point_address(self) -> Optional[int]:
         """Load address of the executable's entry point (LC_MAIN entryoff plus

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import re
-from typing import Iterable, Sequence, Union
+from typing import Iterable, Optional, Sequence, Union
 
 
 FORBIDDEN_ENV = frozenset({
@@ -53,3 +53,85 @@ def contains_marker(value: str, markers: Sequence[str]) -> bool:
 def filter_environment(entries: Iterable[str]) -> list[str]:
     return [entry for entry in entries
             if entry.split("=", 1)[0] not in FORBIDDEN_ENV]
+
+
+class AnalysisCloak:
+    _EXISTING_DEFENSES = (
+        ("anti_sysctl", "_scrub_ptraced"),
+        ("anti_parent", "_scrub_parent"),
+        ("anti_timing", "anti_timing_bp_ids"),
+    )
+
+    def __init__(self, debugger):
+        self.debugger = debugger
+        self.enabled: bool = False
+        self._bp_ids = set()
+        self._return_hooks = {}
+        self._owned_existing = set()
+
+    def enable(self) -> tuple[bool, str]:
+        if self.enabled:
+            return True, "analysis cloak already enabled"
+        if not self.debugger.is_stopped_at_entry_point():
+            return (False,
+                    "analysis cloak must be enabled while stopped at the "
+                    "entry point; restart the target")
+
+        acquired = []
+        for name, state_attr in self._EXISTING_DEFENSES:
+            if getattr(self.debugger, state_attr):
+                continue
+            ok, message = getattr(self.debugger, "enable_" + name)()
+            if not ok:
+                self._rollback_existing(acquired)
+                return False, "could not enable {}: {}".format(name, message)
+            acquired.append(name)
+            self._owned_existing.add(name)
+
+        ok, message = self.scrub_live_environment()
+        if not ok:
+            self._rollback_existing(acquired)
+            return False, message
+
+        self.enabled = True
+        return True, "analysis cloak enabled; {}".format(message)
+
+    def disable(self) -> tuple[bool, str]:
+        for name in reversed([item[0] for item in self._EXISTING_DEFENSES]):
+            if name in self._owned_existing:
+                getattr(self.debugger, "disable_" + name)()
+        self._owned_existing.clear()
+        self.enabled = False
+        return True, "analysis cloak disabled"
+
+    def _rollback_existing(self, acquired):
+        for name in reversed(acquired):
+            getattr(self.debugger, "disable_" + name)()
+            self._owned_existing.discard(name)
+
+    def filter_launch_environment(self, entries) -> list[str]:
+        return filter_environment(entries) if self.enabled else list(entries)
+
+    def scrub_live_environment(self) -> tuple[bool, str]:
+        for name in sorted(FORBIDDEN_ENV):
+            ok, _out, err = self.debugger.handle_command(
+                'expression -l c++ --ignore-breakpoints true -- '
+                '(int)unsetenv("{}")'.format(name))
+            if not ok:
+                return False, "could not unset {}: {}".format(name, err.strip())
+        return True, "removed {} analysis environment variables".format(
+            len(FORBIDDEN_ENV))
+
+    def hidden_bp_ids(self) -> set[int]:
+        return set(self._bp_ids) | set(self._return_hooks)
+
+    def handle_hit(self, _bp_id: int) -> Optional[str]:
+        return None
+
+    def status(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "resolved": len(self._bp_ids),
+            "deferred": 0,
+            "error": None,
+        }

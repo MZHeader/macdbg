@@ -65,6 +65,7 @@ def _int_arg(v) -> int:
     )
 
 _DEFENSES = {
+    "analysis_cloak": ("enable_analysis_cloak", "disable_analysis_cloak"),
     "anti_ptrace": ("enable_anti_ptrace", "disable_anti_ptrace"),
     "anti_sysctl": ("enable_anti_sysctl", "disable_anti_sysctl"),
     "anti_csops": ("enable_anti_csops", "disable_anti_csops"),
@@ -968,6 +969,7 @@ class AgentSession:
 
     def _hidden_bp_ids(self) -> set:
         ids = set(self.tracer._bp_to_name)
+        ids.update(self.dbg.analysis_cloak.hidden_bp_ids())
         if self.dbg.anti_ptrace_bp_id:
             ids.add(self.dbg.anti_ptrace_bp_id)
         if self.dbg.anti_sysctl_bp_id:
