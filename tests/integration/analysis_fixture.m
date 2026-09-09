@@ -3,6 +3,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <mach-o/loader.h>
 #include <crt_externs.h>
 #include <dlfcn.h>
 #include <IOKit/IOKitLib.h>
@@ -181,8 +183,45 @@ static int check_images(const char *path) {
     return bad;
 }
 
+__attribute__((used, noinline)) void integrity_breakpoint_site(void) {
+    __asm__ volatile(".rept 32\n\tnop\n\t.endr");
+}
+
+__attribute__((used, noinline)) void integrity_syscall_site(void) {
+    __asm__ volatile("svc #0x80");
+}
+
+static int check_integrity(const char *expected) {
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)_dyld_get_image_header(0);
+    const struct load_command *command = (const void *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (command->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *segment = (const void *)command;
+            const struct section_64 *section = (const void *)(segment + 1);
+            for (uint32_t j = 0; j < segment->nsects; j++, section++) {
+                if (strcmp(section->segname, "__TEXT") ||
+                    strcmp(section->sectname, "__text")) continue;
+                unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+                char hex[65];
+                CC_SHA256((const void *)(section->addr + _dyld_get_image_vmaddr_slide(0)),
+                          (CC_LONG)section->size, digest);
+                for (int n = 0; n < CC_SHA256_DIGEST_LENGTH; n++)
+                    snprintf(hex + 2 * n, 3, "%02x", digest[n]);
+                int bad = strcmp(hex, expected) != 0;
+                printf("INTEGRITY:%s digest=%s\n", bad ? "DETECTED" : "clean", hex);
+                return bad;
+            }
+        }
+        command = (const void *)((const char *)command + command->cmdsize);
+    }
+    return 66;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (strcmp(argv[1], "integrity") == 0)
+        return argc == 3 ? check_integrity(argv[2]) : 64;
     if (strcmp(argv[1], "env") == 0) {
         int bad = check_environment();
         printf("ENV:%s\n", bad ? "DETECTED" : "clean");

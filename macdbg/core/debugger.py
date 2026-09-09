@@ -52,6 +52,8 @@ class Debugger:
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("settings set target.disable-aslr true", ret, False)
         self.analysis_cloak = AnalysisCloak(self)
+        self.hardware_bp_ids: set[int] = set()
+        self.extra_hardware_bp_ids = lambda: set()
 
     def read_output(self, max_bytes: int = 4096) -> str:
         try:
@@ -65,6 +67,7 @@ class Debugger:
         self.target = self.dbg.CreateTarget(path, None, None, True, err)
         if not err.Success() or not self.target.IsValid():
             raise RuntimeError(f"CreateTarget failed: {err.GetCString()}")
+        self.hardware_bp_ids.clear()
         try:
             self.state = load_for(path)
         except Exception:
@@ -320,8 +323,7 @@ class Debugger:
         bp.SetOneShot(True)
         bp_id = bp.GetID()
         self.process.Continue()
-        if self.process.GetState() != lldb.eStateStopped or (self.pc() or 0) != ep:
-            self.target.BreakpointDelete(bp_id)
+        self.delete_breakpoint(bp_id)
 
     def attach_pid(self, pid: int) -> lldb.SBProcess:
         self.target = self.dbg.CreateTarget("")
@@ -372,7 +374,15 @@ class Debugger:
 
     def cont(self) -> None:
         if self.process:
-            self.process.Continue()
+            ok, error = self.analysis_cloak.validate_resume()
+            if not ok:
+                raise RuntimeError(error)
+            ok, error = self.analysis_cloak.validate_integrity(self.extra_hardware_bp_ids())
+            if not ok:
+                raise RuntimeError(error)
+            result = self.process.Continue()
+            if result.Fail():
+                raise RuntimeError("resume failed: {}".format(result.GetCString()))
 
     def run_to_address(self, addr: int) -> Tuple[bool, str]:
         """Set a one-shot breakpoint at `addr` and continue to it. Returns
@@ -386,17 +396,19 @@ class Debugger:
         cur = self.pc()
         if cur is not None and addr == cur:
             return False, "already at {:#x}".format(addr)
-        bp = self.target.BreakpointCreateByAddress(addr)
+        bp = (self.create_hardware_breakpoint_by_address(addr)
+              if self.hw_breakpoints or self.analysis_cloak.enabled
+              else self.target.BreakpointCreateByAddress(addr))
         if (not bp.IsValid() or bp.GetNumLocations() == 0
                 or not bp.GetLocationAtIndex(0).IsResolved()):
             if bp.IsValid():
-                self.target.BreakpointDelete(bp.GetID())
+                self.delete_breakpoint(bp.GetID())
             return False, "no runnable code at {:#x}".format(addr)
         bp.SetOneShot(True)
         t = self._thread()
         if t:
             bp.SetThreadID(t.GetThreadID())
-        self.process.Continue()
+        self.cont()
         return True, "running to {:#x}".format(addr)
 
     def step_in(self) -> None:
@@ -413,10 +425,38 @@ class Debugger:
         """Run until the current frame returns (gdb's 'finish')."""
         t = self._thread()
         if t:
+            self._require_step_slot()
             self._step_active = True
             self._step_target_depth = t.GetNumFrames() - 1
             self._pending_step_scrubs = None
-            t.StepOut()
+            self._hardware_step_out(t)
+
+    def _require_step_slot(self):
+        if self.analysis_cloak.enabled:
+            from .breakpoints import validate_hardware_capacity
+            validate_hardware_capacity(self.target, reserve=1)
+
+    def _hardware_step_out(self, thread):
+        if not self.analysis_cloak.enabled:
+            thread.StepOut()
+            return
+        self._require_step_slot()
+        # LLDB's private return breakpoint is absent from GetNumBreakpoints().
+        # Require hardware for this plan and reserve its slot until it lands.
+        values = self.dbg.GetInternalVariableValue(
+            "target.require-hardware-breakpoint", self.dbg.GetInstanceName())
+        previous = values.GetStringAtIndex(0)
+        if previous not in ("true", "false"):
+            raise RuntimeError("could not read LLDB hardware-step policy; resume refused")
+        result = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("settings set target.require-hardware-breakpoint true", result, False)
+        if not result.Succeeded():
+            raise RuntimeError("could not require hardware stepping: " + (result.GetError() or ""))
+        try:
+            thread.StepOut()
+        finally:
+            self.ci.HandleCommand("settings set target.require-hardware-breakpoint " + previous,
+                                  result, False)
 
     _CALL_MNEMONICS = {"bl", "blr", "blraa", "blrab", "blraaz", "blrabz"}
 
@@ -447,6 +487,8 @@ class Debugger:
         frame = t.GetFrameAtIndex(0)
         if not frame or not frame.IsValid():
             return
+        if self._is_call_at(frame.GetPC()):
+            self._require_step_slot()
         self._step_active = True
         self._pending_step_scrubs = None
         if self._is_call_at(frame.GetPC()):
@@ -503,7 +545,7 @@ class Debugger:
             self._step_active = False
             self._step_target_depth = None
             return "done"
-        t.StepOut()
+        self._hardware_step_out(t)
         return "more"
 
     def _resolve_pending_step_scrubs(self, thread) -> None:
@@ -633,7 +675,7 @@ class Debugger:
             # A return one-shot armed by a prior non-step hit fired during the
             # step; scrub now and retire it.
             kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
-            self.target.BreakpointDelete(bp_id)
+            self.delete_breakpoint(bp_id)
             self._scrub_flag(kind, buf, oldlenp)
 
     def set_pc(self, addr: int) -> Tuple[bool, str]:
@@ -659,11 +701,15 @@ class Debugger:
         self._pending_step_scrubs = None
 
     def step_in_source(self) -> None:
+        if self.analysis_cloak.enabled:
+            raise RuntimeError("source-level stepping cannot guarantee text integrity; use instruction stepping")
         t = self._thread()
         if t:
             t.StepInto()
 
     def step_over_source(self) -> None:
+        if self.analysis_cloak.enabled:
+            raise RuntimeError("source-level stepping cannot guarantee text integrity; use instruction stepping")
         t = self._thread()
         if t:
             t.StepOver()
@@ -855,19 +901,28 @@ class Debugger:
                 loc = bp.GetLocationAtIndex(j)
                 if loc.GetLoadAddress() == addr:
                     bp_id = bp.GetID()
-                    self.target.BreakpointDelete(bp_id)
+                    self.delete_breakpoint(bp_id)
                     return ("removed", bp_id)
-        if self.hw_breakpoints:
-            ret = lldb.SBCommandReturnObject()
-            self.ci.HandleCommand("breakpoint set -H -a {:#x}".format(addr), ret, False)
-            for i in range(self.target.GetNumBreakpoints()):
-                bp = self.target.GetBreakpointAtIndex(i)
-                for j in range(bp.GetNumLocations()):
-                    if bp.GetLocationAtIndex(j).GetLoadAddress() == addr:
-                        return ("added (HW)", bp.GetID())
-            return ("added (HW)", 0)
+        if self.hw_breakpoints or self.analysis_cloak.enabled:
+            bp = self.create_hardware_breakpoint_by_address(addr)
+            return ("added (HW)", bp.GetID())
         bp = self.target.BreakpointCreateByAddress(addr)
         return ("added", bp.GetID())
+
+    def delete_breakpoint(self, bp_id: int) -> bool:
+        deleted = self.target.BreakpointDelete(bp_id)
+        if deleted or not self.target.FindBreakpointByID(bp_id).IsValid():
+            self.hardware_bp_ids.discard(bp_id)
+        return deleted
+
+    def create_hardware_breakpoint_by_address(self, addr: int):
+        """Require hardware backing; never silently degrade to text patching."""
+        from .breakpoints import create_hardware_breakpoint
+        reserve = int(self.analysis_cloak.enabled and self._step_active
+                      and self._step_target_depth is not None)
+        bp = create_hardware_breakpoint(self.target, self.ci, "-a {:#x}".format(addr), reserve=reserve)
+        self.hardware_bp_ids.add(bp.GetID())
+        return bp
 
     def enable_anti_ptrace(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
@@ -884,7 +939,7 @@ class Debugger:
     def disable_anti_ptrace(self) -> Tuple[bool, str]:
         if not self.target or not self.anti_ptrace_bp_id:
             return True, "already disabled"
-        self.target.BreakpointDelete(self.anti_ptrace_bp_id)
+        self.delete_breakpoint(self.anti_ptrace_bp_id)
         self.anti_ptrace_bp_id = 0
         self._sync_syscall_bp()
         return True, "PT_DENY_ATTACH bypass disabled"
@@ -981,14 +1036,14 @@ class Debugger:
             # SIG_DFL / SIG_IGN / unreadable: step past the brk so we don't trap
             # on it forever. Keeps the session usable even if we can't forward.
             self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
-            self.process.Continue()
+            self.cont()
             return "self-trap: no SIGTRAP handler, skipped brk at {:#x}".format(pc)
         # Deliver: x0 = signo, lr = after the brk (so a handler that returns
         # normally resumes past it), pc = the handler.
         self.ci.HandleCommand("register write x0 {}".format(SIGTRAP), ret, False)
         self.ci.HandleCommand("register write lr {:#x}".format(pc + 4), ret, False)
         self.ci.HandleCommand("register write pc {:#x}".format(handler), ret, False)
-        self.process.Continue()
+        self.cont()
         return "self-trap: ran target SIGTRAP handler {:#x} for brk at {:#x}".format(handler, pc)
 
     def enable_anti_mach_ports(self) -> Tuple[bool, str]:
@@ -1005,7 +1060,7 @@ class Debugger:
     def disable_anti_mach_ports(self) -> Tuple[bool, str]:
         if not self.target or not self.anti_mach_bp_id:
             return True, "already disabled"
-        self.target.BreakpointDelete(self.anti_mach_bp_id)
+        self.delete_breakpoint(self.anti_mach_bp_id)
         self.anti_mach_bp_id = 0
         return True, "Mach exception port cloak disabled"
 
@@ -1024,7 +1079,7 @@ class Debugger:
             self.process.WriteMemory(masks_cnt_ptr, b"\x00\x00\x00\x00", err)
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("thread return 0", ret, False)
-        self.process.Continue()
+        self.cont()
         return "cloaked task_get_exception_ports (returned 0 masks)"
 
     # -- sysctl(P_TRACED) / csops(CS_DEBUGGED) flag scrubbing -----------------
@@ -1048,7 +1103,7 @@ class Debugger:
         buffer. The entry breakpoints stay; only the transient returns go."""
         if self._flag_scrub_returns and self.target and self.target.IsValid():
             for bp_id in list(self._flag_scrub_returns):
-                self.target.BreakpointDelete(bp_id)
+                self.delete_breakpoint(bp_id)
         self._flag_scrub_returns = None
 
     def _ensure_sysctl_bp(self) -> Tuple[bool, str]:
@@ -1065,7 +1120,7 @@ class Debugger:
         """Delete the shared sysctl breakpoint once no owner needs it."""
         if (not self._scrub_ptraced and not self._scrub_parent
                 and self.anti_sysctl_bp_id and self.target):
-            self.target.BreakpointDelete(self.anti_sysctl_bp_id)
+            self.delete_breakpoint(self.anti_sysctl_bp_id)
             self.anti_sysctl_bp_id = 0
 
     def enable_anti_sysctl(self) -> Tuple[bool, str]:
@@ -1100,7 +1155,7 @@ class Debugger:
     def disable_anti_csops(self) -> Tuple[bool, str]:
         if not self.target or not self.anti_csops_bp_id:
             return True, "already disabled"
-        self.target.BreakpointDelete(self.anti_csops_bp_id)
+        self.delete_breakpoint(self.anti_csops_bp_id)
         self.anti_csops_bp_id = 0
         self._sync_syscall_bp()
         return True, "csops(CS_DEBUGGED) scrub disabled"
@@ -1111,7 +1166,14 @@ class Debugger:
         ret_addr = thread.GetFrameAtIndex(0).FindRegister("lr").GetValueAsUnsigned()
         if not ret_addr:
             return
-        bp = self.target.BreakpointCreateByAddress(ret_addr)
+        try:
+            bp = (self.create_hardware_breakpoint_by_address(ret_addr)
+                  if self.analysis_cloak.enabled
+                  else self.target.BreakpointCreateByAddress(ret_addr))
+        except RuntimeError as error:
+            self.analysis_cloak._critical(
+                str(error) + "; restart at entry after reducing hardware sites")
+            return
         bp.SetOneShot(True)
         bp.SetThreadID(thread.GetThreadID())
         if self._flag_scrub_returns is None:
@@ -1193,9 +1255,9 @@ class Debugger:
         # Return side: a tagged call has come back.
         if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
             kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
-            self.target.BreakpointDelete(bp_id)
+            self.delete_breakpoint(bp_id)
             msg = self._scrub_flag(kind, buf, oldlenp)
-            self.process.Continue()
+            self.cont()
             return msg if msg else ""
         thread = self.process.GetSelectedThread()
         if not thread or not thread.IsValid():
@@ -1220,14 +1282,14 @@ class Debugger:
                     if (name[0] == self._CTL_KERN and name[1] == self._KERN_PROC
                             and name[2] == self._KERN_PROC_PID):
                         self._arm_return_scrub(thread, "sysctl", oldp, oldlenp)
-            self.process.Continue()
+            self.cont()
             return ""
         if bp_id == self.anti_csops_bp_id:
             ops = frame.FindRegister("x1").GetValueAsUnsigned()
             useraddr = frame.FindRegister("x2").GetValueAsUnsigned()
             if useraddr and ops == self._CS_OPS_STATUS:
                 self._arm_return_scrub(thread, "csops", useraddr)
-            self.process.Continue()
+            self.cont()
             return ""
         return None
 
@@ -1262,7 +1324,7 @@ class Debugger:
             self.syscall_bp_ids = ids or None
         elif not want and self.syscall_bp_ids:
             for bp_id in self.syscall_bp_ids:
-                self.target.BreakpointDelete(bp_id)
+                self.delete_breakpoint(bp_id)
             self.syscall_bp_ids = None
 
     def _syscall_args(self, frame, n: int) -> List[int]:
@@ -1289,7 +1351,7 @@ class Debugger:
             if self._syscall_args(frame, 1)[0] == 31:  # PT_DENY_ATTACH
                 ret = lldb.SBCommandReturnObject()
                 self.ci.HandleCommand("thread return 0", ret, False)
-                self.process.Continue()
+                self.cont()
                 return "blocked ptrace(PT_DENY_ATTACH) via syscall()"
         elif num == self._SYS_SYSCTL and (self._scrub_ptraced or self._scrub_parent):
             mib, namelen, oldp, oldlenp = self._syscall_args(frame, 4)
@@ -1305,7 +1367,7 @@ class Debugger:
             _pid, ops, useraddr = self._syscall_args(frame, 3)
             if useraddr and ops == self._CS_OPS_STATUS:
                 self._arm_return_scrub(thread, "csops", useraddr)
-        self.process.Continue()
+        self.cont()
         return ""
 
     # -- timing cloak ---------------------------------------------------------
@@ -1347,7 +1409,7 @@ class Debugger:
         if not self.target or not self.anti_timing_bp_ids:
             return True, "already disabled"
         for bp_id in self.anti_timing_bp_ids:
-            self.target.BreakpointDelete(bp_id)
+            self.delete_breakpoint(bp_id)
         self.anti_timing_bp_ids = None
         return True, "timing cloak disabled"
 
@@ -1366,7 +1428,7 @@ class Debugger:
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("thread return {}".format(self._advance_fake_clock()),
                               ret, False)
-        self.process.Continue()
+        self.cont()
         if not self._anti_timing_logged:
             self._anti_timing_logged = True
             return "timing cloak: feeding monotonic clock sources a fake clock"
@@ -1413,7 +1475,13 @@ class Debugger:
         for off in range(0, len(text_bytes) - 3, 4):
             if text_bytes[off:off + 4] == svc_pattern:
                 svc_addr = text_load + off
-                bp = self.target.BreakpointCreateByAddress(svc_addr)
+                try:
+                    bp = (self.create_hardware_breakpoint_by_address(svc_addr)
+                          if self.analysis_cloak.enabled
+                          else self.target.BreakpointCreateByAddress(svc_addr))
+                except RuntimeError as error:
+                    self.disable_direct_syscall_scan()
+                    return False, str(error)
                 if bp.IsValid():
                     self.direct_syscall_bp_ids.append(bp.GetID())
                     found.append(svc_addr)
@@ -1423,7 +1491,7 @@ class Debugger:
         if not self.target or not self.direct_syscall_bp_ids:
             return True, "already disabled"
         for bp_id in self.direct_syscall_bp_ids:
-            self.target.BreakpointDelete(bp_id)
+            self.delete_breakpoint(bp_id)
         self.direct_syscall_bp_ids = []
         return True, "direct-syscall scan disabled"
 
@@ -1445,9 +1513,9 @@ class Debugger:
         if x16 == 26 and x0 == 31:
             self.ci.HandleCommand("register write x0 0", ret, False)
             self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
-            self.process.Continue()
+            self.cont()
             return "blocked direct ptrace(PT_DENY_ATTACH) svc at {:#x}".format(pc)
-        self.process.Continue()
+        self.cont()
         return "direct svc #{} passed (op={:#x})".format(x16, x0)
 
     _FORK_SYMBOLS = ("fork", "vfork")
@@ -1482,9 +1550,9 @@ class Debugger:
             self.fork_mode = "off"
             return True, "fork identity already off"
         for bp_id in (self.fork_bp_ids or []):
-            self.target.BreakpointDelete(bp_id)
+            self.delete_breakpoint(bp_id)
         for bp_id in (self.setsid_bp_ids or []):
-            self.target.BreakpointDelete(bp_id)
+            self.delete_breakpoint(bp_id)
         self.fork_bp_ids = []
         self.setsid_bp_ids = []
         self.fork_mode = "off"
@@ -1499,7 +1567,7 @@ class Debugger:
         fake_sid = self.process.GetProcessID() or 1
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("thread return {}".format(fake_sid), ret, False)
-        self.process.Continue()
+        self.cont()
         return "identity: setsid() faked, returned {} (real call would fail)".format(fake_sid)
 
     def peek_fork_hit(self, bp_id: int) -> Optional[str]:
@@ -1522,7 +1590,7 @@ class Debugger:
         if decision == "child":
             ret = lldb.SBCommandReturnObject()
             self.ci.HandleCommand("thread return 0", ret, False)
-            self.process.Continue()
+            self.cont()
             return
         # A real fork copies our breakpoints into the child, which then dies on
         # the first inherited trap before it can exec. Lift every breakpoint
@@ -1530,9 +1598,9 @@ class Debugger:
         # return with a hardware breakpoint (not inherited by the child). The
         # saved breakpoints go back on the next stop, in finish_fork_shield.
         if not self._arm_fork_shield():
-            self.process.Continue()
+            self.cont()
             return
-        self.process.Continue()
+        self.cont()
 
     def _arm_fork_shield(self) -> bool:
         if not self.target:
@@ -1543,15 +1611,9 @@ class Debugger:
         if not ret_addr:
             return False
         n_before = self.target.GetNumBreakpoints()
-        ro = lldb.SBCommandReturnObject()
-        self.ci.HandleCommand("breakpoint set -H -a {:#x}".format(ret_addr), ro, False)
-        if self.target.GetNumBreakpoints() <= n_before:
-            return False
-        hw_bp = self.target.GetBreakpointAtIndex(n_before)
-        # If no debug register was free the breakpoint resolves to nothing; abort
-        # rather than disable everything and lose the return (and all tracing).
-        if hw_bp.GetNumLocations() == 0:
-            self.target.BreakpointDelete(hw_bp.GetID())
+        try:
+            hw_bp = self.create_hardware_breakpoint_by_address(ret_addr)
+        except RuntimeError:
             return False
         saved = []
         for i in range(n_before):
@@ -1571,7 +1633,7 @@ class Debugger:
         breakpoint and re-arm everything we lifted."""
         if self.target:
             if self._fork_shield_hw_bp:
-                self.target.BreakpointDelete(self._fork_shield_hw_bp)
+                self.delete_breakpoint(self._fork_shield_hw_bp)
             for bid in (self._fork_shield_saved or []):
                 bp = self.target.FindBreakpointByID(bid)
                 if bp.IsValid():
@@ -1591,7 +1653,7 @@ class Debugger:
         fname = frame.GetFunctionName() or "fork"
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("thread return 0", ret, False)
-        self.process.Continue()
+        self.cont()
         return "identity: {}() returned 0, parent takes child code path".format(fname)
 
     def enable_exec_sandbox(self) -> Tuple[bool, str]:
@@ -1611,7 +1673,7 @@ class Debugger:
         if not self.target or not self.exec_bp_ids:
             return True, "already disabled"
         for bp_id in self.exec_bp_ids:
-            self.target.BreakpointDelete(bp_id)
+            self.delete_breakpoint(bp_id)
         self.exec_bp_ids = {}
         return True, "exec sandbox disabled"
 
@@ -1737,7 +1799,7 @@ class Debugger:
         elif decision == "fake":
             self.ci.HandleCommand(
                 "thread return {}".format(self._exec_success_value(name)), ret, False)
-        self.process.Continue()
+        self.cont()
 
     @staticmethod
     def _exec_success_value(name: str) -> int:
@@ -1784,11 +1846,11 @@ class Debugger:
         req = frame.FindRegister("x0").GetValueAsUnsigned()
         PT_DENY_ATTACH = 31
         if req != PT_DENY_ATTACH:
-            self.process.Continue()
+            self.cont()
             return "ptrace(op={}) allowed through".format(req)
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("thread return 0", ret, False)
-        self.process.Continue()
+        self.cont()
         return "blocked ptrace(PT_DENY_ATTACH) — returned 0 without syscall"
 
     def breakpoints(self, exclude_ids: Optional[set] = None) -> List[Tuple[int, int, str, int, bool, str]]:

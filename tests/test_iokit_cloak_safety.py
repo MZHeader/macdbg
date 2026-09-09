@@ -76,6 +76,9 @@ class FakeTarget:
 
 
 class ScriptedDebugger:
+    def cont(self):
+        self.process.Continue()
+
     def __init__(self, process, script):
         self.process = process
         self.target = FakeTarget()

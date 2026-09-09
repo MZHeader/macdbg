@@ -516,6 +516,7 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
 class Tracer:
     def __init__(self) -> None:
         self._bp_ids: List[int] = []
+        self._hardware_bp_ids: set[int] = set()
         self._bp_to_name: Dict[int, str] = {}
         self._regex_bps: Dict[int, Tuple[str, Callable]] = {}
         self.enabled = False
@@ -524,21 +525,33 @@ class Tracer:
         self.hardware: bool = False
         self.skip_fd: int = -1
 
+    @property
+    def hardware_bp_ids(self) -> set[int]:
+        return set(self._hardware_bp_ids)
+
+    def _create_breakpoint(self, target, ci, name, regex=False):
+        if not self.hardware:
+            return (target.BreakpointCreateByRegex(name) if regex
+                    else target.BreakpointCreateByName(name))
+        from .breakpoints import create_hardware_breakpoint
+        import shlex
+        try:
+            bp = create_hardware_breakpoint(
+                target, ci, ("-r " if regex else "-n ") + shlex.quote(name),
+                require_location=False)
+        except RuntimeError:
+            self.disable(target)
+            raise
+        self._hardware_bp_ids.add(bp.GetID())
+        return bp
+
     def enable(self, target: lldb.SBTarget, ci: Optional[lldb.SBCommandInterpreter] = None) -> Tuple[int, int]:
         if self.enabled or not target or not target.IsValid():
             return (0, 0)
         self._exec_name = target.GetExecutable().GetFilename() or ""
         resolved_now = 0
         for name in SIGS:
-            if self.hardware and ci is not None:
-                n_before = target.GetNumBreakpoints()
-                ret = lldb.SBCommandReturnObject()
-                ci.HandleCommand("breakpoint set -H -n {}".format(name), ret, False)
-                if target.GetNumBreakpoints() <= n_before:
-                    continue
-                bp = target.GetBreakpointAtIndex(n_before)
-            else:
-                bp = target.BreakpointCreateByName(name)
+            bp = self._create_breakpoint(target, ci, name)
             if not bp.IsValid():
                 continue
             self._bp_ids.append(bp.GetID())
@@ -546,7 +559,7 @@ class Tracer:
             if bp.GetNumLocations() > 0:
                 resolved_now += 1
         for pattern, cat, fmt in REGEX_SIGS:
-            rbp = target.BreakpointCreateByRegex(pattern)
+            rbp = self._create_breakpoint(target, ci, pattern, regex=True)
             if not rbp.IsValid():
                 continue
             self._bp_ids.append(rbp.GetID())
@@ -558,6 +571,7 @@ class Tracer:
         return (len(self._bp_ids), resolved_now)
 
     def disable(self, target: lldb.SBTarget) -> None:
+        self._hardware_bp_ids.clear()
         if not target or not target.IsValid():
             self._bp_ids.clear()
             self._bp_to_name.clear()

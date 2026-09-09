@@ -98,6 +98,9 @@ class FakeTarget:
 
 
 class FakeCloakDebugger:
+    def cont(self):
+        self.process.Continue()
+
     def __init__(self, process):
         self.process = process
         self.target = FakeTarget()

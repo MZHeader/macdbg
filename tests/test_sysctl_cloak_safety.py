@@ -138,9 +138,15 @@ class FakeProcess:
 
 
 class FakeDebugger:
+    def cont(self):
+        self.process.Continue()
+
     def __init__(self, process, **target_kwargs):
         self.process = process
         self.target = FakeTarget(**target_kwargs)
+
+    def create_hardware_breakpoint_by_address(self, address):
+        return self.target.BreakpointCreateByAddress(address)
 
 
 def make_return_cloak(name="hw.model", *, returned=0, capacity=128,

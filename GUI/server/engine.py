@@ -55,6 +55,7 @@ class Engine:
 
         self.dbg = Debugger()
         self.tracer = Tracer()
+        self.dbg.extra_hardware_bp_ids = lambda: self.tracer.hardware_bp_ids
         self.pump: Optional[EventPump] = None
 
         self._prev_regs: Dict[str, str] = {}
@@ -359,6 +360,12 @@ class Engine:
             self._resuming = False
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
+            cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
+                self.tracer.hardware_bp_ids)
+            if not cloak_ok:
+                self._console("[anti-analysis] " + cloak_error, error=True)
+                self._emit_state()
+                return
             if self.dbg.in_user_step():
                 if self.tracer.enabled:
                     self._log_trace_hit()
@@ -539,7 +546,7 @@ class Engine:
         hidden = self._hidden_bp_ids()
         if any(b not in hidden for b in self._stop_bp_ids(thread)):
             return False
-        self.dbg.process.Continue()
+        self.dbg.cont()
         return True
 
     def _add_trace(self, category: str, call: str) -> None:
@@ -588,6 +595,12 @@ class Engine:
         if not (p and p.IsValid() and p.GetState() == lldb.eStateStopped):
             return False
         cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_resume()
+        if not cloak_ok:
+            self._console("[anti-analysis] " + cloak_error, error=True)
+            self._emit_state()
+            return False
+        cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
+            self.tracer.hardware_bp_ids)
         if not cloak_ok:
             self._console("[anti-analysis] " + cloak_error, error=True)
             self._emit_state()

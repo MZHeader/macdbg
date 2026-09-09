@@ -232,6 +232,7 @@ class AnalysisCloak:
             return
         for bp_id in bp_ids:
             target.BreakpointDelete(bp_id)
+            getattr(self.debugger, "hardware_bp_ids", set()).discard(bp_id)
 
     def filter_launch_environment(self, entries) -> list[str]:
         return filter_environment(entries) if self.enabled else list(entries)
@@ -262,6 +263,7 @@ class AnalysisCloak:
         hook = self._return_hooks.pop(bp_id, None)
         if hook is not None:
             target.BreakpointDelete(bp_id)
+            getattr(self.debugger, "hardware_bp_ids", set()).discard(bp_id)
             import lldb
             message = ""
             thread = process.GetSelectedThread()
@@ -343,7 +345,7 @@ class AnalysisCloak:
                             else:
                                 message = "spoofed sysctlbyname({})".format(name)
             if self.last_error is None:
-                process.Continue()
+                self.debugger.cont()
             return message
 
         if bp_id not in self._bp_ids:
@@ -363,7 +365,10 @@ class AnalysisCloak:
             return_address = frame.FindRegister("lr").GetValueAsUnsigned()
             entry_message = ""
             if return_address:
-                bp = target.BreakpointCreateByAddress(return_address)
+                try:
+                    bp = self.debugger.create_hardware_breakpoint_by_address(return_address)
+                except RuntimeError as error:
+                    return self._critical(str(error) + "; restart at entry after reducing hardware sites")
                 if bp.IsValid() and bp.GetNumLocations() > 0:
                     bp.SetOneShot(True)
                     bp.SetThreadID(thread.GetThreadID())
@@ -378,7 +383,7 @@ class AnalysisCloak:
                 entry_message = self._critical(
                     "_dyld_get_image_name has no return address; cloak failed")
             if self.last_error is None:
-                process.Continue()
+                self.debugger.cont()
             return entry_message
         buffer = frame.FindRegister("x1").GetValueAsUnsigned()
         size_pointer = frame.FindRegister("x2").GetValueAsUnsigned()
@@ -407,7 +412,10 @@ class AnalysisCloak:
                         "sysctlbyname({}) could not read input capacity; "
                         "cloak failed".format(name))
         if hook is not None and return_address:
-            bp = target.BreakpointCreateByAddress(return_address)
+            try:
+                bp = self.debugger.create_hardware_breakpoint_by_address(return_address)
+            except RuntimeError as error:
+                return self._critical(str(error) + "; restart at entry after reducing hardware sites")
             if (entry_kind != "sysctlbyname"
                     or (bp.IsValid() and bp.GetNumLocations() > 0)):
                 bp.SetOneShot(True)
@@ -424,7 +432,7 @@ class AnalysisCloak:
                 "sysctlbyname({}) could not arm return hook; cloak failed"
                 .format(hook[1]))
         if self.last_error is None:
-            process.Continue()
+            self.debugger.cont()
         return entry_message
 
     def _handle_image_return(self, result, returned: int, lldb_module) -> str:
@@ -467,7 +475,7 @@ class AnalysisCloak:
             return self._critical(
                 "could not read IOKit property key; cloak failed")
         if key not in IOKIT_SPOOFS:
-            process.Continue()
+            self.debugger.cont()
             return ""
 
         replacement = self._cfstring_cache.get(key)
@@ -500,7 +508,7 @@ class AnalysisCloak:
                 "could not return replacement for {}; cloak failed: {}"
                 .format(key, err.strip()))
 
-        process.Continue()
+        self.debugger.cont()
         return "spoofed IORegistryEntryCreateCFProperty({})".format(key)
 
     def _eval_pointer(self, expression: str) -> Optional[int]:
@@ -619,6 +627,60 @@ class AnalysisCloak:
         if self.enabled and self.last_error:
             return False, self.last_error
         return True, "analysis cloak ready"
+
+    def validate_integrity(self, extra_hardware_ids: set[int]) -> tuple[bool, str]:
+        if not self.enabled:
+            return True, "integrity protection disabled"
+        target = self.debugger.target
+        from .breakpoints import validate_hardware_capacity
+        try:
+            reserve = int(getattr(self.debugger, "_step_active", False)
+                          and getattr(self.debugger, "_step_target_depth", None) is not None)
+            validate_hardware_capacity(target, reserve=reserve)
+        except RuntimeError as error:
+            return False, str(error)
+        executable = target.GetExecutable()
+        module = target.FindModule(executable)
+        if not module or not module.IsValid():
+            return False, "cannot locate main executable __text; restart at entry"
+        text = module.FindSection("__TEXT").FindSubSection("__text")
+        if not text or not text.IsValid():
+            return False, "cannot locate main executable __TEXT,__text; resume refused"
+        start = text.GetLoadAddress(target)
+        size = text.GetByteSize()
+        if start in (0, 0xffffffffffffffff) or not size:
+            return False, "main executable __text is not mapped; restart at entry"
+        end = start + size
+        live_ids = {target.GetBreakpointAtIndex(i).GetID()
+                    for i in range(target.GetNumBreakpoints())}
+        # LLDB removes one-shots itself and raw commands may delete user BPs.
+        self.debugger.hardware_bp_ids.intersection_update(live_ids)
+        hardware_ids = self.debugger.hardware_bp_ids | set(extra_hardware_ids)
+        for i in range(target.GetNumBreakpoints()):
+            bp = target.GetBreakpointAtIndex(i)
+            if not bp.IsEnabled():
+                continue
+            for j in range(bp.GetNumLocations()):
+                location = bp.GetLocationAtIndex(j)
+                if (location.IsEnabled()
+                        and start <= location.GetLoadAddress() < end):
+                    if bp.GetID() not in hardware_ids or not bp.IsHardware():
+                        return (False, "software breakpoint modifies target __text "
+                                "(breakpoint #{}); delete or disable it and recreate "
+                                "it using the structured hardware breakpoint command. "
+                                "For internal sites, disable/re-enable their defense "
+                                "or enable tracer hardware mode"
+                                .format(bp.GetID()))
+                    if not location.IsResolved():
+                        return (False, "hardware breakpoint #{} is not installed; "
+                                "free hardware breakpoint slots or reduce traced sites"
+                                .format(bp.GetID()))
+        state = getattr(self.debugger, "state", None)
+        for patch in state.patches if state else ():
+            if patch.new and patch.addr < end and patch.addr + len(patch.new) > start:
+                return (False, "tracked patch modifies target __text at {:#x}; "
+                        "revert the patch before resuming".format(patch.addr))
+        return True, "target __text integrity protected"
 
     def clear_return_hooks(self) -> None:
         self._delete_breakpoints(self._return_hooks)

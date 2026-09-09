@@ -15,6 +15,105 @@ from .support import (
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_integrity_step_out_preserves_text(self):
+        digest = support.fixture_text_digest()
+        with AgentProcess(FIXTURE, "integrity", extra_args=[digest]) as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            for command in ("step_in_source", "step_over_source"):
+                rejected = agent.cmd(command, {"timeout": 15})
+                self.assertFalse(rejected["ok"], rejected)
+                self.assertIn("use instruction stepping", rejected["error"])
+                self.assertEqual(agent.cmd("status")["process_state"], "stopped")
+            bp = agent.cmd("breakpoint_toggle", {"addr": support.fixture_symbol("check_integrity")})
+            self.assertTrue(bp["ok"], bp)
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "stop", result)
+            self.assertTrue(agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})["ok"])
+            result = agent.cmd("step_out", {"timeout": 15})
+            self.assertEqual(result.get("event"), "stop", result)
+            self.assertIn("INTEGRITY:clean", result["console"])
+            policy = agent.cmd("raw", {"command": "settings show target.require-hardware-breakpoint"})
+            self.assertIn("false", policy["output"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+
+    def test_cloak_return_hook_slot_failure_leaves_target_stopped(self):
+        marker = support.fixture_symbol("integrity_breakpoint_site")
+        capacity = int(subprocess.check_output(
+            ["/usr/sbin/sysctl", "-n", "hw.optional.breakpoint"], text=True))
+        self.assertLessEqual(capacity, 32)
+        with AgentProcess(FIXTURE, "parent") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            for index in range(capacity):
+                result = agent.cmd("breakpoint_toggle", {"addr": marker + index * 4})
+                self.assertTrue(result["ok"], result)
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "stop", result)
+            self.assertIn("hardware breakpoint allocation failed", result["console"])
+            self.assertNotIn("PARENT:", result["console"])
+            self.assertEqual(agent.cmd("status")["process_state"], "stopped")
+            blocked = agent.continue_to_exit()
+            self.assertFalse(blocked["ok"], blocked)
+            self.assertIn("restart at entry", blocked["error"])
+
+    def test_integrity_hardware_slot_exhaustion_is_recoverable(self):
+        digest = support.fixture_text_digest()
+        marker = support.fixture_symbol("integrity_breakpoint_site")
+        with AgentProcess(FIXTURE, "integrity", extra_args=[digest]) as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            created = []
+            for index in range(32):
+                result = agent.cmd("breakpoint_toggle", {"addr": marker + index * 4})
+                if not result["ok"]:
+                    self.assertIn("hardware breakpoint allocation failed", result["error"])
+                    self.assertIn("slots", result["error"])
+                    break
+                created.append(result["bp_id"])
+            else:
+                # debugserver can defer physical allocation until resume.
+                result = agent.cmd("continue", {"timeout": 2})
+                self.assertFalse(result["ok"], result)
+                self.assertIn("hardware breakpoint", result["error"])
+                self.assertIn("slots", result["error"])
+                self.assertEqual(agent.cmd("status")["process_state"], "stopped")
+            listed = agent.cmd("breakpoint_list")["breakpoints"]
+            self.assertEqual({bp["id"] for bp in listed}, set(created))
+            agent.clear_user_breakpoints()
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+
+    def test_integrity_hardware_breakpoint_preserves_text(self):
+        digest = support.fixture_text_digest()
+        direct = run_fixture_direct("integrity", extra_args=[digest])
+        self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        with AgentProcess(FIXTURE, "integrity", extra_args=[digest]) as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            bp = agent.cmd("breakpoint_toggle", {
+                "addr": support.fixture_symbol("integrity_breakpoint_site")})
+            self.assertTrue(bp["ok"], bp)
+            self.assertIn("added (HW)", str(bp))
+            scan = agent.cmd("defense_enable", {"name": "direct_syscall"})
+            self.assertTrue(scan["ok"], scan)
+            self.assertIn("1 svc", scan["message"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("INTEGRITY:clean", result["console"])
+
+    def test_integrity_raw_software_breakpoint_blocks_resume(self):
+        digest = support.fixture_text_digest()
+        with AgentProcess(FIXTURE, "integrity", extra_args=[digest]) as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            bp = agent.cmd("raw", {"command": "breakpoint set -a {:#x}".format(
+                support.fixture_symbol("integrity_breakpoint_site"))})
+            self.assertTrue(bp["ok"], bp)
+            result = agent.continue_to_exit()
+            self.assertFalse(result["ok"], result)
+            self.assertIn("software breakpoint modifies target __text", result["error"])
+            self.assertEqual(agent.cmd("status")["process_state"], "stopped")
+
     def test_blacklisted_loaded_images_are_cloaked(self):
         dylib = str(FRIDA_FIXTURE.resolve())
         direct = run_fixture_direct("images", extra_args=[dylib])

@@ -92,6 +92,7 @@ class AgentSession:
         self.attach_pid = attach_pid
         self.dbg = Debugger()
         self.tracer = Tracer()
+        self.dbg.extra_hardware_bp_ids = lambda: self.tracer.hardware_bp_ids
         self._trace_hits: List[dict] = []
         self._trace_count = 0
         self._console: List[str] = []
@@ -182,6 +183,10 @@ class AgentSession:
         cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_resume()
         if not cloak_ok:
             return {"ok": False, "error": cloak_error}
+        cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
+            self.tracer.hardware_bp_ids)
+        if not cloak_ok:
+            return {"ok": False, "error": cloak_error}
         if self._pending is not None and cmd not in ("decide_fork", "decide_exec"):
             # A resume issued while a fork/exec decision is pending would
             # otherwise just call dbg.cont()/step_*() directly, letting the
@@ -263,7 +268,7 @@ class AgentSession:
             guard = self._guard_hidden_bp(bp_id)
             if guard is not None:
                 return guard
-            ok = self.dbg.target.BreakpointDelete(bp_id)
+            ok = self.dbg.delete_breakpoint(bp_id)
             return {"ok": bool(ok)}
         if cmd == "registers":
             return self.cmd_registers()
@@ -696,6 +701,10 @@ class AgentSession:
             # leaving it running uncontrolled with no way back but interrupt.
             return {"ok": False, "error": "timeout must be a number, got {!r}".format(max_wait)}
         if resume is not None:
+            cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
+                self.tracer.hardware_bp_ids)
+            if not cloak_ok:
+                return {"ok": False, "error": cloak_error}
             resume()
         event = lldb.SBEvent()
         wait_timeout = max(1, int(wait_timeout))
@@ -770,6 +779,11 @@ class AgentSession:
                 continue
             if state == lldb.eStateStopped:
                 self.dbg.select_stopped_thread()
+                cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
+                    self.tracer.hardware_bp_ids)
+                if not cloak_ok:
+                    return {"ok": False, "error": cloak_error,
+                            "console": self._drain_console()}
                 if self.dbg.in_user_step():
                     # Completing a user step: log this stop first if it is a
                     # tracer hit, then drive the step -- never letting the tracer
