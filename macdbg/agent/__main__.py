@@ -74,6 +74,18 @@ def _cleanup_session_files(sdir: str) -> None:
             pass
 
 
+def _terminate_and_reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    else:
+        proc.wait()
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -150,21 +162,33 @@ def _cmd_start_locked(ns, name: str, sdir: str) -> int:
     elif ns.program:
         argv += ["--program", ns.program, "--"] + ns.args
     log = open(log_path, "ab")
-    proc = subprocess.Popen(argv, stdout=log, stderr=log, cwd=repo_root,
-                             start_new_session=True)
+    try:
+        proc = subprocess.Popen(argv, stdout=log, stderr=log, cwd=repo_root,
+                                start_new_session=True)
+    finally:
+        log.close()
     meta_path = os.path.join(sdir, "meta.json")
     deadline = time.time() + ns.boot_timeout
-    while time.time() < deadline:
-        if os.path.exists(meta_path):
-            break
-        if proc.poll() is not None:
+    meta_published = False
+    try:
+        while time.time() < deadline:
+            if os.path.exists(meta_path):
+                meta_published = True
+                break
+            if proc.poll() is not None:
+                print(json.dumps({"ok": False, "error":
+                                   "daemon exited during startup (see {})".format(log_path)}))
+                return 1
+            time.sleep(0.1)
+        else:
             print(json.dumps({"ok": False, "error":
-                               "daemon exited during startup (see {})".format(log_path)}))
+                               "daemon did not start within {}s".format(
+                                   ns.boot_timeout)}))
             return 1
-        time.sleep(0.1)
-    else:
-        print(json.dumps({"ok": False, "error": "daemon did not start within {}s".format(ns.boot_timeout)}))
-        return 1
+    finally:
+        if not meta_published:
+            _terminate_and_reap(proc)
+            _cleanup_session_files(sdir)
 
     from .client import send_command, ClientError
     meta = _read_meta(name)
