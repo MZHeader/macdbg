@@ -74,6 +74,25 @@ static int check_parent(void) {
     return bad;
 }
 
+static int check_sysctl(void) {
+    int hv = -1;
+    size_t hvn = sizeof(hv);
+    char model[128] = {0};
+    char cpu[128] = {0};
+    size_t modeln = sizeof(model);
+    size_t cpun = sizeof(cpu);
+
+    sysctlbyname("kern.hv_vmm_present", &hv, &hvn, NULL, 0);
+    sysctlbyname("hw.model", model, &modeln, NULL, 0);
+    sysctlbyname("machdep.cpu.brand_string", cpu, &cpun, NULL, 0);
+
+    int bad = hv != 0 || strcmp(model, "Mac14,6") ||
+              strcmp(cpu, "Apple M2 Pro");
+    printf("SYSCTL:%s hv=%d model=%s cpu=%s\n",
+           bad ? "DETECTED" : "clean", hv, model, cpu);
+    return bad;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 64;
     if (strcmp(argv[1], "env") == 0) {
@@ -86,5 +105,7 @@ int main(int argc, char **argv) {
         printf("PARENT:%s\n", bad ? "DETECTED" : "clean");
         return bad;
     }
+    if (strcmp(argv[1], "sysctl") == 0)
+        return check_sysctl();
     return 65;
 }

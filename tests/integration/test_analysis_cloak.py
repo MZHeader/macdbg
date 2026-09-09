@@ -8,6 +8,22 @@ from .support import AgentProcess, FIXTURE, run_fixture_direct
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_hardware_sysctls_are_spoofed(self):
+        direct = run_fixture_direct("sysctl")
+        self.assertNotEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        self.assertIn("SYSCTL:DETECTED", direct.stdout)
+
+        with AgentProcess(FIXTURE, "sysctl") as agent:
+            enabled = agent.enable_cloak()
+            self.assertTrue(enabled["ok"], enabled)
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn(
+                "SYSCTL:clean hv=0 model=Mac14,6 cpu=Apple M2 Pro",
+                result["console"],
+            )
+
     def test_parent_paths_are_cloaked(self):
         with AgentProcess(FIXTURE, "parent") as agent:
             self.assertTrue(agent.enable_cloak()["ok"])

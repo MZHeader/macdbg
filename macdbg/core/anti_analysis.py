@@ -36,6 +36,10 @@ SYSCTL_SPOOFS = {
     "machdep.cpu.brand_string": SpoofValue("cstring", "Apple M2 Pro"),
 }
 
+ParentReturnHook = tuple[str, int, int]
+SysctlReturnHook = tuple[str, str, int, int, int]
+ReturnHook = Union[ParentReturnHook, SysctlReturnHook]
+
 
 def contains_marker(value: str, markers: Sequence[str]) -> bool:
     folded = value.casefold()
@@ -65,14 +69,17 @@ class AnalysisCloak:
     def __init__(self, debugger):
         self.debugger = debugger
         self.enabled: bool = False
+        self.last_error: Optional[str] = None
         self._bp_ids: set[int] = set()
-        self._return_hooks: dict[int, tuple[str, int, int]] = {}
+        self._entry_hooks: dict[int, str] = {}
+        self._return_hooks: dict[int, ReturnHook] = {}
         self._owned_existing = set()
         self._owned_existing_bp_ids = {}
 
     def enable(self) -> tuple[bool, str]:
         if self.enabled:
             return True, "analysis cloak already enabled"
+        self.last_error = None
         if not self.debugger.is_stopped_at_entry_point():
             return (False,
                     "analysis cloak must be enabled while stopped at the "
@@ -98,18 +105,25 @@ class AnalysisCloak:
         target = self.debugger.target
         create_bp = getattr(target, "BreakpointCreateByName", None)
         if create_bp is not None:
-            bp = create_bp("proc_pidpath")
-            if not bp.IsValid() or bp.GetNumLocations() == 0:
-                if bp.IsValid():
-                    target.BreakpointDelete(bp.GetID())
-                self._rollback_existing(acquired)
-                return False, "could not enable proc_pidpath cloak: symbol not found"
-            self._bp_ids.add(bp.GetID())
+            for symbol in ("proc_pidpath", "sysctlbyname"):
+                bp = create_bp(symbol)
+                if not bp.IsValid() or bp.GetNumLocations() == 0:
+                    if bp.IsValid():
+                        target.BreakpointDelete(bp.GetID())
+                    self._delete_breakpoints(self._bp_ids)
+                    self._bp_ids.clear()
+                    self._entry_hooks.clear()
+                    self._rollback_existing(acquired)
+                    return (False, "could not enable {} cloak: symbol not found"
+                            .format(symbol))
+                self._bp_ids.add(bp.GetID())
+                self._entry_hooks[bp.GetID()] = symbol
 
         ok, message = self.scrub_live_environment()
         if not ok:
             self._delete_breakpoints(self._bp_ids)
             self._bp_ids.clear()
+            self._entry_hooks.clear()
             self._rollback_existing(acquired)
             return False, message
 
@@ -119,6 +133,7 @@ class AnalysisCloak:
     def disable(self) -> tuple[bool, str]:
         self._delete_breakpoints(set(self._bp_ids) | set(self._return_hooks))
         self._bp_ids.clear()
+        self._entry_hooks.clear()
         self._return_hooks.clear()
         for name in reversed([item[0] for item in self._EXISTING_DEFENSES]):
             if name in self._owned_existing:
@@ -127,6 +142,7 @@ class AnalysisCloak:
                     self._owned_existing_bp_ids.pop(name, set()))
         self._owned_existing.clear()
         self.enabled = False
+        self.last_error = None
         return True, "analysis cloak disabled"
 
     def _rollback_existing(self, acquired):
@@ -181,41 +197,84 @@ class AnalysisCloak:
         hook = self._return_hooks.pop(bp_id, None)
         if hook is not None:
             target.BreakpointDelete(bp_id)
-            _kind, buffer, capacity = hook
             import lldb
             message = ""
             thread = process.GetSelectedThread()
             frame = thread.GetFrameAtIndex(0)
             result = frame.FindRegister("x0")
             returned = result.GetValueAsUnsigned()
-            replacement = b"/sbin/launchd\0"
-            if 0 < returned <= capacity and capacity >= len(replacement):
-                err = lldb.SBError()
-                read_size = min(capacity, max(returned + 1,
-                                              len(replacement)))
-                data = process.ReadMemory(buffer, read_size, err)
-                nul = data.find(b"\0") if data else -1
-                if (err.Success() and len(data) == read_size
-                        and nul >= 0):
-                    path = data[:nul].decode("utf-8", errors="replace")
-                    if contains_marker(path, TOOL_MARKERS):
-                        original = data[:len(replacement)]
-                        written = process.WriteMemory(buffer, replacement, err)
-                        if err.Success() and written == len(replacement):
-                            if (result.SetValueFromCString(
-                                    str(len(replacement) - 1))
-                                    and result.GetValueAsUnsigned()
-                                    == len(replacement) - 1):
-                                message = (
-                                    "cloaked parent process path from "
-                                    "proc_pidpath")
-                            else:
-                                result.SetValueFromCString(str(returned))
+            if len(hook) == 3:
+                _kind, buffer, capacity = hook
+                replacement = b"/sbin/launchd\0"
+                if 0 < returned <= capacity and capacity >= len(replacement):
+                    err = lldb.SBError()
+                    read_size = min(capacity, max(returned + 1,
+                                                  len(replacement)))
+                    data = process.ReadMemory(buffer, read_size, err)
+                    nul = data.find(b"\0") if data else -1
+                    if (err.Success() and len(data) == read_size
+                            and nul >= 0):
+                        path = data[:nul].decode("utf-8", errors="replace")
+                        if contains_marker(path, TOOL_MARKERS):
+                            original = data[:len(replacement)]
+                            written = process.WriteMemory(buffer, replacement, err)
+                            if err.Success() and written == len(replacement):
+                                if (result.SetValueFromCString(
+                                        str(len(replacement) - 1))
+                                        and result.GetValueAsUnsigned()
+                                        == len(replacement) - 1):
+                                    message = (
+                                        "cloaked parent process path from "
+                                        "proc_pidpath")
+                                else:
+                                    result.SetValueFromCString(str(returned))
+                                    rollback = lldb.SBError()
+                                    process.WriteMemory(buffer, original, rollback)
+                            elif written:
                                 rollback = lldb.SBError()
                                 process.WriteMemory(buffer, original, rollback)
-                        elif written:
-                            rollback = lldb.SBError()
-                            process.WriteMemory(buffer, original, rollback)
+            else:
+                kind, name, buffer, size_pointer, capacity = hook
+                if returned == 0:
+                    spoof = SYSCTL_SPOOFS[name]
+                    payload = (int(spoof.value).to_bytes(4, "little")
+                               if kind == "u32" else
+                               str(spoof.value).encode() + b"\0")
+                    if not buffer or not size_pointer or capacity < len(payload):
+                        message = self._critical(
+                            "sysctlbyname({}) buffer too small; cloak failed"
+                            .format(name))
+                    else:
+                        original = self._read_exact(buffer, len(payload), lldb)
+                        original_size = self._read_exact(size_pointer, 8, lldb)
+                        if original is None or original_size is None:
+                            message = self._critical(
+                                "sysctlbyname({}) could not preserve real result; "
+                                "cloak failed".format(name))
+                        elif not self._write_exact(buffer, payload, lldb):
+                            rollback_ok = self._write_exact(
+                                buffer, original, lldb)
+                            rollback = ("; rollback failed"
+                                        if not rollback_ok else "")
+                            message = self._critical(
+                                "sysctlbyname({}) could not write result buffer; "
+                                "cloak failed{}".format(name, rollback))
+                        else:
+                            size = len(payload).to_bytes(8, "little")
+                            if not self._write_exact(size_pointer, size, lldb):
+                                buffer_rollback_ok = self._write_exact(
+                                    buffer, original, lldb)
+                                size_rollback_ok = self._write_exact(
+                                    size_pointer, original_size, lldb)
+                                rollback_ok = (buffer_rollback_ok
+                                               and size_rollback_ok)
+                                rollback = ("; rollback failed"
+                                            if not rollback_ok else "")
+                                message = self._critical(
+                                    "sysctlbyname({}) could not write result size; "
+                                    "cloak failed{}".format(name, rollback))
+                            else:
+                                message = "spoofed sysctlbyname({})".format(name)
             process.Continue()
             return message
 
@@ -227,26 +286,86 @@ class AnalysisCloak:
         frame = thread.GetFrameAtIndex(0)
         if not frame or not frame.IsValid():
             return None
+        entry_kind = self._entry_hooks.get(bp_id)
+        if entry_kind is None:
+            return None
         buffer = frame.FindRegister("x1").GetValueAsUnsigned()
-        capacity = frame.FindRegister("x2").GetValueAsUnsigned()
+        size_pointer = frame.FindRegister("x2").GetValueAsUnsigned()
         return_address = frame.FindRegister("lr").GetValueAsUnsigned()
-        if buffer and capacity and return_address:
+        hook = None
+        entry_message = ""
+        if entry_kind == "proc_pidpath":
+            capacity = size_pointer
+            if buffer and capacity:
+                hook = ("proc_pidpath", buffer, capacity)
+        else:
+            import lldb
+            name_pointer = frame.FindRegister("x0").GetValueAsUnsigned()
+            err = lldb.SBError()
+            name = (process.ReadCStringFromMemory(name_pointer, 256, err)
+                    if name_pointer else "")
+            if err.Success() and name in SYSCTL_SPOOFS:
+                size_data = (self._read_exact(size_pointer, 8, lldb)
+                             if size_pointer else None)
+                if size_data is not None:
+                    capacity = int.from_bytes(size_data, "little")
+                    hook = (SYSCTL_SPOOFS[name].kind, name, buffer,
+                            size_pointer, capacity)
+                else:
+                    entry_message = self._critical(
+                        "sysctlbyname({}) could not read input capacity; "
+                        "cloak failed".format(name))
+        if hook is not None and return_address:
             bp = target.BreakpointCreateByAddress(return_address)
-            bp.SetOneShot(True)
-            bp.SetThreadID(thread.GetThreadID())
-            self._return_hooks[bp.GetID()] = (
-                "proc_pidpath", buffer, capacity)
+            if (entry_kind != "sysctlbyname"
+                    or (bp.IsValid() and bp.GetNumLocations() > 0)):
+                bp.SetOneShot(True)
+                bp.SetThreadID(thread.GetThreadID())
+                self._return_hooks[bp.GetID()] = hook
+            else:
+                if bp.IsValid():
+                    target.BreakpointDelete(bp.GetID())
+                entry_message = self._critical(
+                    "sysctlbyname({}) could not arm return hook; cloak failed"
+                    .format(hook[1]))
+        elif hook is not None and entry_kind == "sysctlbyname":
+            entry_message = self._critical(
+                "sysctlbyname({}) could not arm return hook; cloak failed"
+                .format(hook[1]))
         process.Continue()
-        return ""
+        return entry_message
+
+    def _read_exact(self, address: int, size: int, lldb_module):
+        error = lldb_module.SBError()
+        data = self.debugger.process.ReadMemory(address, size, error)
+        if not error.Success() or data is None or len(data) != size:
+            return None
+        return bytes(data)
+
+    def _write_exact(self, address: int, data: bytes, lldb_module) -> bool:
+        error = lldb_module.SBError()
+        written = self.debugger.process.WriteMemory(address, data, error)
+        return error.Success() and written == len(data)
+
+    def _critical(self, message: str) -> str:
+        if self.last_error is None:
+            self.last_error = message
+        return self.last_error
+
+    def validate_resume(self) -> tuple[bool, str]:
+        if self.enabled and self.last_error:
+            return False, self.last_error
+        return True, "analysis cloak ready"
 
     def clear_return_hooks(self) -> None:
         self._delete_breakpoints(self._return_hooks)
         self._return_hooks.clear()
+        self.last_error = None
 
     def status(self) -> dict:
         return {
             "enabled": self.enabled,
             "resolved": len(self._bp_ids),
             "deferred": 0,
-            "error": None,
+            "error": self.last_error,
         }
