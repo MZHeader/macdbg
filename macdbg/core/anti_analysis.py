@@ -183,18 +183,39 @@ class AnalysisCloak:
             target.BreakpointDelete(bp_id)
             _kind, buffer, capacity = hook
             import lldb
-            err = lldb.SBError()
-            data = process.ReadMemory(buffer, capacity, err) if capacity else b""
             message = ""
-            if err.Success() and data:
-                path = data.split(b"\0", 1)[0].decode("utf-8", errors="replace")
-                if contains_marker(path, TOOL_MARKERS):
-                    replacement = b"/sbin/launchd\0"
-                    process.WriteMemory(buffer, replacement, err)
-                    frame = process.GetSelectedThread().GetFrameAtIndex(0)
-                    frame.FindRegister("x0").SetValueFromCString(
-                        str(len(replacement) - 1))
-                    message = "cloaked parent process path from proc_pidpath"
+            thread = process.GetSelectedThread()
+            frame = thread.GetFrameAtIndex(0)
+            result = frame.FindRegister("x0")
+            returned = result.GetValueAsUnsigned()
+            replacement = b"/sbin/launchd\0"
+            if 0 < returned <= capacity and capacity >= len(replacement):
+                err = lldb.SBError()
+                read_size = min(capacity, max(returned + 1,
+                                              len(replacement)))
+                data = process.ReadMemory(buffer, read_size, err)
+                nul = data.find(b"\0") if data else -1
+                if (err.Success() and len(data) == read_size
+                        and nul >= 0):
+                    path = data[:nul].decode("utf-8", errors="replace")
+                    if contains_marker(path, TOOL_MARKERS):
+                        original = data[:len(replacement)]
+                        written = process.WriteMemory(buffer, replacement, err)
+                        if err.Success() and written == len(replacement):
+                            if (result.SetValueFromCString(
+                                    str(len(replacement) - 1))
+                                    and result.GetValueAsUnsigned()
+                                    == len(replacement) - 1):
+                                message = (
+                                    "cloaked parent process path from "
+                                    "proc_pidpath")
+                            else:
+                                result.SetValueFromCString(str(returned))
+                                rollback = lldb.SBError()
+                                process.WriteMemory(buffer, original, rollback)
+                        elif written:
+                            rollback = lldb.SBError()
+                            process.WriteMemory(buffer, original, rollback)
             process.Continue()
             return message
 

@@ -1138,11 +1138,13 @@ class Debugger:
                 break
             field = data[start:end]
             name = field.decode("utf-8", errors="ignore")
-            if len(field) >= len(b"launchd") and contains_marker(name, TOOL_MARKERS):
-                replacement = b"launchd\0"
+            if field and contains_marker(name, TOOL_MARKERS):
+                replacement = b"launchd"[:len(field)] + b"\0"
                 replacement += b"\0" * (len(field) + 1 - len(replacement))
-                self.process.WriteMemory(buf + start, replacement, err)
-                return "scrubbed debugger name '{}' from sysctl(KERN_PROC) result".format(name)
+                written = self.process.WriteMemory(buf + start, replacement, err)
+                if err.Success() and written == len(replacement):
+                    return "scrubbed debugger name '{}' from sysctl(KERN_PROC) result".format(name)
+                return None
             start = end + 1
         return ""
 
