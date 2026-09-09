@@ -947,6 +947,11 @@ class Engine:
         for m in msgs:
             self._console("[anti-debug] " + m)
 
+    def _refresh_after_single_defense(self, result):
+        ok, message = result
+        self._console("[anti-debug] " + message, error=not ok)
+        return ok
+
     def _refresh_after_analysis_cloak(self, result):
         ok, message = result
         self._console(
@@ -962,22 +967,39 @@ class Engine:
                   and d.anti_sysctl_bp_id and d.anti_csops_bp_id and d.anti_timing_bp_ids
                   and d._scrub_parent and d.anti_sigtrap_on)
         if on:
+            # Reverse the enable order: remove target-text hardware sites while
+            # integrity mode is still active, then release the cloak, followed
+            # by its independently owned constituent defenses.
+            self._refresh_after_single_defense(
+                d.disable_direct_syscall_scan())
             self._refresh_after_analysis_cloak(d.disable_analysis_cloak())
-            seq = [d.disable_anti_ptrace, d.disable_direct_syscall_scan,
-                   d.disable_anti_mach_ports, d.disable_anti_sysctl,
-                   d.disable_anti_csops, d.disable_anti_timing,
-                   d.disable_anti_parent, d.disable_anti_sigtrap]
+            seq = [d.disable_anti_sigtrap, d.disable_anti_parent,
+                   d.disable_anti_timing, d.disable_anti_csops,
+                   d.disable_anti_sysctl, d.disable_anti_mach_ports,
+                   d.disable_anti_ptrace]
             self._refresh_after_defense([f()[1] for f in seq])
             return
-        seq = [d.enable_anti_ptrace, d.enable_direct_syscall_scan,
-               d.enable_anti_mach_ports, d.enable_anti_sysctl,
+
+        # A scan armed before integrity mode uses software breakpoints in the
+        # executable's __text. Remove it now and recreate it only after the
+        # cloak is active so core selects hardware breakpoints.
+        had_direct_scan = bool(d.direct_syscall_bp_ids)
+        if had_direct_scan and not self._refresh_after_single_defense(
+                d.disable_direct_syscall_scan()):
+            return
+        seq = [d.enable_anti_ptrace, d.enable_anti_mach_ports, d.enable_anti_sysctl,
                d.enable_anti_csops, d.enable_anti_timing,
                d.enable_anti_parent, d.enable_anti_sigtrap]
         self._refresh_after_defense([f()[1] for f in seq])
-        # Arm the composite last so it observes the existing defenses as
-        # independently owned. Disabling ALL can then release the cloak first
-        # without it tearing down those individual toggles itself.
-        self._refresh_after_analysis_cloak(d.enable_analysis_cloak())
+        # Arm the composite after its constituents so it observes them as
+        # independently owned. Direct-syscall sites are the exception: they
+        # must be created after integrity mode is active to become hardware.
+        if not self._refresh_after_analysis_cloak(d.enable_analysis_cloak()):
+            if had_direct_scan:
+                self._refresh_after_single_defense(
+                    d.enable_direct_syscall_scan())
+            return
+        self._refresh_after_single_defense(d.enable_direct_syscall_scan())
 
     def _t_analysis_cloak(self):
         d = self.dbg

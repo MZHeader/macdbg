@@ -80,6 +80,121 @@ class FakeCloak:
         return {77}
 
 
+class AllAntiDebugger:
+    """Stateful GUI boundary fake that models breakpoint mode and ownership."""
+
+    def __init__(self, *, preenabled_direct=False):
+        self.calls = []
+        self.analysis_cloak = FakeCloak()
+        self.analysis_cloak.debugger = self
+        self.anti_ptrace_bp_id = 0
+        self.direct_syscall_bp_ids = {40} if preenabled_direct else set()
+        self.direct_syscall_hardware = False if preenabled_direct else None
+        self.anti_mach_bp_id = 0
+        self.anti_sysctl_bp_id = 0
+        self.anti_csops_bp_id = 0
+        self.anti_timing_bp_ids = set()
+        self._scrub_parent = False
+        self.anti_sigtrap_on = False
+        self.hw_breakpoints = False
+        self.fork_mode = "none"
+        self.fork_interactive = False
+        self.interpose_enabled = False
+        self.exec_bp_ids = {}
+        self.exec_interactive = False
+        self._next_direct_id = 41
+
+        def validate_integrity(_hardware_ids):
+            safe = (not self.direct_syscall_bp_ids
+                    or self.direct_syscall_hardware is True)
+            return (safe, "target __text integrity protected" if safe else
+                    "software breakpoint modifies target __text")
+
+        self.analysis_cloak.validate_integrity = validate_integrity
+
+    def _set(self, call, attr, value):
+        self.calls.append(call)
+        setattr(self, attr, value)
+        return True, call
+
+    def enable_analysis_cloak(self):
+        self.calls.append("enable_analysis_cloak")
+        self.analysis_cloak.enabled = True
+        return True, "analysis cloak enabled"
+
+    def disable_analysis_cloak(self):
+        self.calls.append("disable_analysis_cloak")
+        self.analysis_cloak.enabled = False
+        return True, "analysis cloak disabled"
+
+    def enable_direct_syscall_scan(self):
+        self.calls.append("enable_direct_syscall_scan")
+        if self.direct_syscall_bp_ids:
+            return True, "already armed"
+        self.direct_syscall_bp_ids = {self._next_direct_id}
+        self._next_direct_id += 1
+        self.direct_syscall_hardware = self.analysis_cloak.enabled
+        return True, "direct scan enabled"
+
+    def disable_direct_syscall_scan(self):
+        self.calls.append("disable_direct_syscall_scan")
+        self.direct_syscall_bp_ids = set()
+        self.direct_syscall_hardware = None
+        return True, "direct scan disabled"
+
+    def enable_anti_ptrace(self):
+        return self._set("enable_anti_ptrace", "anti_ptrace_bp_id", 1)
+
+    def disable_anti_ptrace(self):
+        return self._set("disable_anti_ptrace", "anti_ptrace_bp_id", 0)
+
+    def enable_anti_mach_ports(self):
+        return self._set("enable_anti_mach_ports", "anti_mach_bp_id", 2)
+
+    def disable_anti_mach_ports(self):
+        return self._set("disable_anti_mach_ports", "anti_mach_bp_id", 0)
+
+    def enable_anti_sysctl(self):
+        return self._set("enable_anti_sysctl", "anti_sysctl_bp_id", 3)
+
+    def disable_anti_sysctl(self):
+        return self._set("disable_anti_sysctl", "anti_sysctl_bp_id", 0)
+
+    def enable_anti_csops(self):
+        return self._set("enable_anti_csops", "anti_csops_bp_id", 4)
+
+    def disable_anti_csops(self):
+        return self._set("disable_anti_csops", "anti_csops_bp_id", 0)
+
+    def enable_anti_timing(self):
+        return self._set("enable_anti_timing", "anti_timing_bp_ids", {5})
+
+    def disable_anti_timing(self):
+        return self._set("disable_anti_timing", "anti_timing_bp_ids", set())
+
+    def enable_anti_parent(self):
+        return self._set("enable_anti_parent", "_scrub_parent", True)
+
+    def disable_anti_parent(self):
+        return self._set("disable_anti_parent", "_scrub_parent", False)
+
+    def enable_anti_sigtrap(self):
+        return self._set("enable_anti_sigtrap", "anti_sigtrap_on", True)
+
+    def disable_anti_sigtrap(self):
+        return self._set("disable_anti_sigtrap", "anti_sigtrap_on", False)
+
+
+def make_all_anti_engine(*, preenabled_direct=False):
+    from tests.test_sysctl_cloak_orchestration import Engine
+
+    engine = Engine.__new__(Engine)
+    engine.dbg = AllAntiDebugger(preenabled_direct=preenabled_direct)
+    engine.tracer = types.SimpleNamespace(hardware=False, hardware_bp_ids=set())
+    engine._console = mock.Mock()
+    return engine
+
+
 def make_engine(*, enabled=False, safe=True, error=None):
     from tests.test_sysctl_cloak_orchestration import Engine
 
@@ -162,14 +277,54 @@ class GuiBehaviorTests(unittest.TestCase):
         engine.dbg.enable_analysis_cloak.assert_called_once_with()
         engine.dbg.disable_analysis_cloak.assert_called_once_with()
 
-    def test_all_anti_enables_cloak_after_individual_defenses(self):
-        engine = make_engine()
-        engine.dbg.analysis_cloak.enabled = False
-        engine.dbg.anti_ptrace_bp_id = 0
+    def test_all_anti_creates_safe_direct_scan_and_reverse_cleanup(self):
+        engine = make_all_anti_engine()
 
         engine._t_all_anti()
 
-        self.assertEqual(engine._calls[-1], "enable_analysis_cloak")
+        status = engine._defense_states()
+        self.assertTrue(status["all_anti"])
+        self.assertTrue(status["analysis_cloak_safe"])
+        self.assertTrue(engine.dbg.direct_syscall_hardware)
+
+        # The cloak must not own the independently armed constituent defenses.
+        engine._t_analysis_cloak()
+        self.assertTrue(engine.dbg.anti_sysctl_bp_id)
+        self.assertTrue(engine.dbg._scrub_parent)
+        self.assertTrue(engine.dbg.anti_timing_bp_ids)
+        engine._t_analysis_cloak()
+
+        engine._t_all_anti()
+
+        self.assertFalse(engine.dbg.analysis_cloak.enabled)
+        self.assertFalse(engine.dbg.direct_syscall_bp_ids)
+        self.assertFalse(engine.dbg.anti_sysctl_bp_id)
+        self.assertFalse(engine.dbg._scrub_parent)
+        self.assertFalse(engine.dbg.anti_timing_bp_ids)
+        self.assertGreater(
+            engine.dbg.calls.index("disable_direct_syscall_scan"),
+            engine.dbg.calls.index("enable_direct_syscall_scan"),
+        )
+
+    def test_all_anti_recreates_preenabled_direct_scan_as_hardware(self):
+        engine = make_all_anti_engine(preenabled_direct=True)
+
+        engine._t_all_anti()
+
+        self.assertNotIn(40, engine.dbg.direct_syscall_bp_ids)
+        self.assertTrue(engine.dbg.direct_syscall_hardware)
+        self.assertTrue(engine._defense_states()["analysis_cloak_safe"])
+
+    def test_all_anti_restores_preenabled_scan_if_cloak_enable_fails(self):
+        engine = make_all_anti_engine(preenabled_direct=True)
+        engine.dbg.enable_analysis_cloak = mock.Mock(
+            return_value=(False, "synthetic cloak failure"))
+
+        engine._t_all_anti()
+
+        self.assertTrue(engine.dbg.direct_syscall_bp_ids)
+        self.assertIs(engine.dbg.direct_syscall_hardware, False)
+        engine._console.assert_any_call("synthetic cloak failure", error=True)
 
     def test_defense_status_reports_safe_and_error_fields(self):
         engine = make_engine(

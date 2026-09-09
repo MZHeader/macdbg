@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.test_sysctl_cloak_orchestration import Engine
+
 from . import support
 from .support import (
     AgentProcess,
@@ -14,6 +16,98 @@ from .support import (
     STRIPPED_FIXTURE,
     run_fixture_direct,
 )
+
+
+class _AgentCloakProxy:
+    def __init__(self, debugger):
+        self.debugger = debugger
+
+    @property
+    def enabled(self):
+        return self.debugger.state["analysis_cloak"]
+
+
+class _AgentDebuggerProxy:
+    """Run the real GUI ALL orchestration against an agent-owned debugger."""
+
+    _METHODS = {
+        "analysis_cloak": "analysis_cloak",
+        "anti_ptrace": "anti_ptrace",
+        "direct_syscall_scan": "direct_syscall",
+        "anti_mach_ports": "anti_mach_ports",
+        "anti_sysctl": "anti_sysctl",
+        "anti_csops": "anti_csops",
+        "anti_timing": "anti_timing",
+        "anti_parent": "anti_parent",
+        "anti_sigtrap": "anti_sigtrap",
+    }
+
+    def __init__(self, agent):
+        self.agent = agent
+        self.analysis_cloak = _AgentCloakProxy(self)
+        self.refresh()
+
+    def refresh(self):
+        self.state = self.agent.cmd("status")["defenses"]
+
+    def __getattr__(self, name):
+        enable = name.startswith("enable_")
+        disable = name.startswith("disable_")
+        if not (enable or disable):
+            raise AttributeError(name)
+        stem = name[len("enable_"):] if enable else name[len("disable_"):]
+        defense = self._METHODS.get(stem)
+        if defense is None:
+            raise AttributeError(name)
+
+        def toggle():
+            result = self.agent.cmd(
+                "defense_enable" if enable else "defense_disable",
+                {"name": defense},
+            )
+            self.refresh()
+            return result["ok"], result.get("message", result.get("error", ""))
+
+        return toggle
+
+    @property
+    def anti_ptrace_bp_id(self):
+        return int(self.state["anti_ptrace"])
+
+    @property
+    def direct_syscall_bp_ids(self):
+        return {1} if self.state["direct_syscall"] else set()
+
+    @property
+    def anti_mach_bp_id(self):
+        return int(self.state["anti_mach_ports"])
+
+    @property
+    def anti_sysctl_bp_id(self):
+        return int(self.state["anti_sysctl"])
+
+    @property
+    def anti_csops_bp_id(self):
+        return int(self.state["anti_csops"])
+
+    @property
+    def anti_timing_bp_ids(self):
+        return {1} if self.state["anti_timing"] else set()
+
+    @property
+    def _scrub_parent(self):
+        return self.state["anti_parent"]
+
+    @property
+    def anti_sigtrap_on(self):
+        return self.state["anti_sigtrap"]
+
+
+def _gui_all_engine(agent):
+    engine = Engine.__new__(Engine)
+    engine.dbg = _AgentDebuggerProxy(agent)
+    engine._console = mock.Mock()
+    return engine
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
@@ -27,6 +121,47 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
         self.assertIs(type(defenses["analysis_cloak_deferred"]), int)
         for name in ("anti_sysctl", "anti_parent", "anti_timing"):
             self.assertTrue(defenses[name], status)
+
+    def test_gui_all_is_integrity_safe_for_fresh_and_preenabled_svc_scan(self):
+        digest = support.fixture_text_digest()
+        for preenabled in (False, True):
+            with self.subTest(preenabled=preenabled), AgentProcess(
+                    FIXTURE, "integrity", extra_args=[digest]) as agent:
+                if preenabled:
+                    result = agent.cmd(
+                        "defense_enable", {"name": "direct_syscall"})
+                    self.assertTrue(result["ok"], result)
+                    self.assertIn("1 svc", result["message"])
+                engine = _gui_all_engine(agent)
+
+                engine._t_all_anti()
+
+                status = agent.cmd("status")
+                self.assertTrue(status["defenses"]["analysis_cloak_safe"], status)
+                self.assertTrue(status["defenses"]["direct_syscall"], status)
+
+                # Disabling only the cloak preserves constituents that ALL
+                # armed independently; re-enable it before exercising reverse
+                # ALL cleanup.
+                engine._t_analysis_cloak()
+                constituents = agent.cmd("status")["defenses"]
+                for name in ("anti_sysctl", "anti_parent", "anti_timing"):
+                    self.assertTrue(constituents[name], constituents)
+                engine._t_analysis_cloak()
+                engine._t_all_anti()
+                disabled = agent.cmd("status")["defenses"]
+                for name in (
+                    "analysis_cloak", "anti_ptrace", "direct_syscall",
+                    "anti_mach_ports", "anti_sysctl", "anti_csops",
+                    "anti_timing", "anti_parent", "anti_sigtrap",
+                ):
+                    self.assertFalse(disabled[name], disabled)
+
+                engine._t_all_anti()
+                result = agent.continue_to_exit()
+                self.assertEqual(result.get("event"), "exited", result)
+                self.assertEqual(result["exit"]["code"], 0, result)
+                self.assertIn("INTEGRITY:clean", result["console"])
 
     def test_timing_hides_real_sysctl_breakpoint_latency(self):
         with AgentProcess(FIXTURE, "timing") as agent:
