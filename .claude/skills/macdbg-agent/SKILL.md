@@ -91,6 +91,11 @@ Execution control (all take optional `{"timeout": N}`):
 - `continue`, `step_in` (single instruction), `step_over`, `step_out`,
   `step_in_source`, `step_over_source`, `wait` (keep waiting without
   issuing a new resume — use after a `running` timeout).
+- With `analysis_cloak` enabled, `step_in` remains a single instruction and
+  ordinary `step_over` plus non-inlined `step_out` use bounded hardware-only
+  plans. Source-level steps and step-out from an inline frame fail closed before
+  execution. A bounded plan reserves one hardware breakpoint slot until it
+  completes.
 
 Breakpoints:
 - `breakpoint_toggle {"addr": N}` — add if absent, remove if present.
@@ -150,8 +155,54 @@ Strings:
 
 Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
 `anti_csops`, `anti_timing`, `anti_parent`, `anti_sigtrap`,
-`anti_mach_ports`, `direct_syscall`, `fork_identity`, `exec_sandbox`):
+`anti_mach_ports`, `direct_syscall`, `fork_identity`, `exec_sandbox`,
+`analysis_cloak`):
 - `defense_enable {"name": "…"}` / `defense_disable {"name": "…"}`.
+- `analysis_cloak` is the composite environment, parent, VM/hardware identity,
+  loaded-image, text-integrity, timing, and syscall-202 defense. Enable it at
+  the initial entry stop, before the first resume:
+
+  ```sh
+  ./agent.sh start --session cloak /path/to/binary
+  ./agent.sh cmd cloak defense_enable --json '{"name":"analysis_cloak"}'
+  ./agent.sh cmd cloak status
+  ./agent.sh cmd cloak continue --json '{"timeout":15}'
+  ./agent.sh stop cloak
+  ```
+
+  `status.defenses` reports `analysis_cloak`, `analysis_cloak_safe`, resolved
+  and deferred hook counts, and the exact error when unsafe. Enabling after the
+  target has begun executing is rejected; restart to the entry point first.
+- The cloak removes `DYLD_INSERT_LIBRARIES`, `DYLD_FORCE_FLAT_NAMESPACE`,
+  `DYLD_PRINT_LIBRARIES`, `DYLD_PRINT_INITIALIZERS`, `DYLD_PRINT_BINDINGS`,
+  `DYLD_IMAGE_SUFFIX`, `MallocStackLogging`, `MallocStackLoggingNoCompact`, and
+  `NSZombieEnabled` from both the launch and live target environments, covering
+  `getenv`, `_NSGetEnviron`, and direct `environ` inspection.
+- Parent identity is scrubbed after `sysctl(KERN_PROC)` and `proc_pidpath`:
+  matching debugger/analyzer names become `launchd` or `/sbin/launchd`, while
+  clean results are left alone. Recognized `sysctlbyname` results are
+  deterministic: `kern.hv_vmm_present = 0`, `hw.model = Mac14,6`, and
+  `machdep.cpu.brand_string = Apple M2 Pro`.
+- `IORegistryEntryCreateCFProperty` returns
+  `IOPlatformSerialNumber = C02ZQ0ABC123` and
+  `IOPlatformUUID = 8D4C7A12-3F65-4B90-A2DE-61C8E5079F34` for those two keys.
+  `_dyld_get_image_name` substitutes `/usr/lib/libSystem.B.dylib` for configured
+  instrumentation image names without modifying dyld-owned memory.
+- The cloak reuses `anti_sysctl` for both ordinary KERN_PROC calls and syscall
+  number 202, plus `anti_timing` for `mach_absolute_time`,
+  `mach_continuous_time`, and `clock_gettime_nsec_np`. Timing uses a fixed-step
+  synthetic clock; direct `mrs cntvct_el0`, wall-clock APIs such as
+  `gettimeofday`, and arbitrary private or undocumented inspection APIs remain
+  outside v1.
+- It preserves the target's `__TEXT,__text` bytes rather than forging a hash.
+  Every macdbg-managed target-text breakpoint is required to be hardware-backed,
+  target-text patches block resume, and target-text tracer sites require
+  hardware mode. Hardware slots are finite; a bounded step reserves one, and
+  creation/resume fails explicitly instead of falling back to software when the
+  slots run out.
+- `analysis_cloak` and fork-tree tracing are mutually exclusive in v1 because
+  the fork-tree DYLD interposer creates the exact environment variable and
+  loaded image that the cloak must hide. Either enable order is rejected.
 - `anti_sysctl` clears `P_TRACED` from `sysctl(KERN_PROC)` results and
   `anti_csops` clears `CS_DEBUGGED` from `csops(CS_OPS_STATUS)` results --
   the two flag-based checks that otherwise see the debugger even with
@@ -204,6 +255,8 @@ interactive mode first to inspect:
   rejection rule.
 - `dump_exec` — while an exec decision is pending, write the full
   command/argv to a dump file and return its path.
+- Oversized commands/argv are dumped automatically; the on-screen preview may
+  be shortened, but the disk dump retains the complete payload.
 - While a decision is pending, `continue`/`step_*` are refused — resuming
   directly would bypass the shield.
 
@@ -221,7 +274,9 @@ Escape hatch:
 - `raw {"command": "…"}` — run any literal lldb command through the
   command interpreter; returns `output`/`error_output`. This is powerful
   and unrestricted — it can delete internal defense/tracer breakpoints
-  the structured commands would refuse to touch. Do not use it to touch
+  the structured commands would refuse to touch, create software breakpoints,
+  or patch target text. Those actions can invalidate `analysis_cloak` integrity
+  guarantees. Do not use it to touch
   a breakpoint id you got from `breakpoint_list {"hide_internal":
   false}`. See "raw idioms" below for what to reach for.
 

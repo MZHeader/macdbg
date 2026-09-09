@@ -5,17 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "macdbg"
 version = "1.1.0"
-description = "x64dbg-style Textual TUI wrapper around LLDB for reverse engineers and malware analysts."
+description = "x64dbg-style GUI and headless LLDB wrapper for reverse engineers and malware analysts."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Liam Chugg" }]
-keywords = ["lldb", "debugger", "tui", "reverse-engineering", "malware-analysis", "macos"]
+keywords = ["lldb", "debugger", "gui", "headless", "reverse-engineering", "malware-analysis", "macos"]
 
-# macdbg is run via ./macdbg.sh, not pip: LLDB's Python bindings are supplied
-# from the system install (`lldb -P`) and the UI dependencies are vendored in
-# vendor/. Neither can come from PyPI, so no runtime dependencies are declared
-# here. See the README for how to run it.
+# macdbg is launched through macdbg.app / GUI/run.sh or the headless agent.sh,
+# not pip. LLDB's Python bindings come from the system install (`lldb -P`) and
+# the UI dependencies are vendored in vendor/. Neither can come from PyPI, so
+# no runtime dependencies are declared here. See the README for launch details.
 dependencies = []
 
 [project.urls]

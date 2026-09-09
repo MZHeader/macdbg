@@ -7,6 +7,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE_SOURCE = (ROOT / "GUI/server/engine.py").read_text()
 APP_SOURCE = (ROOT / "GUI/web/app.js").read_text()
+README_SOURCE = (ROOT / "README.md").read_text()
+AGENT_SKILL_SOURCE = (ROOT / ".claude/skills/macdbg-agent/SKILL.md").read_text()
+GUI_README_SOURCE = (ROOT / "GUI/README-GUI.md").read_text()
+PYPROJECT_SOURCE = (ROOT / "pyproject.toml").read_text()
 INCOMPATIBLE = "analysis cloak is incompatible with fork-tree tracing in v1"
 
 
@@ -51,6 +55,30 @@ class SurfaceContractTests(unittest.TestCase):
             "self.dbg.analysis_cloak.validate_integrity(",
             ENGINE_SOURCE[begin_resume:],
         )
+
+
+class DocumentationContractTests(unittest.TestCase):
+    def test_readme_documents_analysis_cloak_contract(self):
+        for term in (
+            "analysis_cloak",
+            "kern.hv_vmm_present",
+            "IOPlatformUUID",
+            "hardware breakpoints",
+            "fork-tree",
+        ):
+            self.assertIn(term, README_SOURCE)
+
+    def test_agent_skill_documents_analysis_cloak_command(self):
+        self.assertIn("`analysis_cloak`", AGENT_SKILL_SOURCE)
+
+    def test_project_metadata_describes_current_frontends(self):
+        self.assertIn("GUI and headless", PYPROJECT_SOURCE)
+        self.assertNotIn("Textual TUI", PYPROJECT_SOURCE)
+        self.assertNotIn('"tui"', PYPROJECT_SOURCE)
+
+    def test_gui_readme_uses_repository_root_app_path(self):
+        self.assertIn("produces macdbg.app", GUI_README_SOURCE)
+        self.assertNotIn("GUI/macdbg.app", GUI_README_SOURCE)
 
 
 class FakeCloak:

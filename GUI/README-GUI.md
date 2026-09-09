@@ -39,9 +39,9 @@ GUI/run.sh --attach 12345  # attach to a running pid
 Double-clickable app:
 
 ```sh
-GUI/build_app.sh           # produces GUI/macdbg.app
-open GUI/macdbg.app
-open GUI/macdbg.app --args test/hello
+GUI/build_app.sh           # produces macdbg.app at the repository root
+open macdbg.app
+open macdbg.app --args test/hello
 ```
 
 `run.sh` prefers the native pywebview window; if no pywebview Python is found it
