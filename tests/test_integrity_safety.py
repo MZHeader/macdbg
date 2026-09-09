@@ -23,9 +23,19 @@ class Location:
 
 
 class Breakpoint:
-    def __init__(self, bp_id, locations, hardware=False, enabled=True):
+    def __init__(self, bp_id, locations, hardware=False, enabled=True, thread_id=0):
         self.id, self.locations = bp_id, locations
         self.hardware, self.enabled = hardware, enabled
+        self.thread_id = thread_id
+
+    def GetThreadID(self):
+        return self.thread_id
+
+    def SetThreadID(self, thread_id):
+        self.thread_id = thread_id
+
+    def SetOneShot(self, value):
+        self.one_shot = value
 
     def GetID(self):
         return self.id
@@ -59,6 +69,9 @@ class Target:
 
     def GetBreakpointAtIndex(self, index):
         return self.bps[index]
+
+    def FindBreakpointByID(self, bp_id):
+        return next(bp for bp in self.bps if bp.id == bp_id)
 
     def GetExecutable(self):
         return "main"
@@ -240,6 +253,73 @@ class IntegritySafetyTests(unittest.TestCase):
                 action.return_value = (True, "running") if command == "_c_run_to" else None
                 getattr(engine, command)({"addr": 0x1000})
                 self.assertTrue(engine._resuming)
+
+
+class StepHookOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_sysctl_cloak_orchestration import AgentSession
+        debugger_class = AgentSession.__init__.__globals__["Debugger"]
+        fake_lldb = debugger_class._process_cloak_step_stop.__globals__["lldb"]
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(fake_lldb, "LLDB_INVALID_THREAD_ID", 0, create=True).start()
+        mock.patch.dict(sys.modules, {"lldb": fake_lldb}).start()
+        self.dbg = debugger_class.__new__(debugger_class)
+        self.dbg.target = Target([])
+        self.dbg.hardware_bp_ids = set()
+        self.dbg._step_cloak_handled_stop = None
+        self.dbg._step_cloak_messages = []
+        self.thread = mock.Mock()
+        self.thread.GetThreadID.return_value = 222
+        self.thread.GetStopReason.return_value = 8  # eStopReasonPlanComplete
+        self.thread.GetNumFrames.return_value = 2
+        self.frame = self.thread.GetFrameAtIndex.return_value
+        self.frame.GetPC.return_value = 0x1000
+        self.frame.FindRegister.return_value.GetValueAsUnsigned.return_value = 0
+        self.dbg.process = mock.Mock()
+        self.dbg.process.GetStopID.return_value = 1
+        self.dbg.process.GetSelectedThread.return_value = self.thread
+        self.cloak = self.dbg.analysis_cloak = AnalysisCloak(self.dbg)
+        self.cloak.enabled = True
+        # Resume readiness is independently covered; keep dispatch and hook
+        # consumption real while replacing only the external LLDB surface.
+        mock.patch.object(self.cloak, "validate_resume", return_value=(True, "ready")).start()
+
+    def test_foreign_thread_leaves_return_hook_for_owner_at_same_pc(self):
+        bp = Breakpoint(99, [Location(0x1000)], hardware=True, thread_id=111)
+        self.dbg.target.bps.append(bp)
+        self.dbg.hardware_bp_ids.add(99)
+        self.cloak._return_hooks[99] = ("proc_pidpath", 0x2000, 1024)
+
+        self.dbg._process_cloak_step_stop(self.thread)
+        self.assertIn(99, self.cloak._return_hooks)
+        self.assertEqual(self.dbg.target.bps, [bp])
+        self.assertEqual(self.dbg.hardware_bp_ids, {99})
+
+        self.thread.GetThreadID.return_value = 111
+        self.dbg._process_cloak_step_stop(self.thread)
+        self.assertEqual(self.cloak._return_hooks, {})
+        self.assertEqual(self.dbg.target.bps, [])
+        self.assertEqual(self.dbg.hardware_bp_ids, set())
+
+    def test_global_entry_creates_separate_return_hooks_for_both_threads(self):
+        entry = Breakpoint(98, [Location(0x1000)])
+        self.dbg.target.bps.append(entry)
+        self.cloak._bp_ids.add(98)
+        self.cloak._entry_hooks[98] = "proc_pidpath"
+        self.frame.FindRegister.side_effect = lambda name: types.SimpleNamespace(
+            GetValueAsUnsigned=lambda: {"x1": 0x2000, "x2": 1024, "lr": 0x1100}[name])
+
+        def create_return(address):
+            bp = Breakpoint(99 + len(self.cloak._return_hooks), [Location(address)], hardware=True)
+            self.dbg.target.bps.append(bp)
+            return bp
+
+        self.dbg.create_hardware_breakpoint_by_address = create_return
+        for thread_id in (111, 222):
+            self.thread.GetThreadID.return_value = thread_id
+            self.dbg._process_cloak_step_stop(self.thread)
+        self.assertEqual(set(self.cloak._return_hooks), {99, 100})
+        self.assertEqual([bp.GetThreadID() for bp in self.dbg.target.bps], [0, 111, 222])
 
 
 if __name__ == "__main__":

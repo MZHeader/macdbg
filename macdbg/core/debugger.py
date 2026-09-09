@@ -780,7 +780,15 @@ class Debugger:
             return
         for bp_id in set(cloak._entry_hooks) | set(cloak._return_hooks):
             bp = self.target.FindBreakpointByID(bp_id)
-            if bp.IsValid() and bp.IsEnabled() and any(
+            if not bp.IsValid() or not bp.IsEnabled():
+                continue
+            # A plan-complete stop does not run LLDB's breakpoint filters.
+            # Preserve thread-owned return hooks at shared caller addresses;
+            # unrestricted entry hooks still apply to every thread.
+            if bp.GetThreadID() not in (lldb.LLDB_INVALID_THREAD_ID,
+                                        thread.GetThreadID()):
+                continue
+            if any(
                     bp.GetLocationAtIndex(i).IsEnabled()
                     and bp.GetLocationAtIndex(i).GetLoadAddress() == pc
                     for i in range(bp.GetNumLocations())):
