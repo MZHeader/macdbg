@@ -36,6 +36,11 @@ SYSCTL_SPOOFS = {
     "machdep.cpu.brand_string": SpoofValue("cstring", "Apple M2 Pro"),
 }
 
+IOKIT_SPOOFS = {
+    "IOPlatformSerialNumber": "C02ZQ0ABC123",
+    "IOPlatformUUID": "8D4C7A12-3F65-4B90-A2DE-61C8E5079F34",
+}
+
 ParentReturnHook = tuple[str, int, int]
 SysctlReturnHook = tuple[str, str, int, int, int]
 ReturnHook = Union[ParentReturnHook, SysctlReturnHook]
@@ -59,6 +64,15 @@ def filter_environment(entries: Iterable[str]) -> list[str]:
             if entry.split("=", 1)[0] not in FORBIDDEN_ENV]
 
 
+def _escape_c_string(text: str) -> str:
+    return (text.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+            .replace("\0", "\\0"))
+
+
 class AnalysisCloak:
     _EXISTING_DEFENSES = (
         ("anti_sysctl", "_scrub_ptraced"),
@@ -73,6 +87,7 @@ class AnalysisCloak:
         self._bp_ids: set[int] = set()
         self._entry_hooks: dict[int, str] = {}
         self._return_hooks: dict[int, ReturnHook] = {}
+        self._cfstring_cache: dict[str, int] = {}
         self._owned_existing = set()
         self._owned_existing_bp_ids = {}
 
@@ -105,7 +120,9 @@ class AnalysisCloak:
         target = self.debugger.target
         create_bp = getattr(target, "BreakpointCreateByName", None)
         if create_bp is not None:
-            for symbol in ("proc_pidpath", "sysctlbyname"):
+            for symbol in (
+                    "proc_pidpath", "sysctlbyname",
+                    "IORegistryEntryCreateCFProperty"):
                 bp = create_bp(symbol)
                 if not bp.IsValid() or bp.GetNumLocations() == 0:
                     if bp.IsValid():
@@ -131,6 +148,7 @@ class AnalysisCloak:
         return True, "analysis cloak enabled; {}".format(message)
 
     def disable(self) -> tuple[bool, str]:
+        self._release_cfstrings()
         self._delete_breakpoints(set(self._bp_ids) | set(self._return_hooks))
         self._bp_ids.clear()
         self._entry_hooks.clear()
@@ -290,6 +308,8 @@ class AnalysisCloak:
         entry_kind = self._entry_hooks.get(bp_id)
         if entry_kind is None:
             return None
+        if entry_kind == "IORegistryEntryCreateCFProperty":
+            return self._handle_iokit_entry(frame)
         buffer = frame.FindRegister("x1").GetValueAsUnsigned()
         size_pointer = frame.FindRegister("x2").GetValueAsUnsigned()
         return_address = frame.FindRegister("lr").GetValueAsUnsigned()
@@ -337,6 +357,121 @@ class AnalysisCloak:
             process.Continue()
         return entry_message
 
+    def _handle_iokit_entry(self, frame) -> str:
+        process = self.debugger.process
+        key_pointer = frame.FindRegister("x1").GetValueAsUnsigned()
+        key = self._cfstring_text(key_pointer)
+        if key is None:
+            return self._critical(
+                "could not read IOKit property key; cloak failed")
+        if key not in IOKIT_SPOOFS:
+            process.Continue()
+            return ""
+
+        replacement = self._cfstring_cache.get(key)
+        if replacement is None:
+            replacement = self._make_cfstring(IOKIT_SPOOFS[key])
+            if not replacement:
+                return self._critical(
+                    "could not create replacement for {}; cloak failed"
+                    .format(key))
+            # The Create reference owned by this cache keeps one stable object
+            # alive for the process lifetime. Each intercepted Create call gets
+            # a separate retain below for the caller to release.
+            self._cfstring_cache[key] = replacement
+
+        retain = self._eval_pointer(
+            "expression -l c++ --ignore-breakpoints true -- "
+            "(void*)CFRetain((void*){:#x})".format(replacement))
+        if retain != replacement:
+            return self._critical(
+                "could not retain replacement for {}; cloak failed"
+                .format(key))
+
+        ok, _out, err = self.debugger.handle_command(
+            "thread return {:#x}".format(replacement))
+        if not ok:
+            self.debugger.handle_command(
+                "expression -l c++ --ignore-breakpoints true -- "
+                "(void)CFRelease((void*){:#x})".format(replacement))
+            return self._critical(
+                "could not return replacement for {}; cloak failed: {}"
+                .format(key, err.strip()))
+
+        process.Continue()
+        return "spoofed IORegistryEntryCreateCFProperty({})".format(key)
+
+    def _eval_pointer(self, expression: str) -> Optional[int]:
+        ok, output, _error = self.debugger.handle_command(expression)
+        if not ok:
+            return None
+        matches = re.findall(r"=\s*(0x[0-9a-fA-F]+)", output)
+        if not matches:
+            return None
+        return int(matches[-1], 16)
+
+    def _eval_integer(self, expression: str) -> Optional[int]:
+        ok, output, _error = self.debugger.handle_command(expression)
+        if not ok:
+            return None
+        matches = re.findall(r"=\s*(-?[0-9]+)", output)
+        if not matches:
+            return None
+        return int(matches[-1])
+
+    def _cfstring_text(self, pointer: int) -> Optional[str]:
+        if not pointer:
+            return None
+        import lldb
+        c_string = self._eval_pointer(
+            "expression -l c++ --ignore-breakpoints true -- "
+            "(void*)CFStringGetCStringPtr((CFStringRef){:#x}, "
+            "0x08000100)".format(pointer))
+        if c_string is None:
+            return None
+        if c_string:
+            error = lldb.SBError()
+            value = self.debugger.process.ReadCStringFromMemory(
+                c_string, 256, error)
+            return value if error.Success() else None
+
+        buffer = self._eval_pointer(
+            "expression -l c++ --ignore-breakpoints true -- "
+            "(void*)malloc(256)")
+        if not buffer:
+            return None
+        value = None
+        copied = self._eval_integer(
+            "expression -l c++ --ignore-breakpoints true -- "
+            "(int)CFStringGetCString((CFStringRef){:#x}, (char*){:#x}, "
+            "256, 0x08000100)".format(pointer, buffer))
+        if copied == 1:
+            error = lldb.SBError()
+            candidate = self.debugger.process.ReadCStringFromMemory(
+                buffer, 256, error)
+            if error.Success():
+                value = candidate
+        freed, _out, _error = self.debugger.handle_command(
+            "expression -l c++ --ignore-breakpoints true -- "
+            "(void)free((void*){:#x})".format(buffer))
+        return value if freed else None
+
+    def _make_cfstring(self, text: str) -> Optional[int]:
+        expression = (
+            'expression -l c++ --ignore-breakpoints true -- '
+            '(void*)CFStringCreateWithCString((void*)0, "{}", '
+            '0x08000100)')
+        return self._eval_pointer(
+            expression.format(_escape_c_string(text)))
+
+    def _release_cfstrings(self) -> None:
+        pointers = set(self._cfstring_cache.values())
+        self._cfstring_cache.clear()
+        for pointer in pointers:
+            self.debugger.handle_command(
+                "expression -l c++ --ignore-breakpoints true -- "
+                "(void)CFRelease((void*){:#x})".format(pointer))
+
     def _read_exact(self, address: int, size: int, lldb_module):
         error = lldb_module.SBError()
         data = self.debugger.process.ReadMemory(address, size, error)
@@ -362,6 +497,7 @@ class AnalysisCloak:
     def clear_return_hooks(self) -> None:
         self._delete_breakpoints(self._return_hooks)
         self._return_hooks.clear()
+        self._release_cfstrings()
         self.last_error = None
 
     def status(self) -> dict:

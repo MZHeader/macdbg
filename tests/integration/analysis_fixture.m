@@ -2,7 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <crt_externs.h>
+#include <IOKit/IOKitLib.h>
 #include <libproc.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -93,6 +95,41 @@ static int check_sysctl(void) {
     return bad;
 }
 
+static int copy_cfstring_property(io_registry_entry_t service,
+                                  CFStringRef key,
+                                  char *output,
+                                  size_t output_size) {
+    CFTypeRef value = IORegistryEntryCreateCFProperty(
+        service, key, kCFAllocatorDefault, 0);
+    if (!value || CFGetTypeID(value) != CFStringGetTypeID()) {
+        if (value) CFRelease(value);
+        return 0;
+    }
+    Boolean copied = CFStringGetCString(
+        (CFStringRef)value, output, output_size, kCFStringEncodingUTF8);
+    CFRelease(value);
+    return copied;
+}
+
+static int check_iokit(void) {
+    io_registry_entry_t service = IOServiceGetMatchingService(
+        kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
+    char serial[128] = {0};
+    char uuid[128] = {0};
+    int readable = service &&
+        copy_cfstring_property(service, CFSTR("IOPlatformSerialNumber"),
+                               serial, sizeof(serial)) &&
+        copy_cfstring_property(service, CFSTR("IOPlatformUUID"),
+                               uuid, sizeof(uuid));
+    if (service) IOObjectRelease(service);
+
+    int bad = !readable || strcmp(serial, "C02ZQ0ABC123") ||
+              strcmp(uuid, "8D4C7A12-3F65-4B90-A2DE-61C8E5079F34");
+    printf("IOKIT:%s serial=%s uuid=%s\n",
+           bad ? "DETECTED" : "clean", serial, uuid);
+    return bad;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) return 64;
     if (strcmp(argv[1], "env") == 0) {
@@ -107,5 +144,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "sysctl") == 0)
         return check_sysctl();
+    if (strcmp(argv[1], "iokit") == 0)
+        return check_iokit();
     return 65;
 }

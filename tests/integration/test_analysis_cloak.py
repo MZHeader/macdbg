@@ -8,6 +8,23 @@ from .support import AgentProcess, FIXTURE, run_fixture_direct
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_iokit_platform_identity_is_spoofed(self):
+        direct = run_fixture_direct("iokit")
+        self.assertNotEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        self.assertIn("IOKIT:DETECTED", direct.stdout)
+
+        with AgentProcess(FIXTURE, "iokit") as agent:
+            enabled = agent.enable_cloak()
+            self.assertTrue(enabled["ok"], enabled)
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn(
+                "IOKIT:clean serial=C02ZQ0ABC123 "
+                "uuid=8D4C7A12-3F65-4B90-A2DE-61C8E5079F34",
+                result["console"],
+            )
+
     def test_hardware_sysctls_are_spoofed(self):
         direct = run_fixture_direct("sysctl")
         self.assertNotEqual(direct.returncode, 0, direct.stdout + direct.stderr)
