@@ -348,14 +348,14 @@ class IOKitDeferredHookTests(unittest.TestCase):
 
         self.assertTrue(ok, message)
         self.assertIn("1 deferred", message)
-        self.assertEqual(cloak.status()["resolved"], 2)
+        self.assertEqual(cloak.status()["resolved"], 3)
         self.assertEqual(cloak.status()["deferred"], 1)
         iokit_id = next(bp_id for bp_id, name in cloak._entry_hooks.items()
                         if name == "IORegistryEntryCreateCFProperty")
         self.assertIn(iokit_id, cloak.hidden_bp_ids())
 
         debugger.target.FindBreakpointByID(iokit_id).locations = 1
-        self.assertEqual(cloak.status()["resolved"], 3)
+        self.assertEqual(cloak.status()["resolved"], 4)
         self.assertEqual(cloak.status()["deferred"], 0)
 
         self.assertTrue(cloak.disable()[0])

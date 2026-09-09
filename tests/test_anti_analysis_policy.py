@@ -23,6 +23,7 @@ class PolicyTests(unittest.TestCase):
     def test_image_matching_is_case_insensitive(self):
         self.assertTrue(contains_marker("/tmp/FridaGadget.dylib", IMAGE_MARKERS))
         self.assertTrue(contains_marker("libsubstrate.dylib", IMAGE_MARKERS))
+        self.assertTrue(contains_marker("/tmp/libReveal.dylib", IMAGE_MARKERS))
         self.assertFalse(contains_marker("/usr/lib/libSystem.B.dylib", IMAGE_MARKERS))
 
     def test_sysctl_spoofs_are_deterministic(self):

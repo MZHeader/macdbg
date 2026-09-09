@@ -7,6 +7,7 @@ from . import support
 from .support import (
     AgentProcess,
     FIXTURE,
+    FRIDA_FIXTURE,
     LATE_IOKIT_FIXTURE,
     STRIPPED_FIXTURE,
     run_fixture_direct,
@@ -14,6 +15,52 @@ from .support import (
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_blacklisted_loaded_images_are_cloaked(self):
+        dylib = str(FRIDA_FIXTURE.resolve())
+        direct = run_fixture_direct("images", extra_args=[dylib])
+        self.assertNotEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        self.assertIn("IMAGES:DETECTED", direct.stdout)
+        self.assertIn("FridaGadget.dylib", direct.stdout)
+
+        with AgentProcess(FIXTURE, "images", extra_args=[dylib]) as agent:
+            enabled = agent.enable_cloak()
+            self.assertTrue(enabled["ok"], enabled)
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("IMAGES:clean", result["console"])
+            self.assertIn(
+                "[anti-analysis] cloaked loaded image FridaGadget.dylib",
+                result["console"],
+            )
+
+            restarted = agent.cmd("restart")
+            self.assertTrue(restarted["ok"], restarted)
+            self.assertEqual(restarted["event"], "stop", restarted)
+            rerun = agent.continue_to_exit()
+            self.assertEqual(rerun["event"], "exited", rerun)
+            self.assertEqual(rerun["exit"]["code"], 0, rerun)
+            self.assertIn("IMAGES:clean", rerun["console"])
+            self.assertIn(
+                "[anti-analysis] cloaked loaded image FridaGadget.dylib",
+                rerun["console"],
+            )
+
+    def test_clean_loaded_images_pass_without_rewrite_log(self):
+        dylib = "/usr/lib/libSystem.B.dylib"
+        direct = run_fixture_direct("images", extra_args=[dylib])
+        self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        self.assertIn("IMAGES:clean", direct.stdout)
+
+        with AgentProcess(FIXTURE, "images", extra_args=[dylib]) as agent:
+            enabled = agent.enable_cloak()
+            self.assertTrue(enabled["ok"], enabled)
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("IMAGES:clean", result["console"])
+            self.assertNotIn("cloaked loaded image", result["console"])
+
     def test_iokit_spoofing_works_for_a_stripped_binary(self):
         with AgentProcess(STRIPPED_FIXTURE, "iokit") as agent:
             enabled = agent.enable_cloak()

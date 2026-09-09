@@ -19,7 +19,7 @@ TOOL_MARKERS = (
 
 IMAGE_MARKERS = (
     "frida", "fridagadget", "substrate", "mobilesubstrate", "sbinjector",
-    "libcycript", "revealserver", "dobby", "fishhook", "cycript",
+    "libcycript", "libreveal", "revealserver", "dobby", "fishhook", "cycript",
     "sslkillswitch",
 )
 
@@ -43,7 +43,10 @@ IOKIT_SPOOFS = {
 
 ParentReturnHook = tuple[str, int, int]
 SysctlReturnHook = tuple[str, str, int, int, int]
-ReturnHook = Union[ParentReturnHook, SysctlReturnHook]
+ImageReturnHook = tuple[str]
+ReturnHook = Union[ParentReturnHook, SysctlReturnHook, ImageReturnHook]
+
+IMAGE_REPLACEMENT = "/usr/lib/libSystem.B.dylib"
 
 
 def contains_marker(value: str, markers: Sequence[str]) -> bool:
@@ -88,6 +91,7 @@ class AnalysisCloak:
         self._entry_hooks: dict[int, str] = {}
         self._return_hooks: dict[int, ReturnHook] = {}
         self._cfstring_cache: dict[str, int] = {}
+        self._cstring_cache: dict[str, int] = {}
         self._owned_existing = set()
         self._owned_existing_bp_ids = {}
 
@@ -95,6 +99,10 @@ class AnalysisCloak:
         if self.enabled:
             return True, "analysis cloak already enabled"
         self.last_error = None
+        if getattr(self.debugger, "interpose_enabled", False):
+            return (False,
+                    "analysis cloak is incompatible with fork-tree tracing "
+                    "in v1")
         if not self.debugger.is_stopped_at_entry_point():
             return (False,
                     "analysis cloak must be enabled while stopped at the "
@@ -122,7 +130,8 @@ class AnalysisCloak:
         if create_bp is not None:
             for symbol in (
                     "proc_pidpath", "sysctlbyname",
-                    "IORegistryEntryCreateCFProperty"):
+                    "IORegistryEntryCreateCFProperty",
+                    "_dyld_get_image_name"):
                 bp = create_bp(symbol)
                 can_defer = (
                     symbol == "IORegistryEntryCreateCFProperty"
@@ -157,6 +166,7 @@ class AnalysisCloak:
 
     def disable(self) -> tuple[bool, str]:
         self._release_cfstrings()
+        self._release_cstrings()
         self._delete_breakpoints(set(self._bp_ids) | set(self._return_hooks))
         self._bp_ids.clear()
         self._entry_hooks.clear()
@@ -258,7 +268,9 @@ class AnalysisCloak:
             frame = thread.GetFrameAtIndex(0)
             result = frame.FindRegister("x0")
             returned = result.GetValueAsUnsigned()
-            if len(hook) == 3:
+            if hook[0] == "image":
+                message = self._handle_image_return(result, returned, lldb)
+            elif len(hook) == 3:
                 _kind, buffer, capacity = hook
                 replacement = b"/sbin/launchd\0"
                 if 0 < returned <= capacity and capacity >= len(replacement):
@@ -347,6 +359,27 @@ class AnalysisCloak:
             return None
         if entry_kind == "IORegistryEntryCreateCFProperty":
             return self._handle_iokit_entry(frame)
+        if entry_kind == "_dyld_get_image_name":
+            return_address = frame.FindRegister("lr").GetValueAsUnsigned()
+            entry_message = ""
+            if return_address:
+                bp = target.BreakpointCreateByAddress(return_address)
+                if bp.IsValid() and bp.GetNumLocations() > 0:
+                    bp.SetOneShot(True)
+                    bp.SetThreadID(thread.GetThreadID())
+                    self._return_hooks[bp.GetID()] = ("image",)
+                else:
+                    if bp.IsValid():
+                        target.BreakpointDelete(bp.GetID())
+                    entry_message = self._critical(
+                        "_dyld_get_image_name could not arm return hook; "
+                        "cloak failed")
+            else:
+                entry_message = self._critical(
+                    "_dyld_get_image_name has no return address; cloak failed")
+            if self.last_error is None:
+                process.Continue()
+            return entry_message
         buffer = frame.FindRegister("x1").GetValueAsUnsigned()
         size_pointer = frame.FindRegister("x2").GetValueAsUnsigned()
         return_address = frame.FindRegister("lr").GetValueAsUnsigned()
@@ -393,6 +426,38 @@ class AnalysisCloak:
         if self.last_error is None:
             process.Continue()
         return entry_message
+
+    def _handle_image_return(self, result, returned: int, lldb_module) -> str:
+        process = self.debugger.process
+        if not returned:
+            return ""
+
+        error = lldb_module.SBError()
+        path = process.ReadCStringFromMemory(returned, 4096, error)
+        if not error.Success():
+            return self._critical(
+                "could not read _dyld_get_image_name result; cloak failed")
+        if not contains_marker(path, IMAGE_MARKERS):
+            return ""
+
+        replacement = self._cstring_cache.get(IMAGE_REPLACEMENT)
+        if replacement is None:
+            replacement = self._eval_pointer(
+                'expression -l c++ --ignore-breakpoints true -- '
+                '(void*)strdup("{}")'.format(
+                    _escape_c_string(IMAGE_REPLACEMENT)))
+            if not replacement:
+                return self._critical(
+                    "could not allocate loaded-image replacement; cloak "
+                    "failed")
+            self._cstring_cache[IMAGE_REPLACEMENT] = replacement
+
+        if (not result.SetValueFromCString(str(replacement))
+                or result.GetValueAsUnsigned() != replacement):
+            return self._critical(
+                "could not replace _dyld_get_image_name result; cloak failed")
+        basename = path.rsplit("/", 1)[-1]
+        return "cloaked loaded image {}".format(basename)
 
     def _handle_iokit_entry(self, frame) -> str:
         process = self.debugger.process
@@ -511,6 +576,14 @@ class AnalysisCloak:
                 "expression -l c++ --ignore-breakpoints true -- "
                 "(void)CFRelease((void*){:#x})".format(pointer))
 
+    def _release_cstrings(self) -> None:
+        pointers = set(self._cstring_cache.values())
+        self._cstring_cache.clear()
+        for pointer in pointers:
+            self.debugger.handle_command(
+                "expression -l c++ --ignore-breakpoints true -- "
+                "(void)free((void*){:#x})".format(pointer))
+
     def _read_exact(self, address: int, size: int, lldb_module):
         error = lldb_module.SBError()
         data = self.debugger.process.ReadMemory(address, size, error)
@@ -529,6 +602,10 @@ class AnalysisCloak:
         return self.last_error
 
     def validate_resume(self) -> tuple[bool, str]:
+        if (self.enabled
+                and getattr(self.debugger, "interpose_enabled", False)):
+            self._critical(
+                "analysis cloak is incompatible with fork-tree tracing in v1")
         if self.enabled and self._module_loaded("IOKit"):
             for bp_id, symbol in self._entry_hooks.items():
                 if symbol != "IORegistryEntryCreateCFProperty":
@@ -547,6 +624,7 @@ class AnalysisCloak:
         self._delete_breakpoints(self._return_hooks)
         self._return_hooks.clear()
         self._release_cfstrings()
+        self._release_cstrings()
         self.last_error = None
 
     def status(self) -> dict:

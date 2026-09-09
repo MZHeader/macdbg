@@ -4,8 +4,10 @@
 #include <ctype.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <crt_externs.h>
+#include <dlfcn.h>
 #include <IOKit/IOKitLib.h>
 #include <libproc.h>
+#include <mach-o/dyld.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
@@ -21,6 +23,13 @@ static const char *tool_markers[] = {
     "hopper", "radare2", "r2", "cutter", "ghidra", "x64dbgi",
     "binaryninja", "gdb", "class-dump", "mitmproxy", "charles", "proxyman",
     "objection", "jtool2", "dtrace", "fs_usage", NULL
+};
+
+static const char *image_markers[] = {
+    "frida", "Frida", "FridaGadget", "substrate", "Substrate",
+    "MobileSubstrate", "SBInjector", "libcycript", "libReveal",
+    "RevealServer", "Dobby", "fishhook", "Cycript", "SSLKillSwitch",
+    NULL
 };
 
 static int marker_boundary(char c) {
@@ -43,6 +52,24 @@ static int contains_tool_marker(const char *value) {
             if (marker_len > 2 ||
                 (marker_boundary(at == 0 ? '\0' : value[at - 1]) &&
                  marker_boundary(value[at + marker_len])))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int contains_image_marker(const char *value) {
+    for (int i = 0; image_markers[i]; i++) {
+        const char *marker = image_markers[i];
+        size_t marker_len = strlen(marker);
+        size_t value_len = strlen(value);
+        for (size_t at = 0; at + marker_len <= value_len; at++) {
+            size_t j = 0;
+            while (j < marker_len &&
+                   tolower((unsigned char)value[at + j]) ==
+                   tolower((unsigned char)marker[j]))
+                j++;
+            if (j == marker_len)
                 return 1;
         }
     }
@@ -130,8 +157,32 @@ static int check_iokit(void) {
     return bad;
 }
 
+static int check_images(const char *path) {
+    void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "dlopen failed: %s\n", dlerror());
+        return 2;
+    }
+
+    int bad = 0;
+    const char *detected = "";
+    uint32_t count = _dyld_image_count();
+    for (uint32_t index = 0; index < count; index++) {
+        const char *name = _dyld_get_image_name(index);
+        if (name && contains_image_marker(name)) {
+            bad = 1;
+            detected = name;
+            break;
+        }
+    }
+    printf("IMAGES:%s%s%s\n", bad ? "DETECTED" : "clean",
+           bad ? " path=" : "", detected);
+    dlclose(handle);
+    return bad;
+}
+
 int main(int argc, char **argv) {
-    if (argc != 2) return 64;
+    if (argc < 2) return 64;
     if (strcmp(argv[1], "env") == 0) {
         int bad = check_environment();
         printf("ENV:%s\n", bad ? "DETECTED" : "clean");
@@ -146,5 +197,7 @@ int main(int argc, char **argv) {
         return check_sysctl();
     if (strcmp(argv[1], "iokit") == 0)
         return check_iokit();
+    if (strcmp(argv[1], "images") == 0)
+        return argc == 3 ? check_images(argv[2]) : 64;
     return 65;
 }
