@@ -68,6 +68,7 @@ class AnalysisCloak:
         self._bp_ids = set()
         self._return_hooks = {}
         self._owned_existing = set()
+        self._owned_existing_bp_ids = {}
 
     def enable(self) -> tuple[bool, str]:
         if self.enabled:
@@ -81,12 +82,18 @@ class AnalysisCloak:
         for name, state_attr in self._EXISTING_DEFENSES:
             if getattr(self.debugger, state_attr):
                 continue
+            before_ids = self._breakpoint_ids()
             ok, message = getattr(self.debugger, "enable_" + name)()
+            added_ids = self._breakpoint_ids() - before_ids
             if not ok:
+                if getattr(self.debugger, state_attr):
+                    getattr(self.debugger, "disable_" + name)()
+                self._delete_breakpoints(added_ids)
                 self._rollback_existing(acquired)
                 return False, "could not enable {}: {}".format(name, message)
             acquired.append(name)
             self._owned_existing.add(name)
+            self._owned_existing_bp_ids[name] = added_ids
 
         ok, message = self.scrub_live_environment()
         if not ok:
@@ -100,6 +107,8 @@ class AnalysisCloak:
         for name in reversed([item[0] for item in self._EXISTING_DEFENSES]):
             if name in self._owned_existing:
                 getattr(self.debugger, "disable_" + name)()
+                self._delete_breakpoints(
+                    self._owned_existing_bp_ids.pop(name, set()))
         self._owned_existing.clear()
         self.enabled = False
         return True, "analysis cloak disabled"
@@ -107,7 +116,25 @@ class AnalysisCloak:
     def _rollback_existing(self, acquired):
         for name in reversed(acquired):
             getattr(self.debugger, "disable_" + name)()
+            self._delete_breakpoints(
+                self._owned_existing_bp_ids.pop(name, set()))
             self._owned_existing.discard(name)
+
+    def _breakpoint_ids(self):
+        target = getattr(self.debugger, "target", None)
+        if target is None:
+            return set()
+        return {
+            target.GetBreakpointAtIndex(index).GetID()
+            for index in range(target.GetNumBreakpoints())
+        }
+
+    def _delete_breakpoints(self, bp_ids):
+        target = getattr(self.debugger, "target", None)
+        if target is None:
+            return
+        for bp_id in bp_ids:
+            target.BreakpointDelete(bp_id)
 
     def filter_launch_environment(self, entries) -> list[str]:
         return filter_environment(entries) if self.enabled else list(entries)
@@ -123,7 +150,11 @@ class AnalysisCloak:
             len(FORBIDDEN_ENV))
 
     def hidden_bp_ids(self) -> set[int]:
-        return set(self._bp_ids) | set(self._return_hooks)
+        owned_existing = set()
+        for bp_ids in self._owned_existing_bp_ids.values():
+            owned_existing.update(bp_ids)
+        return (set(self._bp_ids) | set(self._return_hooks)
+                | owned_existing)
 
     def handle_hit(self, _bp_id: int) -> Optional[str]:
         return None

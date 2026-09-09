@@ -40,12 +40,17 @@ class AgentProcess:
         self.boot = None
 
     def __enter__(self):
-        self.boot = _json_run(
-            [AGENT, "start", "--session", self.session, self.fixture,
-             self.mode] + self.extra_args,
-            env=self.env, timeout=40)
-        if not self.boot.get("ok"):
-            raise AssertionError("agent start failed: {!r}".format(self.boot))
+        try:
+            self.boot = _json_run(
+                [AGENT, "start", "--session", self.session, self.fixture,
+                 self.mode] + self.extra_args,
+                env=self.env, timeout=40)
+            if not self.boot.get("ok"):
+                raise AssertionError(
+                    "agent start failed: {!r}".format(self.boot))
+        except BaseException:
+            self._stop()
+            raise
         return self
 
     def cmd(self, name, args=None, timeout=20):
@@ -61,5 +66,8 @@ class AgentProcess:
         return self.cmd("continue", {"timeout": 15}, timeout=20)
 
     def __exit__(self, _exc_type, _exc, _tb):
+        self._stop()
+
+    def _stop(self):
         subprocess.run([str(AGENT), "stop", self.session], cwd=ROOT,
                        env=self.env, text=True, capture_output=True, timeout=15)
