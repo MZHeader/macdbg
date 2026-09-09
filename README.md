@@ -120,9 +120,26 @@ DYLD interposer, which would itself trip the environment and loaded-image
 checks. Enabling either feature while the other is active is rejected.
 
 Exec interception is unchanged. Interactive calls still offer **Allow**,
-**Fake success**, **Block**, or **Dump**; Dump writes the complete command or
-argv to disk, and oversized payloads are dumped automatically rather than
-being truncated to the on-screen preview.
+**Fake success**, **Block**, or **Dump**. The UI preview may be shortened, while
+Dump and oversized automatic dumps write all data macdbg successfully captured.
+Capture is bounded to 1 MiB per C string and 8,192 argv entries; an unreadable
+string is recorded as empty. Treat the disk file as the full captured data, not
+as proof that an unbounded target command or argv was recovered.
+
+To reproduce the synthetic validation from the repository root:
+
+```sh
+python3 -m unittest -v tests.test_anti_analysis_policy tests.test_analysis_cloak_surfaces
+make -C tests/integration clean all
+/usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak
+/usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak.AnalysisCloakIntegrationTests.test_combined_checks_recover_exact_chacha20_payload
+./agent.sh list
+```
+
+The focused test verifies the known synthetic fixture plaintext
+`macdbg analysis cloak recovered this payload`, including recovery again after
+restart. The final command should show no live test session; historical dead
+session records may remain listed.
 
 **Anti-debug**
 

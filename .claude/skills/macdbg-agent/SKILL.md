@@ -255,8 +255,11 @@ interactive mode first to inspect:
   rejection rule.
 - `dump_exec` — while an exec decision is pending, write the full
   command/argv to a dump file and return its path.
-- Oversized commands/argv are dumped automatically; the on-screen preview may
-  be shortened, but the disk dump retains the complete payload.
+- Oversized commands/argv are dumped automatically. The on-screen preview may
+  be shortened, while disk dumps retain all data macdbg successfully captured.
+  Capture is bounded to 1 MiB per C string and 8,192 argv entries; an unreadable
+  string is captured as empty. A dump is therefore the full captured data, not
+  a guarantee that an unbounded target command or argv was recovered.
 - While a decision is pending, `continue`/`step_*` are refused — resuming
   directly would bypass the shield.
 
@@ -355,6 +358,24 @@ section):
 ```
 raw {"command": "image lookup --verbose --address 0x1000a4210"}
 ```
+
+## Verify analysis cloak
+
+Run the public contracts, rebuild every ARM64 fixture, run the real
+`agent.sh`/LLDB integration suite, then check for leftover sessions:
+
+```sh
+python3 -m unittest -v tests.test_anti_analysis_policy tests.test_analysis_cloak_surfaces
+make -C tests/integration clean all
+/usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak
+/usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak.AnalysisCloakIntegrationTests.test_combined_checks_recover_exact_chacha20_payload
+./agent.sh list
+```
+
+The focused test asserts the known synthetic fixture plaintext
+`macdbg analysis cloak recovered this payload` and repeats recovery after a
+restart. `agent.sh list` may include historical dead records, but it must not
+show a live test session.
 
 ## Session management
 

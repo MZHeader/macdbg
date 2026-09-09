@@ -71,6 +71,28 @@ class DocumentationContractTests(unittest.TestCase):
     def test_agent_skill_documents_analysis_cloak_command(self):
         self.assertIn("`analysis_cloak`", AGENT_SKILL_SOURCE)
 
+    def test_dump_docs_state_capture_bounds(self):
+        for document in (README_SOURCE, AGENT_SKILL_SOURCE):
+            with self.subTest(document="README" if document is README_SOURCE
+                              else "agent skill"):
+                for term in ("1 MiB", "8,192", "unreadable", "shortened"):
+                    self.assertIn(term, document)
+
+    def test_docs_publish_synthetic_fixture_verification_commands(self):
+        commands = (
+            "tests.test_anti_analysis_policy tests.test_analysis_cloak_surfaces",
+            "make -C tests/integration clean all",
+            "tests.integration.test_analysis_cloak",
+            "test_combined_checks_recover_exact_chacha20_payload",
+            "./agent.sh list",
+            "synthetic fixture plaintext",
+        )
+        for document in (README_SOURCE, AGENT_SKILL_SOURCE):
+            with self.subTest(document="README" if document is README_SOURCE
+                              else "agent skill"):
+                for term in commands:
+                    self.assertIn(term, document)
+
     def test_project_metadata_describes_current_frontends(self):
         self.assertIn("GUI and headless", PYPROJECT_SOURCE)
         self.assertNotIn("Textual TUI", PYPROJECT_SOURCE)
