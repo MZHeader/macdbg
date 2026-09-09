@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "agent.sh"
 FIXTURE_DIR = ROOT / "tests" / "integration" / "build"
 FIXTURE = FIXTURE_DIR / "analysis_fixture"
+STRIPPED_FIXTURE = FIXTURE_DIR / "analysis_fixture_stripped"
+LATE_IOKIT_FIXTURE = FIXTURE_DIR / "late_iokit_fixture"
 FRIDA_FIXTURE = FIXTURE_DIR / "FridaGadget.dylib"
 
 

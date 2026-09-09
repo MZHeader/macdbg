@@ -124,7 +124,11 @@ class AnalysisCloak:
                     "proc_pidpath", "sysctlbyname",
                     "IORegistryEntryCreateCFProperty"):
                 bp = create_bp(symbol)
-                if not bp.IsValid() or bp.GetNumLocations() == 0:
+                can_defer = (
+                    symbol == "IORegistryEntryCreateCFProperty"
+                    and not self._module_loaded("IOKit"))
+                if (not bp.IsValid()
+                        or (bp.GetNumLocations() == 0 and not can_defer)):
                     if bp.IsValid():
                         target.BreakpointDelete(bp.GetID())
                     self._delete_breakpoints(self._bp_ids)
@@ -145,7 +149,11 @@ class AnalysisCloak:
             return False, message
 
         self.enabled = True
-        return True, "analysis cloak enabled; {}".format(message)
+        hook_status = self.status()
+        return (True,
+                "analysis cloak enabled; {}; {} resolved, {} deferred hooks"
+                .format(message, hook_status["resolved"],
+                        hook_status["deferred"]))
 
     def disable(self) -> tuple[bool, str]:
         self._release_cfstrings()
@@ -178,6 +186,35 @@ class AnalysisCloak:
             target.GetBreakpointAtIndex(index).GetID()
             for index in range(target.GetNumBreakpoints())
         }
+
+    def _module_loaded(self, marker: str) -> bool:
+        target = getattr(self.debugger, "target", None)
+        if target is None or not hasattr(target, "GetNumModules"):
+            return False
+        folded = marker.casefold()
+        for index in range(target.GetNumModules()):
+            module = target.GetModuleAtIndex(index)
+            file_spec = module.GetFileSpec()
+            name = file_spec.GetFilename() or ""
+            if folded == name.casefold():
+                return True
+        return False
+
+    def _hook_counts(self) -> tuple[int, int]:
+        target = getattr(self.debugger, "target", None)
+        if target is None:
+            return 0, 0
+        resolved = 0
+        deferred = 0
+        for bp_id in self._bp_ids:
+            bp = target.FindBreakpointByID(bp_id)
+            if not bp or not bp.IsValid():
+                continue
+            if bp.GetNumLocations() > 0:
+                resolved += 1
+            else:
+                deferred += 1
+        return resolved, deferred
 
     def _delete_breakpoints(self, bp_ids):
         target = getattr(self.debugger, "target", None)
@@ -425,8 +462,9 @@ class AnalysisCloak:
         import lldb
         c_string = self._eval_pointer(
             "expression -l c++ --ignore-breakpoints true -- "
-            "(void*)CFStringGetCStringPtr((CFStringRef){:#x}, "
-            "0x08000100)".format(pointer))
+            "(void*)((const char *(*)(const void *, unsigned int))"
+            "CFStringGetCStringPtr)((const void*){:#x}, 0x08000100)"
+            .format(pointer))
         if c_string is None:
             return None
         if c_string:
@@ -443,8 +481,9 @@ class AnalysisCloak:
         value = None
         copied = self._eval_integer(
             "expression -l c++ --ignore-breakpoints true -- "
-            "(int)CFStringGetCString((CFStringRef){:#x}, (char*){:#x}, "
-            "256, 0x08000100)".format(pointer, buffer))
+            "(int)((unsigned char (*)(const void *, char *, long, "
+            "unsigned int))CFStringGetCString)((const void*){:#x}, "
+            "(char*){:#x}, 256, 0x08000100)".format(pointer, buffer))
         if copied == 1:
             error = lldb.SBError()
             candidate = self.debugger.process.ReadCStringFromMemory(
@@ -490,6 +529,16 @@ class AnalysisCloak:
         return self.last_error
 
     def validate_resume(self) -> tuple[bool, str]:
+        if self.enabled and self._module_loaded("IOKit"):
+            for bp_id, symbol in self._entry_hooks.items():
+                if symbol != "IORegistryEntryCreateCFProperty":
+                    continue
+                bp = self.debugger.target.FindBreakpointByID(bp_id)
+                if (not bp or not bp.IsValid()
+                        or bp.GetNumLocations() == 0):
+                    self._critical(
+                        "IORegistryEntryCreateCFProperty hook did not resolve "
+                        "after IOKit loaded; cloak failed")
         if self.enabled and self.last_error:
             return False, self.last_error
         return True, "analysis cloak ready"
@@ -501,9 +550,10 @@ class AnalysisCloak:
         self.last_error = None
 
     def status(self) -> dict:
+        resolved, deferred = self._hook_counts()
         return {
             "enabled": self.enabled,
-            "resolved": len(self._bp_ids),
-            "deferred": 0,
+            "resolved": resolved,
+            "deferred": deferred,
             "error": self.last_error,
         }

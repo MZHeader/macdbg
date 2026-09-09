@@ -93,7 +93,147 @@ class ScriptedDebugger:
         return response
 
 
+class HookBreakpoint:
+    def __init__(self, bp_id, locations=1, valid=True):
+        self.bp_id = bp_id
+        self.locations = locations
+        self.valid = valid
+
+    def GetID(self):
+        return self.bp_id
+
+    def GetNumLocations(self):
+        return self.locations
+
+    def IsValid(self):
+        return self.valid
+
+
+class FakeFileSpec:
+    def __init__(self, name):
+        self.name = name
+
+    def GetFilename(self):
+        return self.name
+
+
+class FakeModule:
+    def __init__(self, name):
+        self.name = name
+
+    def GetFileSpec(self):
+        return FakeFileSpec(self.name)
+
+
+class HookTarget:
+    def __init__(self, locations=None, modules=()):
+        self.locations = dict(locations or {})
+        self.modules = [FakeModule(name) for name in modules]
+        self.breakpoints = []
+        self.next_id = 100
+
+    def add_breakpoint(self, locations=1):
+        bp = HookBreakpoint(self.next_id, locations)
+        self.next_id += 1
+        self.breakpoints.append(bp)
+        return bp
+
+    def BreakpointCreateByName(self, symbol):
+        return self.add_breakpoint(self.locations.get(symbol, 1))
+
+    def BreakpointDelete(self, bp_id):
+        self.breakpoints = [bp for bp in self.breakpoints
+                            if bp.GetID() != bp_id]
+        return True
+
+    def GetNumBreakpoints(self):
+        return len(self.breakpoints)
+
+    def GetBreakpointAtIndex(self, index):
+        return self.breakpoints[index]
+
+    def FindBreakpointByID(self, bp_id):
+        for bp in self.breakpoints:
+            if bp.GetID() == bp_id:
+                return bp
+        return HookBreakpoint(bp_id, valid=False)
+
+    def GetNumModules(self):
+        return len(self.modules)
+
+    def GetModuleAtIndex(self, index):
+        return self.modules[index]
+
+
+class DeferredDebugger:
+    def __init__(self, locations=None, modules=()):
+        self.target = HookTarget(locations, modules)
+        self.process = FakeProcess(FakeFrame())
+        self._scrub_ptraced = False
+        self._scrub_parent = False
+        self.anti_timing_bp_ids = None
+
+    def is_stopped_at_entry_point(self):
+        return True
+
+    def _enable(self, name):
+        bp = self.target.add_breakpoint()
+        if name == "anti_sysctl":
+            self._scrub_ptraced = True
+        elif name == "anti_parent":
+            self._scrub_parent = True
+        else:
+            self.anti_timing_bp_ids = [bp.GetID()]
+        return True, "enabled"
+
+    def _disable(self, name):
+        if name == "anti_sysctl":
+            self._scrub_ptraced = False
+        elif name == "anti_parent":
+            self._scrub_parent = False
+        else:
+            self.anti_timing_bp_ids = None
+        return True, "disabled"
+
+    def enable_anti_sysctl(self):
+        return self._enable("anti_sysctl")
+
+    def disable_anti_sysctl(self):
+        return self._disable("anti_sysctl")
+
+    def enable_anti_parent(self):
+        return self._enable("anti_parent")
+
+    def disable_anti_parent(self):
+        return self._disable("anti_parent")
+
+    def enable_anti_timing(self):
+        return self._enable("anti_timing")
+
+    def disable_anti_timing(self):
+        return self._disable("anti_timing")
+
+    def handle_command(self, _command):
+        return True, "", ""
+
+
 class IOKitCFStringTests(unittest.TestCase):
+    def test_cfstring_text_direct_pointer_does_not_need_debug_typedefs(self):
+        process = FakeProcess(
+            FakeFrame(x1=0x1111),
+            cstrings={0x2000: "IOPlatformSerialNumber"},
+        )
+        debugger = ScriptedDebugger(process, [
+            ("CFStringGetCStringPtr", (True, "$0 = 0x2000\n", "")),
+        ])
+        cloak = AnalysisCloak(debugger)
+
+        with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
+            text = cloak._cfstring_text(0x1111)
+
+        self.assertEqual(text, "IOPlatformSerialNumber")
+        self.assertNotIn("CFStringRef", debugger.commands[0])
+
     def test_cfstring_text_falls_back_to_temporary_target_buffer(self):
         process = FakeProcess(
             FakeFrame(x1=0x1111),
@@ -114,6 +254,7 @@ class IOKitCFStringTests(unittest.TestCase):
         self.assertFalse(debugger.script)
         self.assertTrue(all("--ignore-breakpoints true" in command
                             for command in debugger.commands))
+        self.assertNotIn("CFStringRef", "\n".join(debugger.commands))
 
     def test_exact_property_is_cached_and_each_create_result_is_retained(self):
         process = FakeProcess(
@@ -194,6 +335,58 @@ class IOKitCFStringTests(unittest.TestCase):
         self.assertIn("could not read IOKit property key", message)
         self.assertEqual(cloak.validate_resume(), (False, message))
         self.assertEqual(process.continues, 0)
+
+
+class IOKitDeferredHookTests(unittest.TestCase):
+    def test_absent_iokit_hook_is_retained_deferred_then_resolves(self):
+        debugger = DeferredDebugger(locations={
+            "IORegistryEntryCreateCFProperty": 0,
+        }, modules=("late_iokit_fixture", "libSystem.B.dylib"))
+        cloak = AnalysisCloak(debugger)
+
+        ok, message = cloak.enable()
+
+        self.assertTrue(ok, message)
+        self.assertIn("1 deferred", message)
+        self.assertEqual(cloak.status()["resolved"], 2)
+        self.assertEqual(cloak.status()["deferred"], 1)
+        iokit_id = next(bp_id for bp_id, name in cloak._entry_hooks.items()
+                        if name == "IORegistryEntryCreateCFProperty")
+        self.assertIn(iokit_id, cloak.hidden_bp_ids())
+
+        debugger.target.FindBreakpointByID(iokit_id).locations = 1
+        self.assertEqual(cloak.status()["resolved"], 3)
+        self.assertEqual(cloak.status()["deferred"], 0)
+
+        self.assertTrue(cloak.disable()[0])
+        self.assertNotIn(iokit_id, {
+            bp.GetID() for bp in debugger.target.breakpoints
+        })
+        self.assertEqual(cloak.status()["resolved"], 0)
+        self.assertEqual(cloak.status()["deferred"], 0)
+
+    def test_required_hook_with_no_location_still_fails_closed(self):
+        debugger = DeferredDebugger(locations={"proc_pidpath": 0})
+        cloak = AnalysisCloak(debugger)
+
+        ok, message = cloak.enable()
+
+        self.assertFalse(ok)
+        self.assertIn("proc_pidpath", message)
+        self.assertFalse(cloak.enabled)
+
+    def test_loaded_iokit_with_no_location_still_fails_closed(self):
+        debugger = DeferredDebugger(
+            locations={"IORegistryEntryCreateCFProperty": 0},
+            modules=("IOKit",),
+        )
+        cloak = AnalysisCloak(debugger)
+
+        ok, message = cloak.enable()
+
+        self.assertFalse(ok)
+        self.assertIn("IORegistryEntryCreateCFProperty", message)
+        self.assertFalse(cloak.enabled)
 
 
 if __name__ == "__main__":

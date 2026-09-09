@@ -4,10 +4,35 @@ import unittest
 from unittest import mock
 
 from . import support
-from .support import AgentProcess, FIXTURE, run_fixture_direct
+from .support import (
+    AgentProcess,
+    FIXTURE,
+    LATE_IOKIT_FIXTURE,
+    STRIPPED_FIXTURE,
+    run_fixture_direct,
+)
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_iokit_spoofing_works_for_a_stripped_binary(self):
+        with AgentProcess(STRIPPED_FIXTURE, "iokit") as agent:
+            enabled = agent.enable_cloak()
+            self.assertTrue(enabled["ok"], enabled)
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("IOKIT:clean", result["console"])
+
+    def test_iokit_hook_defers_and_resolves_after_dlopen(self):
+        with AgentProcess(LATE_IOKIT_FIXTURE, "") as agent:
+            enabled = agent.enable_cloak()
+            self.assertTrue(enabled["ok"], enabled)
+            self.assertIn("1 deferred", enabled["message"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result["event"], "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("LATE-IOKIT:clean", result["console"])
+
     def test_iokit_platform_identity_is_spoofed(self):
         direct = run_fixture_direct("iokit")
         self.assertNotEqual(direct.returncode, 0, direct.stdout + direct.stderr)
