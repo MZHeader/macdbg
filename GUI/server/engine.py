@@ -483,6 +483,12 @@ class Engine:
                     self._emit({"t": "prompt", "kind": "fork", "name": name,
                                 "caller": caller})
                     return True
+        for bp_id in bp_ids:
+            msg = self.dbg.handle_analysis_cloak_hit(bp_id)
+            if msg is not None:
+                if msg:
+                    self._console("[anti-analysis] " + msg)
+                return True
         for handler in (self.dbg.handle_anti_ptrace_hit, self.dbg.handle_flag_scrub_hit,
                         self.dbg.handle_syscall_hit, self.dbg.handle_anti_timing_hit,
                         self.dbg.handle_anti_mach_hit, self.dbg.handle_direct_syscall_hit,

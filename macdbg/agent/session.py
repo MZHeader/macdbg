@@ -888,6 +888,12 @@ class AgentSession:
         bp_ids = self._stop_bp_ids(thread)
         if not bp_ids:
             return False
+        for bp_id in bp_ids:
+            msg = self.dbg.handle_analysis_cloak_hit(bp_id)
+            if msg is not None:
+                if msg:
+                    self._log("[anti-analysis] " + msg)
+                return True
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_flag_scrub_hit,
                         self.dbg.handle_syscall_hit,

@@ -65,8 +65,8 @@ class AnalysisCloak:
     def __init__(self, debugger):
         self.debugger = debugger
         self.enabled: bool = False
-        self._bp_ids = set()
-        self._return_hooks = {}
+        self._bp_ids: set[int] = set()
+        self._return_hooks: dict[int, tuple[str, int, int]] = {}
         self._owned_existing = set()
         self._owned_existing_bp_ids = {}
 
@@ -95,8 +95,21 @@ class AnalysisCloak:
             self._owned_existing.add(name)
             self._owned_existing_bp_ids[name] = added_ids
 
+        target = self.debugger.target
+        create_bp = getattr(target, "BreakpointCreateByName", None)
+        if create_bp is not None:
+            bp = create_bp("proc_pidpath")
+            if not bp.IsValid() or bp.GetNumLocations() == 0:
+                if bp.IsValid():
+                    target.BreakpointDelete(bp.GetID())
+                self._rollback_existing(acquired)
+                return False, "could not enable proc_pidpath cloak: symbol not found"
+            self._bp_ids.add(bp.GetID())
+
         ok, message = self.scrub_live_environment()
         if not ok:
+            self._delete_breakpoints(self._bp_ids)
+            self._bp_ids.clear()
             self._rollback_existing(acquired)
             return False, message
 
@@ -104,6 +117,9 @@ class AnalysisCloak:
         return True, "analysis cloak enabled; {}".format(message)
 
     def disable(self) -> tuple[bool, str]:
+        self._delete_breakpoints(set(self._bp_ids) | set(self._return_hooks))
+        self._bp_ids.clear()
+        self._return_hooks.clear()
         for name in reversed([item[0] for item in self._EXISTING_DEFENSES]):
             if name in self._owned_existing:
                 getattr(self.debugger, "disable_" + name)()
@@ -156,8 +172,55 @@ class AnalysisCloak:
         return (set(self._bp_ids) | set(self._return_hooks)
                 | owned_existing)
 
-    def handle_hit(self, _bp_id: int) -> Optional[str]:
-        return None
+    def handle_hit(self, bp_id: int) -> Optional[str]:
+        process = getattr(self.debugger, "process", None)
+        target = getattr(self.debugger, "target", None)
+        if process is None or target is None:
+            return None
+
+        hook = self._return_hooks.pop(bp_id, None)
+        if hook is not None:
+            target.BreakpointDelete(bp_id)
+            _kind, buffer, capacity = hook
+            import lldb
+            err = lldb.SBError()
+            data = process.ReadMemory(buffer, capacity, err) if capacity else b""
+            message = ""
+            if err.Success() and data:
+                path = data.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+                if contains_marker(path, TOOL_MARKERS):
+                    replacement = b"/sbin/launchd\0"
+                    process.WriteMemory(buffer, replacement, err)
+                    frame = process.GetSelectedThread().GetFrameAtIndex(0)
+                    frame.FindRegister("x0").SetValueFromCString(
+                        str(len(replacement) - 1))
+                    message = "cloaked parent process path from proc_pidpath"
+            process.Continue()
+            return message
+
+        if bp_id not in self._bp_ids:
+            return None
+        thread = process.GetSelectedThread()
+        if not thread or not thread.IsValid():
+            return None
+        frame = thread.GetFrameAtIndex(0)
+        if not frame or not frame.IsValid():
+            return None
+        buffer = frame.FindRegister("x1").GetValueAsUnsigned()
+        capacity = frame.FindRegister("x2").GetValueAsUnsigned()
+        return_address = frame.FindRegister("lr").GetValueAsUnsigned()
+        if buffer and capacity and return_address:
+            bp = target.BreakpointCreateByAddress(return_address)
+            bp.SetOneShot(True)
+            bp.SetThreadID(thread.GetThreadID())
+            self._return_hooks[bp.GetID()] = (
+                "proc_pidpath", buffer, capacity)
+        process.Continue()
+        return ""
+
+    def clear_return_hooks(self) -> None:
+        self._delete_breakpoints(self._return_hooks)
+        self._return_hooks.clear()
 
     def status(self) -> dict:
         return {

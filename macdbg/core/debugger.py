@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import lldb
 
-from .anti_analysis import AnalysisCloak
+from .anti_analysis import AnalysisCloak, TOOL_MARKERS, contains_marker
 from .state import BinaryState, StoredBP, Patch, load_for, STATE_DIR
 
 
@@ -198,6 +198,7 @@ class Debugger:
         self._fake_clock = 0
         self._anti_timing_logged = False
         self._clear_flag_scrub_returns()
+        self.analysis_cloak.clear_return_hooks()
         info = lldb.SBLaunchInfo(argv)
         info.SetLaunchFlags(
             lldb.eLaunchFlagStopAtEntry | lldb.eLaunchFlagDisableASLR
@@ -243,6 +244,9 @@ class Debugger:
 
     def disable_analysis_cloak(self) -> Tuple[bool, str]:
         return self.analysis_cloak.disable()
+
+    def handle_analysis_cloak_hit(self, bp_id: int) -> Optional[str]:
+        return self.analysis_cloak.handle_hit(bp_id)
 
     def entry_point_address(self) -> Optional[int]:
         """Load address of the executable's entry point (LC_MAIN entryoff plus
@@ -1101,7 +1105,6 @@ class Debugger:
         self._sync_syscall_bp()
         return True, "csops(CS_DEBUGGED) scrub disabled"
 
-    _DEBUGGER_NAMES = (b"debugserver", b"lldb", b"gdb")
     _KINFO_PROC_SIZE = 648   # sizeof(struct kinfo_proc) on macOS arm64
 
     def _arm_return_scrub(self, thread, kind: str, buf: int, oldlenp: int = 0) -> None:
@@ -1128,11 +1131,19 @@ class Debugger:
         data = self.process.ReadMemory(buf, length, err)
         if not err.Success() or not data:
             return None
-        for kw in self._DEBUGGER_NAMES:
-            idx = data.find(kw)
-            if idx >= 0 and idx + 8 <= len(data):
-                self.process.WriteMemory(buf + idx, b"launchd\x00", err)
-                return "scrubbed debugger name '{}' from sysctl(KERN_PROC) result".format(kw.decode())
+        start = 0
+        while start < len(data):
+            end = data.find(b"\0", start)
+            if end < 0:
+                break
+            field = data[start:end]
+            name = field.decode("utf-8", errors="ignore")
+            if len(field) >= len(b"launchd") and contains_marker(name, TOOL_MARKERS):
+                replacement = b"launchd\0"
+                replacement += b"\0" * (len(field) + 1 - len(replacement))
+                self.process.WriteMemory(buf + start, replacement, err)
+                return "scrubbed debugger name '{}' from sysctl(KERN_PROC) result".format(name)
+            start = end + 1
         return ""
 
     def _read_uint(self, addr: int, size: int) -> Optional[int]:

@@ -8,6 +8,14 @@ from .support import AgentProcess, FIXTURE, run_fixture_direct
 
 
 class AnalysisCloakIntegrationTests(unittest.TestCase):
+    def test_parent_paths_are_cloaked(self):
+        with AgentProcess(FIXTURE, "parent") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result["exit"]["code"], 0)
+            self.assertIn("PARENT:clean", result["console"])
+            self.assertIn("[anti-analysis]", result["console"])
+
     def test_environment_is_detected_without_cloak_and_clean_with_cloak(self):
         hostile = {"DYLD_PRINT_BINDINGS": "1", "NSZombieEnabled": "YES"}
         self.assertNotEqual(run_fixture_direct("env", env=hostile).returncode, 0)
