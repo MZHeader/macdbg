@@ -4,7 +4,7 @@
 
 Add a reusable, opt-in `analysis_cloak` defense to macdbg that defeats the
 documented environment, parent-process, virtualization, hardware-identity,
-loaded-image, text-integrity, timing, and `sysctl` checks without patching the
+loaded-image, text-integrity, and `sysctl` checks without patching the
 sample's control flow. Validate the defense against compiled ARM64 macOS
 fixtures, including a combined fixture whose failed checks corrupt a derived
 ChaCha20 key and prevent recovery of a known payload.
@@ -33,7 +33,7 @@ repository remains untouched.
 - Preserve the target's `__TEXT,__text` bytes by requiring hardware
   breakpoints for every macdbg-managed breakpoint in that section while the
   cloak is active.
-- Reuse the existing timing cloak and syscall-number-202 `P_TRACED` scrub.
+- Reuse the existing syscall-number-202 `P_TRACED` scrub.
 - Expose one composite defense through both the GUI and headless agent while
   retaining useful individual toggles.
 - Preserve the existing exec prompt and disk-dump behavior: Allow, Fake
@@ -42,8 +42,9 @@ repository remains untouched.
 ### Excluded from v1
 
 - Compatibility between the analysis cloak and the DYLD fork-tree interposer.
-- Hiding direct `mrs cntvct_el0` timing reads or wall-clock APIs not already
-  covered by the timing defense.
+- Hiding timing reads, including clock APIs and direct `mrs cntvct_el0` reads.
+  The fixed-step synthetic clock was removed because it was fingerprintable and
+  changed ordinary monotonic-clock behavior.
 - Generic concealment from arbitrary private or undocumented inspection APIs.
 - Forging arbitrary SHA-256 results or patching sample-specific check sites.
 - x86_64 support.
@@ -165,11 +166,9 @@ while integrity protection is active.
 
 ### Existing protections
 
-The composite defense enables the current `anti_sysctl`, `anti_timing`, and
-parent-related handling. Syscall 202 continues to use the existing
-`syscall`/`__syscall` multiplexer and return-buffer scrub. Timing continues to
-virtualize `mach_absolute_time`, `mach_continuous_time`, and
-`clock_gettime_nsec_np` with the documented fixed-step limitation.
+The composite defense enables the current `anti_sysctl` and parent-related
+handling. Syscall 202 continues to use the existing `syscall`/`__syscall`
+multiplexer and return-buffer scrub.
 
 ## State and Failure Handling
 
@@ -180,10 +179,9 @@ by the current executable must have a resolved hook. Missing critical hooks,
 unsafe target-text breakpoints, text patches, enabling after entry, or active
 fork-tree interposition block execution with an actionable error.
 
-Every actual rewrite emits one concise `[anti-analysis]` message. Repeated
-high-frequency timing calls retain the existing log suppression. Relaunch clears
-return-breakpoint and target-allocation state, reapplies launch filtering, and
-re-arms the composite defense.
+Every actual rewrite emits one concise `[anti-analysis]` message. Relaunch
+clears return-breakpoint and target-allocation state, reapplies launch filtering,
+and re-arms the composite defense.
 Replacing the target through Open or Attach disposes its target-owned defense
 state. A new target starts with the cloak off and can enable it at its own
 entry stop; same-target restart preserves the requested mode.
@@ -228,7 +226,8 @@ The fixtures cover:
    `FridaGadget.dylib` fixture.
 6. In-memory SHA-256 of the fixture's own `__TEXT,__text`, with the expected
    baseline digest supplied independently of that section.
-7. `mach_timebase_info` plus `mach_absolute_time` threshold detection.
+7. A timing fixture that characterizes timing detection as deliberately
+   unsupported and verifies the removed defense is not exposed.
 8. syscall number 202 with `{CTL_KERN, KERN_PROC, KERN_PROC_PID, pid}` and a
    `P_TRACED` assertion.
 9. Existing exec interception, including interactive Dump and oversized
@@ -247,8 +246,10 @@ debugged child or agent daemon remains alive.
 - The original `/Users/liamchugg/Projects/macdbg` working tree has no new source
   modifications from this project.
 - All new unit and integration tests pass in the isolated `testing` copy.
-- Each standalone fixture demonstrates detection without its corresponding
-  defense and a clean result with the defense enabled.
+- Each supported standalone fixture demonstrates detection without its
+  corresponding defense and a clean result with the defense enabled. The timing
+  fixture instead demonstrates that timing is explicitly unsupported and
+  remains detected.
 - The combined fixture prints the exact known payload only with
   `analysis_cloak` enabled.
 - The fixture's in-process `__text` digest remains identical to its clean

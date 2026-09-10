@@ -390,7 +390,7 @@ static int check_combined(const char *digest, const char *dylib) {
     CC_SHA256(password, sizeof(password), key);
     chacha20_xor(payload, sizeof(payload), key);
 
-    int failures[8];
+    int failures[7];
     failures[0] = check_environment();
     printf("ENV:%s\n", failures[0] ? "DETECTED" : "clean");
     failures[1] = check_parent();
@@ -399,9 +399,8 @@ static int check_combined(const char *digest, const char *dylib) {
     failures[3] = check_iokit();
     failures[4] = check_images(dylib);
     failures[5] = check_integrity(digest);
-    failures[6] = check_timing();
-    failures[7] = check_ptraced();
-    for (int i = 0; i < 8; i++)
+    failures[6] = check_ptraced();
+    for (int i = 0; i < 7; i++)
         if (failures[i]) candidate[i] ^= (uint8_t)(0x31 + i);
     CC_SHA256(candidate, sizeof(candidate), key);
     chacha20_xor(payload, sizeof(payload), key);

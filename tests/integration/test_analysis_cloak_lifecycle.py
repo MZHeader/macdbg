@@ -116,7 +116,7 @@ class InternalHookProtectionTests(unittest.TestCase):
                     bid = next(i for i, name in c._entry_hooks.items() if name == "proc_pidpath")
                     bp = s.dbg.target.FindBreakpointByID(bid)
                     if mode == "secondary":
-                        bp = s.dbg.target.BreakpointCreateByRegex("^(check_parent|check_timing)$")
+                        bp = s.dbg.target.BreakpointCreateByRegex("^(check_parent|check_sysctl)$")
                         bid = bp.GetID()
                         assert bp.GetNumLocations() >= 2
                         c._bp_ids.add(bid)
@@ -158,13 +158,12 @@ class InternalHookProtectionTests(unittest.TestCase):
             rows = []
             try:
                 assert s.start()["ok"]
-                for family in ("proc_pidpath", "sysctlbyname", "IORegistryEntryCreateCFProperty", "_dyld_get_image_name", "legacy_sysctl", "syscall", "timing"):
+                for family in ("proc_pidpath", "sysctlbyname", "IORegistryEntryCreateCFProperty", "_dyld_get_image_name", "legacy_sysctl", "syscall"):
                     for mutation in ("delete", "disable", "location"):
                         assert s.dbg.enable_analysis_cloak()[0]
                         d, c = s.dbg, s.dbg.analysis_cloak
                         if family == "legacy_sysctl": bid = d.anti_sysctl_bp_id
                         elif family == "syscall": bid = d.syscall_bp_ids[0]
-                        elif family == "timing": bid = d.anti_timing_bp_ids[0]
                         else: bid = next(i for i, name in c._entry_hooks.items() if name == family)
                         bp = d.target.FindBreakpointByID(bid)
                         if mutation == "delete": d.target.BreakpointDelete(bid)

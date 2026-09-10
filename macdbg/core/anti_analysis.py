@@ -85,7 +85,6 @@ class AnalysisCloak:
     _EXISTING_DEFENSES = (
         ("anti_sysctl", "_scrub_ptraced"),
         ("anti_parent", "_scrub_parent"),
-        ("anti_timing", "anti_timing_bp_ids"),
     )
 
     def __init__(self, debugger):
@@ -173,10 +172,8 @@ class AnalysisCloak:
         sysctl_id = getattr(self.debugger, "anti_sysctl_bp_id", 0)
         if sysctl_id:
             self._required_hooks[sysctl_id] = "sysctl"
-        for attr, label in (("syscall_bp_ids", "syscall wrapper"),
-                            ("anti_timing_bp_ids", "monotonic timing")):
-            for bp_id in getattr(self.debugger, attr, None) or ():
-                self._required_hooks[bp_id] = label
+        for bp_id in getattr(self.debugger, "syscall_bp_ids", None) or ():
+            self._required_hooks[bp_id] = "syscall wrapper"
         hook_status = self.status()
         return (True,
                 "analysis cloak enabled; {}; {} resolved, {} deferred hooks"

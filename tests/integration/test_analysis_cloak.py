@@ -37,7 +37,6 @@ class _AgentDebuggerProxy:
         "anti_mach_ports": "anti_mach_ports",
         "anti_sysctl": "anti_sysctl",
         "anti_csops": "anti_csops",
-        "anti_timing": "anti_timing",
         "anti_parent": "anti_parent",
         "anti_sigtrap": "anti_sigtrap",
     }
@@ -91,10 +90,6 @@ class _AgentDebuggerProxy:
         return int(self.state["anti_csops"])
 
     @property
-    def anti_timing_bp_ids(self):
-        return {1} if self.state["anti_timing"] else set()
-
-    @property
     def _scrub_parent(self):
         return self.state["anti_parent"]
 
@@ -119,7 +114,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
         self.assertIsNone(defenses["analysis_cloak_error"], status)
         self.assertIs(type(defenses["analysis_cloak_resolved"]), int)
         self.assertIs(type(defenses["analysis_cloak_deferred"]), int)
-        for name in ("anti_sysctl", "anti_parent", "anti_timing"):
+        for name in ("anti_sysctl", "anti_parent"):
             self.assertTrue(defenses[name], status)
 
     def test_gui_all_is_integrity_safe_for_fresh_and_preenabled_svc_scan(self):
@@ -145,7 +140,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                 # ALL cleanup.
                 engine._t_analysis_cloak()
                 constituents = agent.cmd("status")["defenses"]
-                for name in ("anti_sysctl", "anti_parent", "anti_timing"):
+                for name in ("anti_sysctl", "anti_parent"):
                     self.assertTrue(constituents[name], constituents)
                 engine._t_analysis_cloak()
                 engine._t_all_anti()
@@ -153,7 +148,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                 for name in (
                     "analysis_cloak", "anti_ptrace", "direct_syscall",
                     "anti_mach_ports", "anti_sysctl", "anti_csops",
-                    "anti_timing", "anti_parent", "anti_sigtrap",
+                    "anti_parent", "anti_sigtrap",
                 ):
                     self.assertFalse(disabled[name], disabled)
 
@@ -163,19 +158,16 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                 self.assertEqual(result["exit"]["code"], 0, result)
                 self.assertIn("INTEGRITY:clean", result["console"])
 
-    def test_timing_hides_real_sysctl_breakpoint_latency(self):
+    def test_synthetic_timing_defense_is_removed_and_cloak_does_not_claim_it(self):
         with AgentProcess(FIXTURE, "timing") as agent:
-            self.assertTrue(agent.cmd("defense_enable", {"name": "anti_sysctl"})["ok"])
+            removed = agent.cmd("defense_enable", {"name": "anti_timing"})
+            self.assertFalse(removed["ok"], removed)
+            self.assertTrue(agent.enable_cloak()["ok"])
+            self.assertNotIn("anti_timing", agent.cmd("status")["defenses"])
             result = agent.continue_to_exit()
             self.assertEqual(result["event"], "exited", result)
             self.assertEqual(result["exit"]["code"], 1, result)
             self.assertIn("TIMING:DETECTED", result["console"])
-        with AgentProcess(FIXTURE, "timing") as agent:
-            self.assertTrue(agent.enable_cloak()["ok"])
-            result = agent.continue_to_exit()
-            self.assertEqual(result["event"], "exited", result)
-            self.assertEqual(result["exit"]["code"], 0, result)
-            self.assertIn("TIMING:clean", result["console"])
 
     def test_syscall_202_ptraced_is_scrubbed(self):
         direct = run_fixture_direct("ptraced")
@@ -192,7 +184,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                               result["console"])
 
     def test_cloak_status_and_existing_defense_ownership(self):
-        with AgentProcess(FIXTURE, "timing") as agent:
+        with AgentProcess(FIXTURE, "parent") as agent:
             self.assertTrue(agent.cmd("defense_enable", {"name": "anti_sysctl"})["ok"])
             self.assertTrue(agent.enable_cloak()["ok"])
             self.assert_cloak_status(agent)
@@ -201,7 +193,6 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
             self.assertFalse(defenses["analysis_cloak"])
             self.assertTrue(defenses["anti_sysctl"])
             self.assertFalse(defenses["anti_parent"])
-            self.assertFalse(defenses["anti_timing"])
 
     def test_disable_preserves_wrapper_hooks_adopted_by_independent_defenses(self):
         for name, mode, marker, message in (
@@ -270,7 +261,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                 if cloak:
                     self.assertIn(payload, result["console"].splitlines())
                     for check in ("ENV", "PARENT", "SYSCTL", "IOKIT", "IMAGES",
-                                  "INTEGRITY", "TIMING", "P_TRACED"):
+                                  "INTEGRITY", "P_TRACED"):
                         self.assertIn(check + ":clean", result["console"])
                     self.assertNotIn("DETECTED", result["console"])
                     restarted = agent.cmd("restart")
@@ -402,8 +393,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                  ("iokit", "copy_cfstring_property", "IORegistryEntryCreateCFProperty", 0),
                  ("images", "check_images", "_dyld_get_image_name", 0),
                  ("ptraced", "check_ptraced", "syscall", 0),
-                 ("sysctl_ptraced", "check_sysctl_ptraced", "sysctl", 0),
-                 ("timing", "check_timing", "mach_absolute_time", 0))
+                 ("sysctl_ptraced", "check_sysctl_ptraced", "sysctl", 0))
         for mode, function, api, index in cases:
             with self.subTest(mode=mode):
                 extra = [str(FRIDA_FIXTURE)] if mode == "images" else []
@@ -450,7 +440,6 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
         cases = (
             ("ptraced", "check_ptraced", "syscall", "__syscall", 0),
             ("sysctl_ptraced", "check_sysctl_ptraced", "sysctl", "sysctl", 0),
-            ("timing", "check_timing", "mach_absolute_time", "mach_absolute_time", 0),
             ("parent", "check_parent", "proc_pidpath", "proc_pidpath", 0),
             ("sysctl", "check_sysctl", "sysctlbyname", "sysctlbyname", 1),
             ("iokit", "copy_cfstring_property", "IORegistryEntryCreateCFProperty",
@@ -516,7 +505,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
 
     def test_step_out_applies_all_cloak_hook_families(self):
         for mode in ("parent", "sysctl", "iokit", "images", "ptraced",
-                     "sysctl_ptraced", "timing"):
+                     "sysctl_ptraced"):
             with self.subTest(mode=mode):
                 extra = [str(FRIDA_FIXTURE)] if mode == "images" else []
                 with AgentProcess(FIXTURE, mode, extra_args=extra) as agent:

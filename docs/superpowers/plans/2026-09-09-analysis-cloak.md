@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add and verify an opt-in macOS analysis cloak that neutralizes the documented environment, parent, virtualization, hardware-identity, image-enumeration, text-integrity, timing, and `P_TRACED` checks while preserving command dumping.
+**Goal:** Add and verify an opt-in macOS analysis cloak that neutralizes the documented environment, parent, virtualization, hardware-identity, image-enumeration, text-integrity, and `P_TRACED` checks while preserving command dumping. The originally planned fixed-step timing defense was removed after a compiled probe showed it was fingerprintable and changed normal monotonic-clock behavior.
 
 **Architecture:** A focused `AnalysisCloak` component owns blacklist policy, LLDB hook state, return-side rewrites, and integrity validation. `Debugger` supplies low-level process/breakpoint helpers, while the GUI engine and headless agent share the same composite defense and stop-dispatch behavior. Tests use pure Python policy cases plus a compiled ARM64 fixture driven through the real `agent.sh` protocol.
 
@@ -410,7 +410,7 @@ env = self.analysis_cloak.filter_launch_environment(env)
 ```
 
 `enable_analysis_cloak` must require a stopped process at the entry point,
-enable `anti_sysctl`, `anti_parent`, and `anti_timing` only if not already on,
+enable `anti_sysctl` and `anti_parent` only if not already on,
 remember which ones it owns, scrub the live environment, then set `enabled`.
 On failure, roll back only state it acquired.
 
@@ -807,7 +807,7 @@ git commit -m "feat: preserve target text under analysis cloak"
 
 ---
 
-### Task 8: Combined Checks, Timing, Syscall 202, and Command Dumps
+### Task 8: Combined Checks, Timing Characterization, Syscall 202, and Command Dumps
 
 **Files:**
 - Modify: `tests/integration/analysis_fixture.m`
@@ -818,18 +818,17 @@ git commit -m "feat: preserve target text under analysis cloak"
 
 **Interfaces:**
 - Extends fixture modes: `timing`, `ptraced`, `exec`, and `combined`.
-- Verifies existing `anti_timing`, syscall-wrapper multiplexing, interactive
-  exec decisions, and dump paths through the composite defense.
+- Verifies that timing remains explicitly unsupported, plus syscall-wrapper
+  multiplexing, interactive exec decisions, and dump paths.
 
-- [ ] **Step 1: Add failing timing and syscall-202 cases**
+- [ ] **Step 1: Add timing characterization and syscall-202 cases**
 
 `timing` calls `mach_timebase_info`, reads `mach_absolute_time`, performs a
 `sysctl(KERN_PROC_PID)` query that is intercepted by `anti_sysctl`, reads the
 clock again, converts to nanoseconds, and treats a delta above 5 milliseconds
-as detected. The negative run enables `anti_sysctl` alone so LLDB's
-entry/return breakpoint latency is visible; the positive run enables the
-composite cloak so the same flag scrub is protected by the fake clock. Require
-`TIMING:DETECTED` in the negative run and `TIMING:clean` with the cloak.
+as detected. Keep this as an unsupported-feature characterization: the headless
+agent must reject `anti_timing`, omit it from status, and the composite must not
+claim to clean this result.
 
 `ptraced` invokes:
 
@@ -851,7 +850,7 @@ case fail. Do not change code until the expected failure is observed.
 - [ ] **Step 3: Fix only missing composite lifecycle behavior**
 
 Ensure `AnalysisCloak.enable()` acquires existing defenses in this order:
-`anti_sysctl`, `anti_parent`, `anti_timing`; record only defenses that were off.
+`anti_sysctl`, `anti_parent`; record only defenses that were off.
 On disable or failed enable, release only those recorded names in reverse order.
 Ensure relaunch clears cloak return hooks and target allocations without turning
 off the requested composite mode.
@@ -927,7 +926,7 @@ plaintext in memory:
 macdbg analysis cloak recovered this payload
 ```
 
-Then run environment, parent, sysctl, IOKit, images, integrity, timing, and
+Then run environment, parent, sysctl, IOKit, images, integrity, and
 syscall-202 checks, mutate the candidate password for every failure, derive the
 candidate key, and decrypt the ciphertext with it. Print bytes only when they
 equal the complete expected plaintext; otherwise print `PAYLOAD:unavailable`.
@@ -1003,7 +1002,7 @@ Insert in the Defenses modal:
 
 ```javascript
 ['analysis_cloak', 'Analysis cloak',
- 'environment · parent · VM/hardware · images · text integrity · timing'],
+ 'environment · parent · VM/hardware · images · text integrity'],
 ```
 
 Render an unsafe/error state using the existing defense status and console
@@ -1058,7 +1057,7 @@ Document:
 - deterministic spoof values;
 - why fork-tree tracing is rejected;
 - why target-text breakpoints become hardware and can fail when slots run out;
-- timing and private-API limitations;
+- unsupported timing and private-API limitations;
 - preserved exec prompt/dump behavior.
 
 Change `pyproject.toml` description/keywords from Textual TUI to GUI/headless

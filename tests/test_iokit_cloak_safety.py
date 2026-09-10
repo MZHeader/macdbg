@@ -174,7 +174,6 @@ class DeferredDebugger:
         self.process = FakeProcess(FakeFrame())
         self._scrub_ptraced = False
         self._scrub_parent = False
-        self.anti_timing_bp_ids = None
 
     def is_stopped_at_entry_point(self):
         return True
@@ -185,8 +184,6 @@ class DeferredDebugger:
             self._scrub_ptraced = True
         elif name == "anti_parent":
             self._scrub_parent = True
-        else:
-            self.anti_timing_bp_ids = [bp.GetID()]
         return True, "enabled"
 
     def _disable(self, name):
@@ -194,8 +191,6 @@ class DeferredDebugger:
             self._scrub_ptraced = False
         elif name == "anti_parent":
             self._scrub_parent = False
-        else:
-            self.anti_timing_bp_ids = None
         return True, "disabled"
 
     def enable_anti_sysctl(self):
@@ -209,12 +204,6 @@ class DeferredDebugger:
 
     def disable_anti_parent(self):
         return self._disable("anti_parent")
-
-    def enable_anti_timing(self):
-        return self._enable("anti_timing")
-
-    def disable_anti_timing(self):
-        return self._disable("anti_timing")
 
     def handle_command(self, _command):
         return True, "", ""

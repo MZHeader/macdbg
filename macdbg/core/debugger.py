@@ -104,15 +104,13 @@ class Debugger:
         self.hardware_bp_ids.clear()
         self.anti_ptrace_bp_id = self.anti_sysctl_bp_id = 0
         self.anti_csops_bp_id = self.anti_mach_bp_id = 0
-        self.syscall_bp_ids = self.anti_timing_bp_ids = None
+        self.syscall_bp_ids = None
         self.direct_syscall_bp_ids = self.fork_bp_ids = self.setsid_bp_ids = None
         self.exec_bp_ids = None
         self._scrub_ptraced = self._scrub_parent = self.anti_sigtrap_on = False
         self.fork_mode = "off"
         self._fork_shield_hw_bp = 0
         self._fork_shield_saved = None
-        self._fake_clock = 0
-        self._anti_timing_logged = False
         self._step_cloak_messages.clear()
         self._step_cloak_handled_stop = None
         # Stops and exit notifications for the retired process must not be
@@ -248,8 +246,6 @@ class Debugger:
         self._step_active = False
         self._step_target_depth = None
         self._pending_step_scrubs = None
-        self._fake_clock = 0
-        self._anti_timing_logged = False
         self._clear_flag_scrub_returns()
         self.analysis_cloak.clear_return_hooks()
         info = lldb.SBLaunchInfo(argv)
@@ -741,10 +737,6 @@ class Debugger:
                 self.ci.HandleCommand("register write x0 0", ret, False)
                 self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
             return
-        if self.anti_timing_bp_ids and bp_id in self.anti_timing_bp_ids:
-            self.ci.HandleCommand("thread return {}".format(self._advance_fake_clock()),
-                                  ret, False)
-            return
         if self.syscall_bp_ids and bp_id in self.syscall_bp_ids:
             num = frame.FindRegister("x0").GetValueAsUnsigned()
             if (num == self._SYS_PTRACE and self.anti_ptrace_bp_id
@@ -821,8 +813,8 @@ class Debugger:
             self.anti_ptrace_bp_id, self.anti_mach_bp_id,
             self.anti_sysctl_bp_id, self.anti_csops_bp_id,
         } - {0}
-        for group in (self.syscall_bp_ids, self.anti_timing_bp_ids,
-                      self.setsid_bp_ids, self.direct_syscall_bp_ids,
+        for group in (self.syscall_bp_ids, self.setsid_bp_ids,
+                      self.direct_syscall_bp_ids,
                       self._flag_scrub_returns):
             legacy_ids.update(group or ())
         candidates = set(cloak._entry_hooks) | set(cloak._return_hooks) | legacy_ids
@@ -1034,7 +1026,6 @@ class Debugger:
     hw_breakpoints: bool = False
     anti_ptrace_bp_id: int = 0
     anti_csops_bp_id: int = 0
-    anti_timing_bp_ids: Optional[List[int]] = None
     # One shared sysctl breakpoint drives two independent scrubs, tracked by
     # these owner flags: P_TRACED (anti_sysctl) and the parent-name scrub
     # (anti_parent). The breakpoint is armed while either owner is on.
@@ -1049,14 +1040,6 @@ class Debugger:
     # defenses is on, so the same checks issued through the syscall() wrapper
     # (bypassing the libc symbol and the __text svc scan) are still neutralised.
     syscall_bp_ids: Optional[List[int]] = None
-    # monotonic fake clock fed to the hooked time sources so a self-timing check
-    # can't see the milliseconds our stop/continue hooks actually cost. (A
-    # "real-clock minus paused-time" version was tried and abandoned: LLDB's
-    # async event delivery leaves ~ms of stopped time unaccounted, so it hid
-    # latency worse than this does. See git history / the timing comment below.)
-    _fake_clock: int = 0
-    _fake_clock_step: int = 100
-    _anti_timing_logged: bool = False
     # return-address one-shots waiting to scrub a flag out of a syscall's output
     # buffer once the call fills it: {ret_bp_id: (kind, buffer_addr)}.
     _flag_scrub_returns: Optional[Dict[int, tuple]] = None
@@ -1569,70 +1552,6 @@ class Debugger:
             if useraddr and ops == self._CS_OPS_STATUS:
                 self._arm_return_scrub(thread, "csops", useraddr)
         self.cont()
-        return ""
-
-    # -- timing cloak ---------------------------------------------------------
-    # A self-timing check reads a monotonic clock before and after a sensitive
-    # call; a debugger that hooks that call adds milliseconds the check catches.
-    # We feed the common monotonic clock sources a fake clock that advances a
-    # small fixed step per call, so any measured delta stays tiny no matter how
-    # long we were really stopped. Each returns a uint64 in x0, so one thread
-    # return covers them all. Scoped to libsystem_kernel.dylib. Limits: a direct
-    # `mrs x0, cntvct_el0` read can't be hooked, wall-clock `gettimeofday`
-    # returns a struct we don't fake, and the constant step is a uniform-clock
-    # fingerprint a sophisticated check could notice -- this hides latency from
-    # ordinary threshold checks, it is not a perfect clock emulation. (A
-    # real-clock-minus-paused-time version was tried and dropped: LLDB's async
-    # event delivery leaves ~ms of stopped time unaccounted, so it hid latency
-    # worse than this constant-step clock does.)
-    _TIMING_SYMBOLS = ("mach_absolute_time", "mach_continuous_time",
-                       "clock_gettime_nsec_np")
-
-    def enable_anti_timing(self) -> Tuple[bool, str]:
-        if not self.target or not self.target.IsValid():
-            return False, "no target"
-        if self.anti_timing_bp_ids:
-            return True, "already enabled"
-        ids = []
-        for sym in self._TIMING_SYMBOLS:
-            bp = self.target.BreakpointCreateByName(sym, "libsystem_kernel.dylib")
-            if not bp.IsValid() or bp.GetNumLocations() == 0:
-                bp = self.target.BreakpointCreateByName(sym)
-            if bp.IsValid() and bp.GetNumLocations() > 0:
-                ids.append(bp.GetID())
-        if not ids:
-            return False, "no monotonic clock symbols found"
-        self.anti_timing_bp_ids = ids
-        self._anti_timing_logged = False
-        return True, "timing cloak armed: fake clock for {} source(s)".format(len(ids))
-
-    def disable_anti_timing(self) -> Tuple[bool, str]:
-        if not self.target or not self.anti_timing_bp_ids:
-            return True, "already disabled"
-        for bp_id in self.anti_timing_bp_ids:
-            self.delete_breakpoint(bp_id)
-        self.anti_timing_bp_ids = None
-        return True, "timing cloak disabled"
-
-    def _advance_fake_clock(self) -> int:
-        self._fake_clock += self._fake_clock_step
-        return self._fake_clock
-
-    def handle_anti_timing_hit(self, bp_id: int) -> Optional[str]:
-        """A monotonic clock source was called: return the next fake-clock value
-        instead of the real one, so timing checks can't see our stop/continue
-        latency. All the hooked sources return a uint64 in x0."""
-        if not self.anti_timing_bp_ids or bp_id not in self.anti_timing_bp_ids:
-            return None
-        if not self.process:
-            return None
-        ret = lldb.SBCommandReturnObject()
-        self.ci.HandleCommand("thread return {}".format(self._advance_fake_clock()),
-                              ret, False)
-        self.cont()
-        if not self._anti_timing_logged:
-            self._anti_timing_logged = True
-            return "timing cloak: feeding monotonic clock sources a fake clock"
         return ""
 
     def enable_direct_syscall_scan(self) -> Tuple[bool, str]:

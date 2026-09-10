@@ -154,12 +154,12 @@ Strings:
   Default `budget_bytes` is 512 MiB.
 
 Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
-`anti_csops`, `anti_timing`, `anti_parent`, `anti_sigtrap`,
+`anti_csops`, `anti_parent`, `anti_sigtrap`,
 `anti_mach_ports`, `direct_syscall`, `fork_identity`, `exec_sandbox`,
 `analysis_cloak`):
 - `defense_enable {"name": "…"}` / `defense_disable {"name": "…"}`.
 - `analysis_cloak` is the composite environment, parent, VM/hardware identity,
-  loaded-image, text-integrity, timing, and syscall-202 defense. Enable it at
+  loaded-image, text-integrity, and syscall-202 defense. Enable it at
   the initial entry stop, before the first resume:
 
   ```sh
@@ -193,11 +193,10 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   `_dyld_get_image_name` substitutes `/usr/lib/libSystem.B.dylib` for configured
   instrumentation image names without modifying dyld-owned memory.
 - The cloak reuses `anti_sysctl` for both ordinary KERN_PROC calls and syscall
-  number 202, plus `anti_timing` for `mach_absolute_time`,
-  `mach_continuous_time`, and `clock_gettime_nsec_np`. Timing uses a fixed-step
-  synthetic clock; direct `mrs cntvct_el0`, wall-clock APIs such as
-  `gettimeofday`, and arbitrary private or undocumented inspection APIs remain
-  outside v1.
+  number 202. Timing checks are not cloaked: the former fixed-step synthetic
+  clock was removed because it was fingerprintable and changed ordinary
+  monotonic-clock behavior. Direct `mrs cntvct_el0`, clock APIs, and arbitrary
+  private or undocumented inspection APIs remain outside the current scope.
 - It preserves the target's `__TEXT,__text` bytes rather than forging a hash.
   Every macdbg-managed target-text breakpoint is required to be hardware-backed,
   target-text patches block resume, and target-text tracer sites require
@@ -212,16 +211,6 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   the two flag-based checks that otherwise see the debugger even with
   `anti_ptrace` on. Enable them at the entry stop, before your first
   `continue`, so the check can't run first.
-- `anti_timing` feeds `mach_absolute_time()` a fake monotonic clock. A
-  sample that times a sensitive call catches the millisecond latency the
-  scrubs above add (a scrubbed flag plus a slow call still reads as
-  "debugger"); this hides that delta, and the per-instruction cost of
-  single-stepping. Pair it with `anti_sysctl`/`anti_csops`. It intercepts
-  *every* `mach_absolute_time` call, so it slows timing-heavy targets --
-  leave it off unless a timing check needs it.
-- `anti_timing` covers `mach_absolute_time`, `mach_continuous_time`, and
-  `clock_gettime_nsec_np`. It cannot cover a direct `mrs cntvct_el0`
-  register read or wall-clock `gettimeofday`.
 - `anti_parent` scrubs a debugger `p_comm` (`debugserver`/`lldb`/`gdb`) to
   `launchd` in `sysctl(KERN_PROC)` results, defeating a parent-name check
   whether it used `getppid` or read `e_ppid` from its own `kinfo_proc`. It

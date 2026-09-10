@@ -48,17 +48,16 @@ Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry
 
 `⌘D` opens a menu of toggles, all off by default.
 
-<img src="docs/img/gui-defenses.png" alt="Defenses menu" width="440">
-
 ### Analysis cloak (ARM64)
 
 **Analysis cloak** is the composite defense for samples that combine several
 environment and debugger checks with a `__TEXT,__text` integrity hash. Open a
 target, leave it stopped at the initial entry point, press `⌘D`, and click
-**Analysis cloak**. The row reports whether the cloak is safe and how many API
-hooks are resolved or deferred. **Enable ALL anti-debug bypasses** includes the
-cloak too. If the target has already run, restart it and enable the cloak at the
-new entry stop.
+**Analysis cloak** in the **Recommended** section. The row reports whether the
+cloak is safe and how many API hooks are resolved or deferred. Individual
+controls, including **Enable ALL anti-debug bypasses**, live under
+**Advanced / individual defenses**. If the target has already run, restart it
+and enable the cloak at the new entry stop.
 
 Opening or attaching to another target turns off the previous target's
 defenses and clears its internal hooks. Enable the cloak again at the new
@@ -98,9 +97,7 @@ The composite defense covers these analysis signals:
 * It hides configured instrumentation library names returned by
   `_dyld_get_image_name`, substituting `/usr/lib/libSystem.B.dylib` without
   overwriting dyld-owned memory.
-* It reuses the P_TRACED scrub for `sysctl` and syscall number 202 plus the
-  timing cloak for `mach_absolute_time`, `mach_continuous_time`, and
-  `clock_gettime_nsec_np`.
+* It reuses the P_TRACED scrub for `sysctl` and syscall number 202.
 
 The cloak protects the sample's text bytes; it does not forge SHA-256 results.
 While it is enabled, macdbg-managed breakpoints in the main executable's
@@ -117,12 +114,18 @@ stepping instead. The headless `raw` command remains an unrestricted LLDB
 escape hatch and can create software breakpoints, patch text, or delete
 internal defenses, so it can invalidate the cloak's guarantees.
 
-The timing defense uses a fixed-step synthetic clock. It does not cover direct
-`mrs cntvct_el0` reads, wall-clock APIs such as `gettimeofday`, or arbitrary
-private/undocumented inspection APIs. The cloak is also deliberately
-incompatible with **Trace the whole fork tree**: fork-tree tracing injects a
-DYLD interposer, which would itself trip the environment and loaded-image
-checks. Enabling either feature while the other is active is rejected.
+Timing checks are not currently cloaked. The former fixed-step synthetic clock
+was removed because it was directly fingerprintable and changed normal
+monotonic-clock semantics. Direct `mrs cntvct_el0` reads, clock APIs, and
+arbitrary private or undocumented inspection APIs remain outside the current
+scope. The cloak is also deliberately incompatible with **Trace the whole fork
+tree**: fork-tree tracing injects a DYLD interposer, which would itself trip the
+environment and loaded-image checks. Enabling either feature while the other is
+active is rejected.
+
+This intentionally removes the headless `anti_timing` command and its status
+field as well as the GUI toggle; clients should treat those interfaces as no
+longer available.
 
 Exec interception is unchanged. Interactive calls still offer **Allow**,
 **Fake success**, **Block**, or **Dump**. The UI preview may be shortened, while
@@ -161,8 +164,6 @@ session records may remain listed.
 * **Cloak parent identity** scrubs the debugger's name out of `sysctl(KERN_PROC)` results.
 
 * **Forward self-trap brk #0** runs the target's own `SIGTRAP` handler for a breakpoint instruction it planted on itself, the way the kernel would with no debugger attached.
-
-* **Cloak timing (Experimental)** feeds the common monotonic clock sources (`mach_absolute_time`, `mach_continuous_time`, `clock_gettime_nsec_np`) a fake clock, so a sample that *times* a sensitive call to catch the latency a flag-scrubber adds sees a normal, tiny delta.
 
 **Breakpoints**
 

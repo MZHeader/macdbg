@@ -69,7 +69,6 @@ _DEFENSES = {
     "anti_ptrace": ("enable_anti_ptrace", "disable_anti_ptrace"),
     "anti_sysctl": ("enable_anti_sysctl", "disable_anti_sysctl"),
     "anti_csops": ("enable_anti_csops", "disable_anti_csops"),
-    "anti_timing": ("enable_anti_timing", "disable_anti_timing"),
     "anti_parent": ("enable_anti_parent", "disable_anti_parent"),
     "anti_sigtrap": ("enable_anti_sigtrap", "disable_anti_sigtrap"),
     "anti_mach_ports": ("enable_anti_mach_ports", "disable_anti_mach_ports"),
@@ -458,7 +457,6 @@ class AgentSession:
                 "anti_sysctl": bool(d._scrub_ptraced),
                 "anti_parent": bool(d._scrub_parent),
                 "anti_csops": bool(d.anti_csops_bp_id),
-                "anti_timing": bool(d.anti_timing_bp_ids),
                 "anti_sigtrap": bool(d.anti_sigtrap_on),
                 "anti_mach_ports": bool(d.anti_mach_bp_id),
                 "direct_syscall": bool(d.direct_syscall_bp_ids),
@@ -950,7 +948,6 @@ class AgentSession:
         for handler in (self.dbg.handle_anti_ptrace_hit,
                         self.dbg.handle_flag_scrub_hit,
                         self.dbg.handle_syscall_hit,
-                        self.dbg.handle_anti_timing_hit,
                         self.dbg.handle_anti_mach_hit,
                         self.dbg.handle_direct_syscall_hit,
                         self.dbg.handle_fork_hit,
@@ -1035,8 +1032,6 @@ class AgentSession:
             ids.add(self.dbg.anti_sysctl_bp_id)
         if self.dbg.anti_csops_bp_id:
             ids.add(self.dbg.anti_csops_bp_id)
-        if self.dbg.anti_timing_bp_ids:
-            ids.update(self.dbg.anti_timing_bp_ids)
         if self.dbg.syscall_bp_ids:
             ids.update(self.dbg.syscall_bp_ids)
         if self.dbg._flag_scrub_returns:

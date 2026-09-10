@@ -815,15 +815,16 @@
   // ---- defenses toggle dialog ---------------------------------------------
   let defensesOpen = false;
   const DEF_SECTIONS = [
-    ['Anti-debug', [
-      ['all_anti', 'Enable ALL anti-debug bypasses', 'ptrace · sysctl · csops · mach · parent · sigtrap · timing · direct-syscall'],
-      ['analysis_cloak', 'Analysis cloak', 'environment · parent · VM/hardware · images · text integrity · timing'],
+    ['Recommended', [
+      ['analysis_cloak', 'Analysis cloak', 'environment · parent · VM/hardware · images · text integrity']
+    ]],
+    ['Advanced / individual defenses', [
+      ['all_anti', 'Enable ALL anti-debug bypasses', 'ptrace · sysctl · csops · mach · parent · sigtrap · direct-syscall'],
       ['deny_attach', 'Defeat PT_DENY_ATTACH', 'libc ptrace hook + inline svc #0x80 scan'],
       ['mach', 'Cloak Mach exception ports', 'report none — look unattached'],
       ['flag_scrubs', 'Scrub debugger flags', 'P_TRACED (sysctl) + CS_DEBUGGED (csops)'],
       ['parent', 'Cloak parent identity', 'scrub debugger name from KERN_PROC'],
-      ['sigtrap', 'Forward self-trap to SIGTRAP handler', 'brk #0 → target’s handler'],
-      ['timing', 'Cloak timing', 'fake monotonic clocks (slower)']
+      ['sigtrap', 'Forward self-trap to SIGTRAP handler', 'brk #0 → target’s handler']
     ]],
     ['Breakpoints', [
       ['hw_bps', 'Hardware breakpoints for your BPs', 'no __TEXT patch'],

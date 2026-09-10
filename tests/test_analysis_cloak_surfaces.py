@@ -16,12 +16,15 @@ INCOMPATIBLE = "analysis cloak is incompatible with fork-tree tracing in v1"
 
 class SurfaceContractTests(unittest.TestCase):
     def test_gui_exposes_analysis_cloak(self):
+        self.assertIn("['Recommended'", APP_SOURCE)
         self.assertIn("['analysis_cloak', 'Analysis cloak'", APP_SOURCE)
         self.assertIn(
             "environment · parent · VM/hardware · images · "
-            "text integrity · timing",
+            "text integrity",
             APP_SOURCE,
         )
+        self.assertIn("['Advanced / individual defenses'", APP_SOURCE)
+        self.assertNotIn("['timing', 'Cloak timing'", APP_SOURCE)
 
     def test_frontend_renders_cloak_safety_and_error_status(self):
         self.assertIn("analysis_cloak_safe", APP_SOURCE)
@@ -143,7 +146,6 @@ class AllAntiDebugger:
         self.anti_mach_bp_id = 0
         self.anti_sysctl_bp_id = 0
         self.anti_csops_bp_id = 0
-        self.anti_timing_bp_ids = set()
         self._scrub_parent = False
         self.anti_sigtrap_on = False
         self.hw_breakpoints = False
@@ -216,12 +218,6 @@ class AllAntiDebugger:
     def disable_anti_csops(self):
         return self._set("disable_anti_csops", "anti_csops_bp_id", 0)
 
-    def enable_anti_timing(self):
-        return self._set("enable_anti_timing", "anti_timing_bp_ids", {5})
-
-    def disable_anti_timing(self):
-        return self._set("disable_anti_timing", "anti_timing_bp_ids", set())
-
     def enable_anti_parent(self):
         return self._set("enable_anti_parent", "_scrub_parent", True)
 
@@ -267,7 +263,6 @@ def make_engine(*, enabled=False, safe=True, error=None):
         anti_mach_bp_id=3,
         anti_sysctl_bp_id=4,
         anti_csops_bp_id=5,
-        anti_timing_bp_ids={6},
         _scrub_parent=True,
         anti_sigtrap_on=True,
         hw_breakpoints=False,
@@ -283,7 +278,7 @@ def make_engine(*, enabled=False, safe=True, error=None):
         "disable_analysis_cloak", ("analysis_cloak", cloak))
     for name in (
         "anti_ptrace", "direct_syscall_scan", "anti_mach_ports",
-        "anti_sysctl", "anti_csops", "anti_timing", "anti_parent",
+        "anti_sysctl", "anti_csops", "anti_parent",
         "anti_sigtrap",
     ):
         setattr(debugger, "enable_" + name, operation("enable_" + name))
@@ -300,6 +295,14 @@ def make_engine(*, enabled=False, safe=True, error=None):
 
 
 class GuiBehaviorTests(unittest.TestCase):
+    def test_all_anti_does_not_enable_or_report_synthetic_timing(self):
+        engine = make_all_anti_engine()
+
+        engine._t_all_anti()
+
+        self.assertNotIn("enable_anti_timing", engine.dbg.calls)
+        self.assertNotIn("timing", engine._defense_states())
+
     def test_toggle_enable_failure_is_exact_error_then_state_refresh(self):
         engine = make_engine()
         engine.dbg.enable_analysis_cloak = mock.Mock(
@@ -341,7 +344,6 @@ class GuiBehaviorTests(unittest.TestCase):
         engine._t_analysis_cloak()
         self.assertTrue(engine.dbg.anti_sysctl_bp_id)
         self.assertTrue(engine.dbg._scrub_parent)
-        self.assertTrue(engine.dbg.anti_timing_bp_ids)
         engine._t_analysis_cloak()
 
         engine._t_all_anti()
@@ -350,7 +352,6 @@ class GuiBehaviorTests(unittest.TestCase):
         self.assertFalse(engine.dbg.direct_syscall_bp_ids)
         self.assertFalse(engine.dbg.anti_sysctl_bp_id)
         self.assertFalse(engine.dbg._scrub_parent)
-        self.assertFalse(engine.dbg.anti_timing_bp_ids)
         self.assertGreater(
             engine.dbg.calls.index("disable_direct_syscall_scan"),
             engine.dbg.calls.index("enable_direct_syscall_scan"),
