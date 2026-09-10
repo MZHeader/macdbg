@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import errno
 import re
 from typing import Iterable, Optional, Sequence, Union
 
@@ -341,11 +342,27 @@ class AnalysisCloak:
                                 process.WriteMemory(buffer, original, rollback)
             else:
                 kind, name, buffer, size_pointer, capacity = hook
-                if returned == 0:
-                    spoof = SYSCTL_SPOOFS[name]
-                    payload = (int(spoof.value).to_bytes(4, "little")
-                               if kind == "u32" else
-                               str(spoof.value).encode() + b"\0")
+                spoof = SYSCTL_SPOOFS[name]
+                payload = (int(spoof.value).to_bytes(4, "little")
+                           if kind == "u32" else
+                           str(spoof.value).encode() + b"\0")
+                recover_capacity = False
+                if (returned & 0xffffffff == 0xffffffff and buffer
+                        and size_pointer and capacity >= len(payload)):
+                    # A size probe advertises our payload, not the host's.
+                    # The real read may therefore fail ENOMEM even though
+                    # the caller's buffer is sufficient for this known,
+                    # read-only spoof. Never turn other API errors into success.
+                    real_errno = self._eval_integer(
+                        "expression -l c++ --ignore-breakpoints true -- "
+                        "(int)*((int *(*)())__error)()")
+                    if real_errno is None:
+                        message = self._critical(
+                            "sysctlbyname({}) could not read return errno; "
+                            "cloak failed".format(name))
+                    else:
+                        recover_capacity = real_errno == errno.ENOMEM
+                if returned == 0 or recover_capacity:
                     if not buffer:
                         # oldp == NULL is the standard first call used to
                         # learn the required size. Only oldlenp is output;
@@ -398,6 +415,23 @@ class AnalysisCloak:
                                             if not rollback_ok else "")
                                 message = self._critical(
                                     "sysctlbyname({}) could not write result size; "
+                                    "cloak failed{}".format(name, rollback))
+                            elif recover_capacity and (
+                                    not result.SetValueFromCString("0")
+                                    or result.GetValueAsUnsigned() != 0):
+                                register_rollback_ok = (
+                                    result.SetValueFromCString(str(returned))
+                                    and result.GetValueAsUnsigned() == returned)
+                                buffer_rollback_ok = self._write_exact(
+                                    buffer, original, lldb)
+                                size_rollback_ok = self._write_exact(
+                                    size_pointer, original_size, lldb)
+                                rollback_ok = (register_rollback_ok
+                                               and buffer_rollback_ok
+                                               and size_rollback_ok)
+                                rollback = "; rollback failed" if not rollback_ok else ""
+                                message = self._critical(
+                                    "sysctlbyname({}) could not write return register; "
                                     "cloak failed{}".format(name, rollback))
                             else:
                                 message = "spoofed sysctlbyname({})".format(name)
@@ -458,7 +492,9 @@ class AnalysisCloak:
             err = lldb.SBError()
             name = (process.ReadCStringFromMemory(name_pointer, 256, err)
                     if name_pointer else "")
-            if err.Success() and name in SYSCTL_SPOOFS:
+            if (err.Success() and name in SYSCTL_SPOOFS
+                    and frame.FindRegister("x3").GetValueAsUnsigned() == 0
+                    and frame.FindRegister("x4").GetValueAsUnsigned() == 0):
                 size_data = (self._read_exact(size_pointer, 8, lldb)
                              if size_pointer else None)
                 if size_data is not None:

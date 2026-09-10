@@ -540,25 +540,34 @@ not the deterministic values.
 - [ ] **Step 3: Implement size-safe sysctl return rewriting**
 
 At entry, read `x0` as a C string and ignore names absent from
-`SYSCTL_SPOOFS`. Capture `x1`, `x2`, and the input capacity from `*x2`; arm a
-thread-specific return breakpoint. At return:
+`SYSCTL_SPOOFS`, non-null `newp` (`x3`), and nonzero `newlen` (`x4`). Capture
+`x1`, `x2`, and the input capacity from `*x2`; arm a thread-specific return
+breakpoint. Build the fixed payload at return:
 
 ```python
 if spoof.kind == "u32":
     payload = int(spoof.value).to_bytes(4, "little")
 else:
     payload = str(spoof.value).encode() + b"\0"
-if buffer:
-    if capacity < len(payload):
-        return "sysctlbyname({}) buffer too small; cloak failed".format(name)
-    process.WriteMemory(buffer, payload, error)
-process.WriteMemory(size_pointer, len(payload).to_bytes(8, "little"), error)
 ```
 
 The null-buffer branch is a successful length-only query, not an undersized
 data request. Preserve the real returned length and roll it back on a partial
 write; unreadable/unwritable length storage is still a critical error. This
 follows the execution ledger's correction for the standard two-call API use.
+The second read must also work when the real host value exceeds the advertised
+spoof size: for a recognized read-only call returning `-1`, verify the selected
+thread's `errno` and recover only `ENOMEM` with input capacity sufficient for
+the spoof. Preserve other error codes and requests too small for the spoof.
+Write exactly the spoof payload and its length, then set and verify a successful
+return. Preserve original outputs/registers for transactional rollback on any
+partial write or register failure, attempt every rollback even if another
+rollback fails, and fail closed if errno/output storage is unreadable.
+
+Use the compiled linked `SysctlHost.dylib` fixture to test shorter, equal, and
+longer host strings with exact-size caller allocations, plus real-error/write
+controls and supported stepping. Matching this Mac's real identity lengths is
+not sufficient two-stage coverage.
 
 Treat a failed write as a critical cloak error recorded in
 `AnalysisCloak.last_error`; resume validation must reject the next continue.

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <mach-o/loader.h>
@@ -135,16 +136,38 @@ static int check_sysctl_two_stage(void) {
         size_t size = 0;
         int rc = sysctlbyname(names[i], NULL, &size, NULL, 0);
         if (rc != 0 || size == 0 || size > 4096) return 2;
-        void *value = calloc(1, size);
+        void *value = calloc(1, size + 8);
         if (!value) return 2;
+        memset((unsigned char *)value + size, 0xa5, 8);
         size_t capacity = size;
         rc = sysctlbyname(names[i], value, &size, NULL, 0);
         bad |= rc != 0 || size != expected_sizes[i] || capacity != expected_sizes[i];
         if (!bad) bad |= i ? strcmp(value, expected_strings[i]) != 0 : *(int *)value != 0;
+        for (int guard = 0; guard < 8; guard++)
+            bad |= ((unsigned char *)value)[capacity + guard] != 0xa5;
         printf("SIZE-PROBE:%s capacity=%zu returned=%zu rc=%d\n", names[i], capacity, size, rc);
         free(value);
     }
     printf("SYSCTL-TWO-STAGE:%s\n", bad ? "DETECTED" : "clean");
+    return bad;
+}
+
+static int check_sysctl_failure(const char *call, int expected_errno) {
+    unsigned char value[32], original[32];
+    memset(value, 0xa5, sizeof(value));
+    memcpy(original, value, sizeof(value));
+    size_t size = strcmp(call, "short") == 0 ? 4 : sizeof(value);
+    int proposed = 1;
+    void *newp = strcmp(call, "write") == 0 ? &proposed : NULL;
+    size_t newlen = newp || strcmp(call, "newlen") == 0 ? sizeof(proposed) : 0;
+    errno = 0;
+    int rc = sysctlbyname("hw.model", value, &size, newp, newlen);
+    int actual_errno = errno;
+    int bad = rc != -1 || actual_errno != expected_errno ||
+              size != (strcmp(call, "short") == 0 ? 0 : sizeof(value)) ||
+              memcmp(value, original, sizeof(value)) != 0;
+    printf("SYSCTL-FAILURE:%s call=%s rc=%d errno=%d\n",
+           bad ? "DETECTED" : "preserved", call, rc, actual_errno);
     return bad;
 }
 
@@ -419,6 +442,8 @@ int main(int argc, char **argv) {
         return check_sysctl();
     if (strcmp(argv[1], "sysctl_two_stage") == 0)
         return check_sysctl_two_stage();
+    if (strcmp(argv[1], "sysctl_failure") == 0)
+        return argc == 4 ? check_sysctl_failure(argv[2], atoi(argv[3])) : 64;
     if (strcmp(argv[1], "iokit") == 0)
         return check_iokit();
     if (strcmp(argv[1], "images") == 0)

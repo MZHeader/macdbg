@@ -95,7 +95,8 @@ name. Unrelated process paths are untouched.
 
 A breakpoint on `sysctlbyname` records recognized names and output buffers at
 entry and uses a thread-specific one-shot breakpoint at the return address.
-After a successful real call:
+For recognized read-only calls (`newp == NULL`, `newlen == 0`), successful
+results become:
 
 - `kern.hv_vmm_present` becomes integer zero;
 - `hw.model` becomes `Mac14,6`;
@@ -103,10 +104,18 @@ After a successful real call:
 
 The implementation respects the caller-provided buffer size, NUL-terminates
 strings, and updates the returned length when the API provides a length pointer.
-Unknown sysctl names pass through without modification.
+Unknown sysctl names and write requests pass through without modification.
 Successful length-only queries (`oldp == NULL`) publish the spoof payload's
-size through `oldlenp` without writing a data buffer. Unreadable or unwritable
-length storage retains the same rollback and fail-closed behavior.
+size through `oldlenp` without writing a data buffer. If a recognized real
+read returns `-1`/`ENOMEM`, a caller buffer large enough for the spoof still
+receives the spoof payload and size with a successful return. This keeps the
+second query independent of the real host value's length. The return hook
+verifies the selected thread's `errno`; other error codes and buffers too small
+even for the spoof remain failed.
+Payload, size, and the recovered success register are committed transactionally.
+Unreadable errno/output storage, failed output/register writes, and failed
+rollbacks retain the same fail-closed behavior. Only the spoof's bytes and
+returned length are written; bytes past the spoof are untouched.
 
 ### IOKit identity
 
