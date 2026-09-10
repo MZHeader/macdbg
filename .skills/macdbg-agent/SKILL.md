@@ -1,6 +1,6 @@
 ---
 name: macdbg-agent
-description: Drive the macdbg LLDB wrapper as a headless debugger from Claude — launch/attach a macOS binary, set breakpoints, step, read/write memory and registers, and toggle anti-anti-debug bypasses (PT_DENY_ATTACH, Mach exception ports, fork/exec interception), all via JSON commands over agent.sh instead of the interactive Textual TUI. Use this whenever the user wants Claude itself to debug, trace, or reverse-engineer a macOS binary in this repo (or any target binary/pid) rather than just editing macdbg's own source.
+description: Use when an AI coding agent needs to debug, trace, or reverse-engineer a macOS binary with macdbg rather than edit macdbg's own source.
 ---
 
 # macdbg headless agent

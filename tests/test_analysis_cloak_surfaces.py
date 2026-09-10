@@ -8,7 +8,10 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE_SOURCE = (ROOT / "GUI/server/engine.py").read_text()
 APP_SOURCE = (ROOT / "GUI/web/app.js").read_text()
 README_SOURCE = (ROOT / "README.md").read_text()
-AGENT_SKILL_SOURCE = (ROOT / ".claude/skills/macdbg-agent/SKILL.md").read_text()
+CLAUDE_SKILL = ROOT / ".claude/skills/macdbg-agent/SKILL.md"
+CODEX_SKILL = ROOT / ".agents/skills/macdbg-agent/SKILL.md"
+CANONICAL_SKILL = ROOT / ".skills/macdbg-agent/SKILL.md"
+AGENT_SKILL_SOURCE = CLAUDE_SKILL.read_text()
 GUI_README_SOURCE = (ROOT / "GUI/README-GUI.md").read_text()
 PYPROJECT_SOURCE = (ROOT / "pyproject.toml").read_text()
 INCOMPATIBLE = "analysis cloak is incompatible with fork-tree tracing in v1"
@@ -61,6 +64,13 @@ class SurfaceContractTests(unittest.TestCase):
 
 
 class DocumentationContractTests(unittest.TestCase):
+    def test_claude_and_codex_share_one_canonical_skill(self):
+        self.assertTrue(CANONICAL_SKILL.is_file())
+        self.assertTrue(CLAUDE_SKILL.parent.is_symlink())
+        self.assertTrue(CODEX_SKILL.parent.is_symlink())
+        self.assertTrue(CLAUDE_SKILL.samefile(CODEX_SKILL))
+        self.assertTrue(CLAUDE_SKILL.samefile(CANONICAL_SKILL))
+
     def test_readme_documents_analysis_cloak_contract(self):
         for term in (
             "analysis_cloak",

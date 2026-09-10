@@ -11,6 +11,8 @@ import lldb
 class StopEvent:
     state: int
     description: str
+    process_id: int = 0
+    stop_id: int = 0
 
 
 @dataclass
@@ -49,7 +51,18 @@ class EventPump:
                 if etype & lldb.SBProcess.eBroadcastBitStateChanged:
                     state = lldb.SBProcess.GetStateFromEvent(event)
                     desc = lldb.SBDebugger.StateAsCString(state)
-                    self.on_stop(StopEvent(state=state, description=desc))
+                    proc = lldb.SBProcess.GetProcessFromEvent(event)
+                    process_id = (proc.GetProcessID()
+                                  if proc and proc.IsValid() else 0)
+                    stop_id = (proc.GetStopID()
+                               if (proc and proc.IsValid()
+                                   and state == lldb.eStateStopped) else 0)
+                    self.on_stop(StopEvent(
+                        state=state,
+                        description=desc,
+                        process_id=process_id,
+                        stop_id=stop_id,
+                    ))
                 elif etype & lldb.SBProcess.eBroadcastBitSTDOUT:
                     proc = lldb.SBProcess.GetProcessFromEvent(event)
                     chunk = proc.GetSTDOUT(4096)

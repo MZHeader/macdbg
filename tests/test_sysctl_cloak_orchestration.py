@@ -7,11 +7,14 @@ from unittest import mock
 FAKE_LLDB = types.SimpleNamespace(
     eStopReasonBreakpoint=3,
     eStateStopped=5,
+    eStateCrashed=8,
+    eStateExited=10,
 )
 
 with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
     from GUI.server.engine import Engine
     from macdbg.agent.session import AgentSession
+    from macdbg.core.events import StopEvent
 
 
 CRITICAL = "sysctlbyname(hw.model) could not write result buffer; cloak failed"
@@ -133,6 +136,94 @@ class GuiCloakFailureTests(unittest.TestCase):
             "[anti-analysis] " + CRITICAL, error=True
         )
         engine._emit_state.assert_called_once_with()
+
+
+class GuiStopEventTests(unittest.TestCase):
+    def test_raw_relaunch_forgets_stop_identity_even_when_command_fails(self):
+        engine = Engine.__new__(Engine)
+        engine.dbg = mock.Mock()
+        engine.dbg.process = None
+        engine.dbg.handle_command.return_value = (False, "", "launch failed")
+        engine.dbg.ensure_listening.return_value = False
+        engine._last_stop_event_key = (2079, 42)
+        engine._console = mock.Mock()
+
+        engine._c_run_cmd({"cmd": "run"})
+
+        self.assertIsNone(engine._last_stop_event_key)
+
+    def test_failed_restart_forgets_stop_identity_before_launch(self):
+        engine = Engine.__new__(Engine)
+        engine.attach_pid = None
+        engine.program_args = []
+        engine.dbg = mock.Mock()
+        engine.dbg.target.IsValid.return_value = True
+        engine.dbg.process = None
+        engine.dbg.launch.side_effect = RuntimeError("launch failed")
+        engine._interpose_stop = mock.Mock()
+        engine._interpose_thread = None
+        engine._hidden_bp_ids = mock.Mock(return_value=set())
+        engine._last_stop_event_key = (2079, 42)
+        engine._console = mock.Mock()
+
+        engine._c_restart({})
+
+        self.assertIsNone(engine._last_stop_event_key)
+
+    def test_target_change_forgets_previous_stop_identity(self):
+        engine = Engine.__new__(Engine)
+        engine.tracer = types.SimpleNamespace(enabled=False)
+        engine._pending_exec = None
+        engine._pending_fork = None
+        engine._resuming = False
+        engine._prev_regs = {}
+        engine._annot_cache = {}
+        engine._strings_bin = []
+        engine._strings_live = []
+        engine._mem_follow = None
+        engine._disasm_follow = None
+        engine._last_stop_event_key = (2079, 42)
+
+        engine._prepare_target_change()
+
+        self.assertIsNone(engine._last_stop_event_key)
+
+    def test_duplicate_internal_stop_is_not_exposed_as_user_stop(self):
+        process = mock.Mock()
+        process.IsValid.return_value = True
+        process.GetState.return_value = FAKE_LLDB.eStateStopped
+        process.GetProcessID.return_value = 2079
+        process.GetStopID.return_value = 42
+
+        debugger = mock.Mock()
+        debugger.process = process
+        debugger.analysis_cloak.validate_integrity.return_value = (True, "ok")
+        debugger.in_user_step.return_value = False
+        debugger.in_fork_shield.return_value = False
+
+        engine = Engine.__new__(Engine)
+        engine.dbg = debugger
+        engine.tracer = types.SimpleNamespace(enabled=False, hardware_bp_ids=set())
+        engine._resuming = False
+        engine._last_stop_event_key = None
+        engine._console = mock.Mock()
+        engine._emit_state = mock.Mock()
+        engine._handle_possible_trace_hit = mock.Mock(return_value=False)
+        engine._handle_anti_debug_hit = mock.Mock(side_effect=(True, False))
+
+        event = StopEvent(
+            state=FAKE_LLDB.eStateStopped,
+            description="stopped",
+            process_id=2079,
+            stop_id=42,
+        )
+        engine._on_stop_event(event)
+        engine._on_stop_event(event)
+
+        engine._handle_anti_debug_hit.assert_called_once_with()
+        engine._console.assert_not_called()
+        engine._emit_state.assert_not_called()
+        self.assertFalse(engine._resuming)
 
 
 if __name__ == "__main__":

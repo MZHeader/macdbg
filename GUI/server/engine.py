@@ -71,6 +71,7 @@ class Engine:
         self._search_hits: List[int] = []
         self._search_pos = 0
         self._resuming = False
+        self._last_stop_event_key = None
         self._pending_exec = None   # (name, cmd, bp_id)
         self._pending_fork = None   # (name,)
 
@@ -356,7 +357,25 @@ class Engine:
         return self.dbg.read_around(addr, before=before_rows * 16, total=total_rows * 16)
 
     # ---- orchestration (port of ui/app.py _on_stop_event) --------------------
+    def _forget_stop_event_identity(self) -> None:
+        self._last_stop_event_key = None
+
     def _on_stop_event(self, e: StopEvent) -> None:
+        if e.state == lldb.eStateStopped and e.stop_id:
+            process = self.dbg.process
+            if not process or not process.IsValid():
+                return
+            if process.GetState() != lldb.eStateStopped:
+                return
+            process_id = process.GetProcessID()
+            if e.process_id and process_id != e.process_id:
+                return
+            if process.GetStopID() != e.stop_id:
+                return
+            stop_key = (process_id, e.stop_id)
+            if self._last_stop_event_key == stop_key:
+                return
+            self._last_stop_event_key = stop_key
         if e.state in (lldb.eStateStopped, lldb.eStateExited, lldb.eStateCrashed):
             self._resuming = False
         if e.state == lldb.eStateStopped:
@@ -686,6 +705,7 @@ class Engine:
         if not self.dbg.target or not self.dbg.target.IsValid():
             self._console("[restart] no target loaded", error=True)
             return
+        self._forget_stop_event_identity()
         p = self.dbg.process
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
@@ -1222,6 +1242,7 @@ class Engine:
             return
         cl = cmd.lower()
         if any(cl == x or cl.startswith(x + " ") for x in self._RELAUNCH):
+            self._forget_stop_event_identity()
             p = self.dbg.process
             if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
                 p.Kill()
@@ -1267,6 +1288,7 @@ class Engine:
             self.tracer.disable(self.dbg.target)
         self._pending_exec = self._pending_fork = None
         self._resuming = False
+        self._forget_stop_event_identity()
         self._prev_regs = {}
         self._annot_cache = {}
         self._strings_bin = self._strings_live = []
