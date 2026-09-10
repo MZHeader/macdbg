@@ -178,6 +178,7 @@ class Engine:
     def _launch(self, program: str, args: List[str]) -> None:
         try:
             self._ensure_host_platform()
+            self._prepare_target_change()
             self.dbg.create_target(program)
             restored = self.dbg.restore_stored_breakpoints()
             self.dbg.launch(list(args))
@@ -717,6 +718,16 @@ class Engine:
         addr = self._addr(a) if a.get("addr") is not None else self.dbg.pc()
         if not addr:
             return
+        hidden = self._hidden_bp_ids()
+        if self.dbg.target:
+            for index in range(self.dbg.target.GetNumBreakpoints()):
+                bp = self.dbg.target.GetBreakpointAtIndex(index)
+                if bp.GetID() not in hidden:
+                    continue
+                if any(bp.GetLocationAtIndex(i).GetLoadAddress() == addr
+                       for i in range(bp.GetNumLocations())):
+                    self._guard_hidden_bp(bp.GetID())
+                    return
         op, bp_id = self.dbg.toggle_breakpoint_at(addr)
         self._console("breakpoint {} #{} @ {:#x}".format(op, bp_id, addr))
         self._emit_state()
@@ -817,24 +828,45 @@ class Engine:
         self._emit_state()
 
     # -- breakpoints
+    def _guard_hidden_bp(self, bp_id):
+        if bp_id not in self._hidden_bp_ids():
+            return False
+        self._console(
+            "breakpoint #{} belongs to an internal defense/tracer hook; "
+            "use its defense or tracer toggle instead of editing it directly".format(bp_id),
+            error=True)
+        self._emit_state()
+        return True
+
     def _c_bp_enable(self, a):
         bid = int(a["id"])
+        if self._guard_hidden_bp(bid):
+            return
         rows = self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids())
         cur = next((en for i, _addr, _s, _n, en, _c in rows if i == bid), True)
         self.dbg.set_bp_enabled(bid, not cur)
         self._emit_state()
 
     def _c_bp_delete(self, a):
-        self.dbg.handle_command("breakpoint delete {}".format(int(a["id"])))
+        bid = int(a["id"])
+        if self._guard_hidden_bp(bid):
+            return
+        self.dbg.delete_breakpoint(bid)
         self._emit_state()
 
     def _c_bp_condition(self, a):
-        self.dbg.set_bp_condition(int(a["id"]), (a.get("cond") or "").strip())
+        bid = int(a["id"])
+        if self._guard_hidden_bp(bid):
+            return
+        self.dbg.set_bp_condition(bid, (a.get("cond") or "").strip())
         self._emit_state()
 
     def _c_bp_commands(self, a):
+        bid = int(a["id"])
+        if self._guard_hidden_bp(bid):
+            return
         cmds = a.get("commands") or []
-        self.dbg.set_bp_commands(int(a["id"]), list(cmds))
+        self.dbg.set_bp_commands(bid, list(cmds))
         self._emit_state()
 
     # -- watches
@@ -1232,11 +1264,18 @@ class Engine:
         if not path:
             return
         args = a.get("args") or []
-        p = self.dbg.process
-        if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
-            p.Kill()
         self.program, self.program_args, self.attach_pid = path, args, None
         self._launch(path, args)
+
+    def _prepare_target_change(self):
+        if self.tracer.enabled:
+            self.tracer.disable(self.dbg.target)
+        self._pending_exec = self._pending_fork = None
+        self._resuming = False
+        self._prev_regs = {}
+        self._annot_cache = {}
+        self._strings_bin = self._strings_live = []
+        self._mem_follow = self._disasm_follow = None
 
     def _c_attach(self, a):
         try:
@@ -1246,8 +1285,10 @@ class Engine:
             return
         try:
             self._ensure_host_platform()
+            self._prepare_target_change()
             self.dbg.attach_pid(pid)
             self.attach_pid = pid
+            self.program, self.program_args = None, []
             self._console("attached to pid {}".format(pid))
             self._emit_state()
         except Exception as e:

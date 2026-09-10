@@ -104,6 +104,9 @@ After a successful real call:
 The implementation respects the caller-provided buffer size, NUL-terminates
 strings, and updates the returned length when the API provides a length pointer.
 Unknown sysctl names pass through without modification.
+Successful length-only queries (`oldp == NULL`) publish the spoof payload's
+size through `oldlenp` without writing a data buffer. Unreadable or unwritable
+length storage retains the same rollback and fail-closed behavior.
 
 ### IOKit identity
 
@@ -172,6 +175,9 @@ Every actual rewrite emits one concise `[anti-analysis]` message. Repeated
 high-frequency timing calls retain the existing log suppression. Relaunch clears
 return-breakpoint and target-allocation state, reapplies launch filtering, and
 re-arms the composite defense.
+Replacing the target through Open or Attach disposes its target-owned defense
+state. A new target starts with the cloak off and can enable it at its own
+entry stop; same-target restart preserves the requested mode.
 
 Disabling the cloak removes only breakpoints and allocations owned by the
 cloak, disables the composite-owned existing defenses, and restores normal

@@ -548,11 +548,17 @@ if spoof.kind == "u32":
     payload = int(spoof.value).to_bytes(4, "little")
 else:
     payload = str(spoof.value).encode() + b"\0"
-if not buffer or capacity < len(payload):
-    return "sysctlbyname({}) buffer too small; cloak failed".format(name)
-process.WriteMemory(buffer, payload, error)
+if buffer:
+    if capacity < len(payload):
+        return "sysctlbyname({}) buffer too small; cloak failed".format(name)
+    process.WriteMemory(buffer, payload, error)
 process.WriteMemory(size_pointer, len(payload).to_bytes(8, "little"), error)
 ```
+
+The null-buffer branch is a successful length-only query, not an undersized
+data request. Preserve the real returned length and roll it back on a partial
+write; unreadable/unwritable length storage is still a critical error. This
+follows the execution ledger's correction for the standard two-call API use.
 
 Treat a failed write as a critical cloak error recorded in
 `AnalysisCloak.last_error`; resume validation must reject the next continue.

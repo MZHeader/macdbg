@@ -77,6 +77,10 @@ def _escape_c_string(text: str) -> str:
 
 
 class AnalysisCloak:
+    _ENTRY_SYMBOLS = (
+        "proc_pidpath", "sysctlbyname", "IORegistryEntryCreateCFProperty",
+        "_dyld_get_image_name",
+    )
     _EXISTING_DEFENSES = (
         ("anti_sysctl", "_scrub_ptraced"),
         ("anti_parent", "_scrub_parent"),
@@ -97,9 +101,14 @@ class AnalysisCloak:
         self._cstring_cache: dict[str, int] = {}
         self._owned_existing = set()
         self._owned_existing_bp_ids = {}
+        self._target = None
+        self._required_hooks: dict[int, str] = {}
 
     def enable(self) -> tuple[bool, str]:
         if self.enabled:
+            ready, error = self.validate_resume()
+            if not ready:
+                return False, error
             return True, "analysis cloak already enabled"
         self.last_error = None
         if getattr(self.debugger, "interpose_enabled", False):
@@ -131,10 +140,7 @@ class AnalysisCloak:
         target = self.debugger.target
         create_bp = getattr(target, "BreakpointCreateByName", None)
         if create_bp is not None:
-            for symbol in (
-                    "proc_pidpath", "sysctlbyname",
-                    "IORegistryEntryCreateCFProperty",
-                    "_dyld_get_image_name"):
+            for symbol in self._ENTRY_SYMBOLS:
                 bp = create_bp(symbol)
                 can_defer = (
                     symbol == "IORegistryEntryCreateCFProperty"
@@ -161,6 +167,15 @@ class AnalysisCloak:
             return False, message
 
         self.enabled = True
+        self._target = target
+        self._required_hooks = dict(self._entry_hooks)
+        sysctl_id = getattr(self.debugger, "anti_sysctl_bp_id", 0)
+        if sysctl_id:
+            self._required_hooks[sysctl_id] = "sysctl"
+        for attr, label in (("syscall_bp_ids", "syscall wrapper"),
+                            ("anti_timing_bp_ids", "monotonic timing")):
+            for bp_id in getattr(self.debugger, attr, None) or ():
+                self._required_hooks[bp_id] = label
         hook_status = self.status()
         return (True,
                 "analysis cloak enabled; {}; {} resolved, {} deferred hooks"
@@ -178,19 +193,30 @@ class AnalysisCloak:
         for name in reversed([item[0] for item in self._EXISTING_DEFENSES]):
             if name in self._owned_existing:
                 getattr(self.debugger, "disable_" + name)()
-                self._delete_breakpoints(
+                self._delete_unclaimed_breakpoints(
                     self._owned_existing_bp_ids.pop(name, set()))
         self._owned_existing.clear()
         self.enabled = False
+        self._target = None
+        self._required_hooks.clear()
         self.last_error = None
         return True, "analysis cloak disabled"
 
     def _rollback_existing(self, acquired):
         for name in reversed(acquired):
             getattr(self.debugger, "disable_" + name)()
-            self._delete_breakpoints(
+            self._delete_unclaimed_breakpoints(
                 self._owned_existing_bp_ids.pop(name, set()))
             self._owned_existing.discard(name)
+
+    def _delete_unclaimed_breakpoints(self, bp_ids):
+        # A defense enabled after the cloak can adopt the shared syscall or
+        # sysctl entry hooks. Their managers retain those IDs while any owner
+        # needs them; snapshot cleanup must only remove unclaimed leftovers
+        # (including unresolved fallbacks from a partially successful enable).
+        shared = set(getattr(self.debugger, "syscall_bp_ids", None) or ())
+        shared.add(getattr(self.debugger, "anti_sysctl_bp_id", 0))
+        self._delete_breakpoints(set(bp_ids) - shared)
 
     def _breakpoint_ids(self):
         target = getattr(self.debugger, "target", None)
@@ -320,7 +346,27 @@ class AnalysisCloak:
                     payload = (int(spoof.value).to_bytes(4, "little")
                                if kind == "u32" else
                                str(spoof.value).encode() + b"\0")
-                    if not buffer or not size_pointer or capacity < len(payload):
+                    if not buffer:
+                        # oldp == NULL is the standard first call used to
+                        # learn the required size. Only oldlenp is output;
+                        # its input value is not a data-buffer capacity.
+                        original_size = (self._read_exact(size_pointer, 8, lldb)
+                                         if size_pointer else None)
+                        if original_size is None:
+                            message = self._critical(
+                                "sysctlbyname({}) could not preserve real result size; "
+                                "cloak failed".format(name))
+                        elif not self._write_exact(
+                                size_pointer, len(payload).to_bytes(8, "little"), lldb):
+                            rollback_ok = self._write_exact(
+                                size_pointer, original_size, lldb)
+                            rollback = "; rollback failed" if not rollback_ok else ""
+                            message = self._critical(
+                                "sysctlbyname({}) could not write result size; "
+                                "cloak failed{}".format(name, rollback))
+                        else:
+                            message = "spoofed sysctlbyname({}) result size".format(name)
+                    elif not size_pointer or capacity < len(payload):
                         message = self._critical(
                             "sysctlbyname({}) buffer too small; cloak failed"
                             .format(name))
@@ -629,19 +675,47 @@ class AnalysisCloak:
                 and getattr(self.debugger, "interpose_enabled", False)):
             self._critical(
                 "analysis cloak is incompatible with fork-tree tracing in v1")
-        if self.enabled and self._module_loaded("IOKit"):
-            for bp_id, symbol in self._entry_hooks.items():
-                if symbol != "IORegistryEntryCreateCFProperty":
-                    continue
-                bp = self.debugger.target.FindBreakpointByID(bp_id)
-                if (not bp or not bp.IsValid()
-                        or bp.GetNumLocations() == 0):
-                    self._critical(
-                        "IORegistryEntryCreateCFProperty hook did not resolve "
-                        "after IOKit loaded; cloak failed")
+        if self.enabled and not self.last_error:
+            self._validate_required_hooks()
         if self.enabled and self.last_error:
             return False, self.last_error
         return True, "analysis cloak ready"
+
+    def _validate_required_hooks(self) -> None:
+        target = getattr(self.debugger, "target", None)
+        if target is None or target != self._target:
+            self._critical("analysis cloak belongs to a different target; restart and enable at entry")
+            return
+        missing = set(self._ENTRY_SYMBOLS) - set(self._entry_hooks.values())
+        if missing:
+            self._critical("missing analysis cloak entry handler for {}; restart and re-enable at entry".format(
+                ", ".join(sorted(missing))))
+            return
+        for name, attr in self._EXISTING_DEFENSES:
+            if not getattr(self.debugger, attr, None):
+                self._critical("required {} defense is disabled; restart and re-enable analysis cloak".format(name))
+                return
+        for bp_id, symbol in self._required_hooks.items():
+            bp = target.FindBreakpointByID(bp_id)
+            failure = None
+            if not bp or not bp.IsValid():
+                failure = "is missing"
+            elif not bp.IsEnabled():
+                failure = "is disabled"
+            elif bp.GetNumLocations() == 0:
+                if symbol == "IORegistryEntryCreateCFProperty" and not self._module_loaded("IOKit"):
+                    continue
+                failure = "did not resolve"
+            else:
+                for index in range(bp.GetNumLocations()):
+                    location = bp.GetLocationAtIndex(index)
+                    if not location.IsEnabled() or not location.IsResolved():
+                        failure = "has a disabled or unresolved location"
+                        break
+            if failure:
+                self._critical("required {} hook #{} {}; restart and re-enable analysis cloak".format(
+                    symbol, bp_id, failure))
+                return
 
     def validate_integrity(self, extra_hardware_ids: set[int]) -> tuple[bool, str]:
         if not self.enabled:

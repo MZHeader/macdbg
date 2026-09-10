@@ -126,6 +126,28 @@ static int check_sysctl(void) {
     return bad;
 }
 
+static int check_sysctl_two_stage(void) {
+    const char *names[] = {"kern.hv_vmm_present", "hw.model", "machdep.cpu.brand_string"};
+    const size_t expected_sizes[] = {4, 8, 13};
+    const char *expected_strings[] = {NULL, "Mac14,6", "Apple M2 Pro"};
+    int bad = 0;
+    for (int i = 0; i < 3; i++) {
+        size_t size = 0;
+        int rc = sysctlbyname(names[i], NULL, &size, NULL, 0);
+        if (rc != 0 || size == 0 || size > 4096) return 2;
+        void *value = calloc(1, size);
+        if (!value) return 2;
+        size_t capacity = size;
+        rc = sysctlbyname(names[i], value, &size, NULL, 0);
+        bad |= rc != 0 || size != expected_sizes[i] || capacity != expected_sizes[i];
+        if (!bad) bad |= i ? strcmp(value, expected_strings[i]) != 0 : *(int *)value != 0;
+        printf("SIZE-PROBE:%s capacity=%zu returned=%zu rc=%d\n", names[i], capacity, size, rc);
+        free(value);
+    }
+    printf("SYSCTL-TWO-STAGE:%s\n", bad ? "DETECTED" : "clean");
+    return bad;
+}
+
 static int copy_cfstring_property(io_registry_entry_t service,
                                   CFStringRef key,
                                   char *output,
@@ -259,6 +281,29 @@ static int check_ptraced(void) {
     return bad;
 }
 
+static int check_sysctl_ptraced(void) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct kinfo_proc info = {0};
+    size_t n = sizeof(info);
+    int rc = sysctl(mib, 4, &info, &n, NULL, 0);
+    int bad = rc != 0 || n < sizeof(info) || (info.kp_proc.p_flag & P_TRACED) != 0;
+    printf("SYSCTL-P_TRACED:%s rc=%d\n", bad ? "DETECTED" : "clean", rc);
+    return bad;
+}
+
+static int check_wrapper_defense(int ptrace_query) {
+    uint32_t flags = 0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    long rc = ptrace_query ? syscall(26, 31, 0, 0, 0)
+                          : syscall(169, getpid(), 0, &flags, sizeof(flags));
+#pragma clang diagnostic pop
+    int bad = rc != 0 || (!ptrace_query && (flags & 0x10000000));
+    printf("WRAPPER-%s:%s rc=%ld\n", ptrace_query ? "PTRACE" : "CSOPS",
+           bad ? "DETECTED" : "clean", rc);
+    return bad;
+}
+
 static int check_exec(void) {
     /* Harmless even if interception regresses; its final marker proves that
        disk dumps preserve bytes beyond the preview's 200-byte limit. */
@@ -347,8 +392,12 @@ static int check_combined(const char *digest, const char *dylib) {
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
+    if (strcmp(argv[1], "wait") == 0) { sleep(30); return 0; }
     if (strcmp(argv[1], "timing") == 0) return check_timing();
     if (strcmp(argv[1], "ptraced") == 0) return check_ptraced();
+    if (strcmp(argv[1], "sysctl_ptraced") == 0) return check_sysctl_ptraced();
+    if (strcmp(argv[1], "wrapper_ptrace") == 0) return check_wrapper_defense(1);
+    if (strcmp(argv[1], "wrapper_csops") == 0) return check_wrapper_defense(0);
     if (strcmp(argv[1], "exec") == 0) return check_exec();
     if (strcmp(argv[1], "combined") == 0)
         return argc == 4 ? check_combined(argv[2], argv[3]) : 64;
@@ -368,6 +417,8 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "sysctl") == 0)
         return check_sysctl();
+    if (strcmp(argv[1], "sysctl_two_stage") == 0)
+        return check_sysctl_two_stage();
     if (strcmp(argv[1], "iokit") == 0)
         return check_iokit();
     if (strcmp(argv[1], "images") == 0)

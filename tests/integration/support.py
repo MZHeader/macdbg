@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import struct
+import textwrap
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +17,19 @@ LATE_IOKIT_FIXTURE = FIXTURE_DIR / "late_iokit_fixture"
 FRIDA_FIXTURE = FIXTURE_DIR / "FridaGadget.dylib"
 EXEC_COMMAND = "printf '%s\\n' '" + "0123456789" * 32 + "-COMMAND-END'"
 EXEC_DUMP_BODY = "symbol: system\ncommand:\n" + EXEC_COMMAND + "\n"
+
+
+def run_core_probe(source, timeout=40):
+    """Use real LLDB in a fresh interpreter, separate from unit-test doubles."""
+    env = os.environ.copy()
+    bindings = subprocess.check_output(["xcrun", "lldb", "-P"], text=True).strip()
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + bindings
+    result = subprocess.run(["/usr/bin/python3", "-c", textwrap.dedent(source)],
+                            cwd=ROOT, env=env, text=True, capture_output=True,
+                            timeout=timeout)
+    if result.returncode:
+        raise AssertionError(result.stdout + result.stderr)
+    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 def fixture_text_digest(fixture=FIXTURE):

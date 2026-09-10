@@ -272,6 +272,55 @@ class SysctlEntrySafetyTests(unittest.TestCase):
 
 
 class SysctlReturnSafetyTests(unittest.TestCase):
+    def length_probe(self, name="hw.model", kind="cstring", write_results=None):
+        size_address = 0x3000
+        process = FakeProcess(FakeFrame({"x0": 0}), memory={
+            size_address: bytearray((24).to_bytes(8, "little")),
+        }, write_results=write_results)
+        cloak = AnalysisCloak(FakeDebugger(process))
+        cloak.enabled = True
+        cloak._return_hooks[9] = (kind, name, 0, size_address, 0)
+        cloak._return_hook_threads[9] = 0x1234
+        return cloak, process, size_address
+
+    def test_length_only_probe_publishes_spoof_size_without_data_write(self):
+        for name, kind, expected_size in (("hw.model", "cstring", 8),
+                                           ("machdep.cpu.brand_string", "cstring", 13),
+                                           ("kern.hv_vmm_present", "u32", 4)):
+            with self.subTest(name=name):
+                cloak, process, size_address = self.length_probe(name, kind)
+                with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
+                    message = cloak.handle_hit(9)
+                self.assertIsNone(cloak.last_error, message)
+                self.assertEqual(int.from_bytes(process.memory[size_address], "little"), expected_size)
+                self.assertEqual([address for address, _data, _n in process.writes], [size_address])
+                self.assertEqual(process.continues, 1)
+
+    def test_length_only_probe_with_unreadable_length_fails_closed(self):
+        cloak, process, size_address = self.length_probe()
+        process.memory.clear()
+        with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
+            message = cloak.handle_hit(9)
+        self.assertIn("could not preserve real result size", message)
+        self.assertEqual(cloak.last_error, message)
+        self.assertEqual(process.writes, [])
+        self.assertEqual(process.continues, 0)
+
+    def test_length_only_probe_rolls_back_partial_length_write(self):
+        for writes, rollback_fails in (([3, 8], False), ([3, 2], True)):
+            with self.subTest(rollback_fails=rollback_fails):
+                cloak, process, size_address = self.length_probe(write_results={0x3000: writes})
+                before = bytes(process.memory[size_address])
+                with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
+                    message = cloak.handle_hit(9)
+                self.assertIn("could not write result size", message)
+                self.assertEqual("rollback failed" in message, rollback_fails)
+                self.assertEqual(cloak.last_error, message)
+                self.assertEqual([address for address, _data, _n in process.writes], [size_address, size_address])
+                if not rollback_fails:
+                    self.assertEqual(bytes(process.memory[size_address]), before)
+                self.assertEqual(process.continues, 0)
+
     def test_u32_spoof_writes_four_bytes_and_preserves_adjacent_memory(self):
         buffer_address = 0x2000
         size_address = 0x3000

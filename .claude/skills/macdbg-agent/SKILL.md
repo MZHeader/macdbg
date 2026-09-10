@@ -173,6 +173,9 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   `status.defenses` reports `analysis_cloak`, `analysis_cloak_safe`, resolved
   and deferred hook counts, and the exact error when unsafe. Enabling after the
   target has begun executing is rejected; restart to the entry point first.
+  Opening or attaching to another target clears the previous target's defense
+  state; re-enable the cloak at the new entry stop. Same-target restart keeps
+  the requested cloak mode.
 - The cloak removes `DYLD_INSERT_LIBRARIES`, `DYLD_FORCE_FLAT_NAMESPACE`,
   `DYLD_PRINT_LIBRARIES`, `DYLD_PRINT_INITIALIZERS`, `DYLD_PRINT_BINDINGS`,
   `DYLD_IMAGE_SUFFIX`, `MallocStackLogging`, `MallocStackLoggingNoCompact`, and
@@ -182,7 +185,8 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   matching debugger/analyzer names become `launchd` or `/sbin/launchd`, while
   clean results are left alone. Recognized `sysctlbyname` results are
   deterministic: `kern.hv_vmm_present = 0`, `hw.model = Mac14,6`, and
-  `machdep.cpu.brand_string = Apple M2 Pro`.
+  `machdep.cpu.brand_string = Apple M2 Pro`. Successful length-only probes
+  update only the returned size so a subsequent data query can proceed.
 - `IORegistryEntryCreateCFProperty` returns
   `IOPlatformSerialNumber = C02ZQ0ABC123` and
   `IOPlatformUUID = 8D4C7A12-3F65-4B90-A2DE-61C8E5079F34` for those two keys.

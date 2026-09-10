@@ -203,6 +203,23 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
             self.assertFalse(defenses["anti_parent"])
             self.assertFalse(defenses["anti_timing"])
 
+    def test_disable_preserves_wrapper_hooks_adopted_by_independent_defenses(self):
+        for name, mode, marker, message in (
+                ("anti_ptrace", "wrapper_ptrace", "WRAPPER-PTRACE:clean",
+                 "blocked ptrace(PT_DENY_ATTACH) via syscall()"),
+                ("anti_csops", "wrapper_csops", "WRAPPER-CSOPS:clean",
+                 "scrubbed CS_DEBUGGED")):
+            with self.subTest(defense=name), AgentProcess(FIXTURE, mode) as agent:
+                self.assertTrue(agent.enable_cloak()["ok"])
+                self.assertTrue(agent.cmd("defense_enable", {"name": name})["ok"])
+                self.assertTrue(agent.cmd("defense_disable", {"name": "analysis_cloak"})["ok"])
+                self.assertTrue(agent.cmd("status")["defenses"][name])
+                result = agent.continue_to_exit()
+                self.assertEqual(result.get("event"), "exited", result)
+                self.assertEqual(result["exit"]["code"], 0, result)
+                self.assertIn(marker, result["console"])
+                self.assertIn(message, result["console"])
+
     def test_exec_prompt_dumps_full_command_then_fakes_success(self):
         with AgentProcess(FIXTURE, "exec") as agent:
             self.assertTrue(agent.enable_cloak()["ok"])
@@ -303,6 +320,7 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                 "d._step_cloak_messages = []",
                 "d.analysis_cloak = c = AnalysisCloak(d)",
                 "c.enabled = True",
+                "c.validate_resume = lambda: (True, 'ownership-only probe')",
                 "c._return_hooks = {{i: ('proc_pidpath', 0, 0) for i in {!r}}}".format(ids),
                 "c._return_hook_threads = {!r}".format({foreign: tid + 1000000000, matched: tid}),
                 "thread.GetFrameAtIndex(0).FindRegister('x0').SetValueFromCString('0')",
@@ -382,7 +400,10 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
         cases = (("parent", "check_parent", "proc_pidpath", 0),
                  ("sysctl", "check_sysctl", "sysctlbyname", 1),
                  ("iokit", "copy_cfstring_property", "IORegistryEntryCreateCFProperty", 0),
-                 ("images", "check_images", "_dyld_get_image_name", 0))
+                 ("images", "check_images", "_dyld_get_image_name", 0),
+                 ("ptraced", "check_ptraced", "syscall", 0),
+                 ("sysctl_ptraced", "check_sysctl_ptraced", "sysctl", 0),
+                 ("timing", "check_timing", "mach_absolute_time", 0))
         for mode, function, api, index in cases:
             with self.subTest(mode=mode):
                 extra = [str(FRIDA_FIXTURE)] if mode == "images" else []
@@ -425,6 +446,47 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
             self.assertEqual(result["exit"]["code"], 0, result)
             self.assertIn("PARENT:clean", result["console"])
 
+    def test_instruction_steps_through_all_composite_api_entries(self):
+        cases = (
+            ("ptraced", "check_ptraced", "syscall", "__syscall", 0),
+            ("sysctl_ptraced", "check_sysctl_ptraced", "sysctl", "sysctl", 0),
+            ("timing", "check_timing", "mach_absolute_time", "mach_absolute_time", 0),
+            ("parent", "check_parent", "proc_pidpath", "proc_pidpath", 0),
+            ("sysctl", "check_sysctl", "sysctlbyname", "sysctlbyname", 1),
+            ("iokit", "copy_cfstring_property", "IORegistryEntryCreateCFProperty",
+             "IORegistryEntryCreateCFProperty", 0),
+            ("images", "check_images", "_dyld_get_image_name", "_dyld_get_image_name", 0),
+        )
+        for mode, function, api, hook_name, index in cases:
+            extra = [str(FRIDA_FIXTURE)] if mode == "images" else []
+            with self.subTest(mode=mode), AgentProcess(FIXTURE, mode, extra_args=extra) as agent:
+                self.assertTrue(agent.enable_cloak()["ok"])
+                listing = agent.cmd("breakpoint_list", {"hide_internal": False})
+                hook = next(bp["addr"] for bp in listing["breakpoints"]
+                            if bp["symbol"] == hook_name)
+                text = agent.cmd("raw", {"command": "disassemble -n " + function})["output"]
+                sites = re.findall(r"^\s*(0x[0-9a-f]+).*\bbl\s+.*symbol stub for: "
+                                   + re.escape(api) + r"\s*$", text, re.M)
+                site = int(sites[index], 16)
+                bp = agent.cmd("breakpoint_toggle", {"addr": site})
+                self.assertTrue(bp["ok"], bp)
+                self.assertEqual(agent.continue_to_exit().get("event"), "stop")
+                self.assertTrue(agent.cmd("breakpoint_delete", {"bp_id": bp["bp_id"]})["ok"])
+                seen_hook = False
+                for _ in range(12):
+                    stepped = agent.cmd("step_in", {"timeout": 15})
+                    self.assertEqual(stepped.get("event"), "stop", stepped)
+                    pc = stepped["stop"]["pc"]
+                    if pc == site + 4 or (seen_hook and pc != hook):
+                        break
+                    seen_hook |= pc == hook
+                else:
+                    self.fail("instruction steps did not traverse " + api)
+                result = agent.continue_to_exit()
+                self.assertEqual(result.get("event"), "exited", result)
+                self.assertEqual(result["exit"]["code"], 0, (mode, stepped, result))
+                self.assertNotIn("DETECTED", result["console"])
+
     def test_optimized_inline_step_out_is_rejected_before_text_changes(self):
         fixture = support.OPTIMIZED_FIXTURE
         digest = support.fixture_text_digest(fixture)
@@ -453,7 +515,8 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
             self.assertEqual(result["exit"]["code"], 0, result)
 
     def test_step_out_applies_all_cloak_hook_families(self):
-        for mode in ("parent", "sysctl", "iokit", "images"):
+        for mode in ("parent", "sysctl", "iokit", "images", "ptraced",
+                     "sysctl_ptraced", "timing"):
             with self.subTest(mode=mode):
                 extra = [str(FRIDA_FIXTURE)] if mode == "images" else []
                 with AgentProcess(FIXTURE, mode, extra_args=extra) as agent:
@@ -467,7 +530,8 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                     result = agent.continue_to_exit()
                     self.assertEqual(result.get("event"), "exited", result)
                     self.assertEqual(result["exit"]["code"], 0, (stepped, result))
-                    self.assertIn(mode.upper() + ":clean", stepped["console"] + result["console"])
+                    marker = {"ptraced": "P_TRACED", "sysctl_ptraced": "SYSCTL-P_TRACED"}.get(mode, mode.upper())
+                    self.assertIn(marker + ":clean", stepped["console"] + result["console"])
 
     def test_integrity_step_out_preserves_text(self):
         digest = support.fixture_text_digest()
@@ -670,6 +734,17 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                 "SYSCTL:clean hv=0 model=Mac14,6 cpu=Apple M2 Pro",
                 result["console"],
             )
+
+    def test_hardware_sysctl_two_stage_queries_publish_spoof_sizes(self):
+        with AgentProcess(FIXTURE, "sysctl_two_stage") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            result = agent.continue_to_exit()
+            self.assertEqual(result.get("event"), "exited", result)
+            self.assertEqual(result["exit"]["code"], 0, result)
+            self.assertIn("SYSCTL-TWO-STAGE:clean", result["console"])
+            for name, size in (("kern.hv_vmm_present", 4), ("hw.model", 8),
+                               ("machdep.cpu.brand_string", 13)):
+                self.assertIn("SIZE-PROBE:{} capacity={} returned={} rc=0".format(name, size, size), result["console"])
 
     def test_parent_paths_are_cloaked(self):
         with AgentProcess(FIXTURE, "parent") as agent:

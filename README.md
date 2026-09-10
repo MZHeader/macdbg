@@ -60,6 +60,10 @@ hooks are resolved or deferred. **Enable ALL anti-debug bypasses** includes the
 cloak too. If the target has already run, restart it and enable the cloak at the
 new entry stop.
 
+Opening or attaching to another target turns off the previous target's
+defenses and clears its internal hooks. Enable the cloak again at the new
+target's entry stop. Restarting the same target preserves the requested mode.
+
 The equivalent headless sequence is:
 
 ```sh
@@ -86,7 +90,8 @@ The composite defense covers these analysis signals:
   a suspicious full path becomes `/sbin/launchd`. Unrelated paths pass through.
 * It virtualizes recognized `sysctlbyname` queries with deterministic results:
   `kern.hv_vmm_present = 0`, `hw.model = Mac14,6`, and
-  `machdep.cpu.brand_string = Apple M2 Pro`.
+  `machdep.cpu.brand_string = Apple M2 Pro`. Successful length-only probes
+  publish the spoofed size for the caller's subsequent data query.
 * It replaces the two recognized `IORegistryEntryCreateCFProperty` results with
   `IOPlatformSerialNumber = C02ZQ0ABC123` and
   `IOPlatformUUID = 8D4C7A12-3F65-4B90-A2DE-61C8E5079F34`.

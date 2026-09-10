@@ -68,6 +68,7 @@ class Debugger:
         return data.decode("utf-8", errors="replace") if data else ""
 
     def create_target(self, path: str) -> lldb.SBTarget:
+        self._dispose_target()
         err = lldb.SBError()
         self.target = self.dbg.CreateTarget(path, None, None, True, err)
         if not err.Success() or not self.target.IsValid():
@@ -78,6 +79,47 @@ class Debugger:
         except Exception:
             self.state = None
         return self.target
+
+    def _dispose_target(self) -> None:
+        """Retire one target before Open/Attach installs another one.
+
+        Breakpoint IDs, return buffers, and target allocations are meaningful
+        only within their original SBTarget. A replacement starts with all
+        target-owned defenses off and can opt in again at its own entry stop.
+        """
+        self.cancel_user_step()
+        self.analysis_cloak.disable()
+        self._clear_flag_scrub_returns()
+        if self.process and self.process.IsValid():
+            if self._attached:
+                self.process.Detach()
+            else:
+                self.process.Kill()
+        if self.target and self.target.IsValid():
+            self.dbg.DeleteTarget(self.target)
+        self.process = None
+        self.target = None
+        self.state = None
+        self._attached = False
+        self.hardware_bp_ids.clear()
+        self.anti_ptrace_bp_id = self.anti_sysctl_bp_id = 0
+        self.anti_csops_bp_id = self.anti_mach_bp_id = 0
+        self.syscall_bp_ids = self.anti_timing_bp_ids = None
+        self.direct_syscall_bp_ids = self.fork_bp_ids = self.setsid_bp_ids = None
+        self.exec_bp_ids = None
+        self._scrub_ptraced = self._scrub_parent = self.anti_sigtrap_on = False
+        self.fork_mode = "off"
+        self._fork_shield_hw_bp = 0
+        self._fork_shield_saved = None
+        self._fake_clock = 0
+        self._anti_timing_logged = False
+        self._step_cloak_messages.clear()
+        self._step_cloak_handled_stop = None
+        # Stops and exit notifications for the retired process must not be
+        # surfaced as events from the newly opened target.
+        event = lldb.SBEvent()
+        while self.listener.GetNextEvent(event):
+            pass
 
     def restore_stored_breakpoints(self) -> int:
         if not self.state or not self.target or not self.target.IsValid():
@@ -334,6 +376,7 @@ class Debugger:
         self.delete_breakpoint(bp_id)
 
     def attach_pid(self, pid: int) -> lldb.SBProcess:
+        self._dispose_target()
         self.target = self.dbg.CreateTarget("")
         if not self.target.IsValid():
             raise RuntimeError("failed to create empty target for attach")
@@ -576,11 +619,12 @@ class Debugger:
             if hit - auto:
                 self.cancel_user_step()
                 return "done"
-            depth_before = t.GetNumFrames()
-            for bp_id in hit:
-                self._defense_step_action(bp_id, t)
-            if t.GetNumFrames() < depth_before:
-                self._step_plan_active = False
+            if not self.analysis_cloak.enabled:
+                depth_before = t.GetNumFrames()
+                for bp_id in hit:
+                    self._defense_step_action(bp_id, t)
+                if t.GetNumFrames() < depth_before:
+                    self._step_plan_active = False
         # Complete once we're back at or above the target frame depth. This is
         # re-checked *after* _defense_step_action because a fake-the-call defense
         # (ptrace/mach/setsid) pops the callee frame via `thread return`, which
@@ -720,9 +764,9 @@ class Debugger:
         if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
             # A return one-shot armed by a prior non-step hit fired during the
             # step; scrub now and retire it.
-            kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
-            self.delete_breakpoint(bp_id)
-            self._scrub_flag(kind, buf, oldlenp)
+            message = self._consume_flag_scrub_return(bp_id, thread)
+            if message:
+                self._step_cloak_messages.append("[anti-debug] " + message)
 
     def set_pc(self, addr: int) -> Tuple[bool, str]:
         """Redirect execution: point the program counter at `addr` (x64dbg's
@@ -764,10 +808,24 @@ class Debugger:
         return messages
 
     def _process_cloak_step_stop(self, thread):
-        """Apply entry/return rewrites without starting an unrelated continue."""
+        """Apply all composite entry/return rewrites without a free continue.
+
+        This runs before single-instruction completion as well as bounded
+        step-out progress. LLDB may report only plan-complete at an API's PC,
+        so constituent hooks need the same address matching as new cloak hooks.
+        """
         cloak = self.analysis_cloak
         if not cloak.enabled:
             return
+        legacy_ids = {
+            self.anti_ptrace_bp_id, self.anti_mach_bp_id,
+            self.anti_sysctl_bp_id, self.anti_csops_bp_id,
+        } - {0}
+        for group in (self.syscall_bp_ids, self.anti_timing_bp_ids,
+                      self.setsid_bp_ids, self.direct_syscall_bp_ids,
+                      self._flag_scrub_returns):
+            legacy_ids.update(group or ())
+        candidates = set(cloak._entry_hooks) | set(cloak._return_hooks) | legacy_ids
         ids = set()
         if thread.GetStopReason() == lldb.eStopReasonBreakpoint:
             ids.update(thread.GetStopReasonDataAtIndex(i)
@@ -778,7 +836,7 @@ class Debugger:
         stop_key = (self.process.GetStopID(), thread.GetThreadID(), pc)
         if self._step_cloak_handled_stop == stop_key:
             return
-        for bp_id in set(cloak._entry_hooks) | set(cloak._return_hooks):
+        for bp_id in candidates:
             bp = self.target.FindBreakpointByID(bp_id)
             if not bp.IsValid() or not bp.IsEnabled():
                 continue
@@ -793,9 +851,18 @@ class Debugger:
                     and bp.GetLocationAtIndex(i).GetLoadAddress() == pc
                     for i in range(bp.GetNumLocations())):
                 ids.add(bp_id)
-        for bp_id in sorted(ids):
+        syscall_handled = False
+        for bp_id in sorted(ids & candidates):
+            # syscall and __syscall can be two IDs for the same entry site.
+            # Decode the call once, before any thread-return changes its frame.
+            is_syscall = bp_id in (self.syscall_bp_ids or ())
+            if is_syscall and syscall_handled:
+                continue
             depth_before = thread.GetNumFrames()
             message = cloak.handle_hit(bp_id, resume=False)
+            if message is None and bp_id in legacy_ids:
+                self._defense_step_action(bp_id, thread)
+                syscall_handled |= is_syscall
             if thread.GetNumFrames() < depth_before:
                 # `thread return` used by IOKit invalidates LLDB's active plan.
                 self._step_plan_active = False
@@ -805,6 +872,11 @@ class Debugger:
             if not ok:
                 self.cancel_user_step()
                 raise RuntimeError(error)
+            if thread.GetFrameAtIndex(0).GetPC() != pc:
+                # A fake-the-call handler has already returned to the caller.
+                # Remaining entry IDs describe the old PC and must not apply
+                # to the new caller frame.
+                break
         self._step_cloak_handled_stop = (
             self.process.GetStopID(), thread.GetThreadID(),
             thread.GetFrameAtIndex(0).GetPC())
@@ -988,6 +1060,9 @@ class Debugger:
     # return-address one-shots waiting to scrub a flag out of a syscall's output
     # buffer once the call fills it: {ret_bp_id: (kind, buffer_addr)}.
     _flag_scrub_returns: Optional[Dict[int, tuple]] = None
+    # Retained separately from LLDB's object, which may already be auto-deleted
+    # by the time a shared-site stop reports its ID.
+    _flag_scrub_return_threads: Optional[Dict[int, int]] = None
     # scrubs deferred while a user step runs: [(frame_depth_at_call, kind, buf)].
     # We can't Continue mid-step, so instead of a return one-shot we let the
     # step's own StepOut run the call, then scrub once its frame has returned.
@@ -1214,6 +1289,7 @@ class Debugger:
             for bp_id in list(self._flag_scrub_returns):
                 self.delete_breakpoint(bp_id)
         self._flag_scrub_returns = None
+        self._flag_scrub_return_threads = None
 
     def _ensure_sysctl_bp(self) -> Tuple[bool, str]:
         """Arm the shared sysctl breakpoint if not already armed."""
@@ -1287,7 +1363,24 @@ class Debugger:
         bp.SetThreadID(thread.GetThreadID())
         if self._flag_scrub_returns is None:
             self._flag_scrub_returns = {}
+        if self._flag_scrub_return_threads is None:
+            self._flag_scrub_return_threads = {}
         self._flag_scrub_returns[bp.GetID()] = (kind, buf, oldlenp)
+        self._flag_scrub_return_threads[bp.GetID()] = thread.GetThreadID()
+
+    def _consume_flag_scrub_return(self, bp_id, thread) -> Optional[str]:
+        owner = (self._flag_scrub_return_threads or {}).get(bp_id)
+        if owner is None:
+            if self.analysis_cloak.enabled:
+                self.analysis_cloak._critical(
+                    "flag return hook missing thread ownership; cloak failed")
+            return None
+        if thread.GetThreadID() != owner:
+            return None
+        kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
+        self._flag_scrub_return_threads.pop(bp_id)
+        self.delete_breakpoint(bp_id)
+        return self._scrub_flag(kind, buf, oldlenp) or ""
 
     def _scrub_debugger_name(self, buf: int, oldlenp: int) -> Optional[str]:
         """Rewrite a debugger process name (p_comm) in a returned kinfo_proc to
@@ -1361,16 +1454,15 @@ class Debugger:
         message to log, "" for handled-but-silent, or None if not ours."""
         if not self.process:
             return None
-        # Return side: a tagged call has come back.
-        if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
-            kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
-            self.delete_breakpoint(bp_id)
-            msg = self._scrub_flag(kind, buf, oldlenp)
-            self.cont()
-            return msg if msg else ""
         thread = self.process.GetSelectedThread()
         if not thread or not thread.IsValid():
             return None
+        # Return side: a tagged call has come back.
+        if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
+            msg = self._consume_flag_scrub_return(bp_id, thread)
+            if msg is not None:
+                self.cont()
+            return msg
         frame = thread.GetFrameAtIndex(0)
         if not frame or not frame.IsValid():
             return None
