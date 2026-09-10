@@ -24,8 +24,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key>     <string>macdbg</string>
     <key>CFBundleExecutable</key>      <string>macdbg</string>
     <key>CFBundleIdentifier</key>      <string>tech.mzheader.macdbg.gui</string>
-    <key>CFBundleVersion</key>         <string>1.1.0</string>
-    <key>CFBundleShortVersionString</key> <string>1.1.0</string>
+    <key>CFBundleVersion</key>         <string>1.2.0</string>
+    <key>CFBundleShortVersionString</key> <string>1.2.0</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
@@ -41,19 +41,20 @@ PLIST
 # error -10669) even though macdbg is arm64-only. A native Mach-O is launched
 # arm64 directly. It resolves the repo from its own path and execs GUI/run.sh
 # (see GUI/launcher.c). Keep macdbg.app at the repo root for that to resolve.
-# Compile + ad-hoc sign the Mach-O OUTSIDE the bundle, then move it in. An arm64
-# binary needs an ad-hoc signature to run at all (AMFI); signing it as a bare
-# file (not via its in-bundle path) signs only the executable and leaves the
-# *bundle* unsigned. That matters: a real ad-hoc *bundle* signature makes
-# Gatekeeper reject a quarantined double-click, whereas an unsigned, un-
-# quarantined local app is allowed to run.
+# An arm64 binary needs a signature to run at all (AMFI kills an unsigned one
+# with SIGKILL), so the bundle CANNOT ship unsigned now that its executable is a
+# Mach-O rather than a shell script. Signing only the executable is not an
+# option either: codesign then evaluates macdbg.app as a bundle whose signature
+# has no CodeResources seal, and verification fails with "code has no resources
+# but signature indicates they must be present" -- which Finder reports as
+# "damaged and can't be opened", with no right-click -> Open escape hatch. So
+# ad-hoc sign the whole BUNDLE, below, once Resources/ is populated.
 # -mmacosx-version-min pins the binary's minimum-OS load command; without it
 # clang stamps the *build host's* macOS, and the app then refuses to launch on
 # any older macOS ("you can't use this version of the application with this
 # version of macOS"). 11.0 = the arm64 floor, matching LSMinimumSystemVersion.
 LAUNCHER_BIN="$(mktemp -t macdbg-launcher)"
 clang -arch arm64 -mmacosx-version-min=11.0 -O2 -Wall -o "$LAUNCHER_BIN" "$DIR/launcher.c"
-codesign --force --sign - --identifier tech.mzheader.macdbg.gui "$LAUNCHER_BIN" >/dev/null 2>&1 || true
 mv "$LAUNCHER_BIN" "$CONTENTS/MacOS/macdbg"
 chmod +x "$CONTENTS/MacOS/macdbg"
 
@@ -62,9 +63,16 @@ if [ -f "$DIR/macdbg.icns" ]; then
     cp "$DIR/macdbg.icns" "$CONTENTS/Resources/macdbg.icns"
 fi
 
-# The launcher is ad-hoc signed above and the bundle is intentionally left
-# unsigned. Strip the quarantine flag so a freshly built bundle launches cleanly
-# from Finder.
+# Ad-hoc sign the whole bundle, last, so the signature seals Resources/ too.
+# No `|| true`: an unsigned launcher is SIGKILLed by AMFI on launch with nothing
+# logged, so a failure here must fail the build rather than ship a dead app.
+codesign --force --sign - --identifier tech.mzheader.macdbg.gui "$APP"
+codesign --verify --verbose=2 "$APP"
+
+# Strip the quarantine flag so a freshly built bundle launches cleanly from
+# Finder. (Ad-hoc signing is not notarisation: a bundle that reaches another
+# machine quarantined still needs right-click -> Open, which a valid ad-hoc
+# signature permits and a broken one does not.)
 xattr -dr com.apple.quarantine "$APP" >/dev/null 2>&1 || true
 
 # Refresh LaunchServices so Finder picks up the new bundle.

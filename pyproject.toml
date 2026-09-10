@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "macdbg"
-version = "1.1.0"
+version = "1.2.0"
 description = "x64dbg-style GUI and headless LLDB wrapper for reverse engineers and malware analysts."
 readme = "README.md"
 requires-python = ">=3.9"
