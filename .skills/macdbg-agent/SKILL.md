@@ -1,465 +1,116 @@
 ---
 name: macdbg-agent
-description: Use when an AI coding agent needs to debug, trace, or reverse-engineer a macOS binary with macdbg rather than edit macdbg's own source.
+description: Drive macdbg through agent.sh to launch or attach to macOS processes, inspect stops, trace calls, and use anti-debug defenses. Use for debugging a target, not ordinary edits to macdbg's source.
 ---
 
-# macdbg headless agent
+# Drive macdbg
 
-Use `./agent.sh` for headless control: the same LLDB-backed `Debugger` core
-(`macdbg/core/debugger.py`) as the native GUI, driven by a JSON protocol over
-a Unix socket. Only works on
-macOS with Xcode command line tools (`lldb`) installed. Run every command
-from the macdbg repo root.
+Run `./agent.sh` from the macdbg checkout. It starts a headless LLDB daemon;
+subsequent commands address that session by name. No GUI or MCP server is needed.
+Requires macOS and Xcode command-line tools (`xcrun lldb -P` must work).
+Use the host or guest authorized for the target. `exec_sandbox` intercepts calls;
+it does not isolate filesystem or network access.
 
-## Mental model
-
-`agent.sh start` launches a background daemon process that owns one live
-LLDB session (one target, one or more threads). All later commands
-(`agent.sh cmd <session> <command>`) talk to that daemon over a local Unix
-socket and return JSON. The daemon keeps running — with breakpoints,
-register state, patched memory, etc. all intact — between your tool calls,
-until you explicitly `agent.sh stop <session>`. **Always stop a session
-when you're done with it** — it holds a live child process and an LLDB
-debugger object open until then.
-
-Commands that resume execution (`continue`, `step_*`, `wait`,
-`decide_fork`, `decide_exec`) block until the process reaches the next
-genuine stop, exits, or hits an interactive fork/exec decision. Anti-debug
-and tracer breakpoint hits are handled and auto-continued transparently —
-you only see "real" stops (your own breakpoints, step completions,
-signals, exceptions).
-
-## Starting a session
-
-```
-./agent.sh start --session <name> [--attach <pid>] <program> [args...]
-```
-
-`--session`, `--attach`, and `--boot-timeout` are global options and **must
-come before the program path** — anything after the program path is passed
-to the target itself. Giving both a program path and `--attach` is
-rejected.
-
-Session names are plain identifiers only (no `/`, no `..`, max 40 chars —
-Unix socket path limit). Omit `--session` for an auto-generated one.
-
-The response includes a `boot` object with the initial console output and
-either an `event: "stop"` (paused at the entry breakpoint, ready to go) or
-`event: "exited"` (rare, means the target exited during startup).
-
-## Sending commands
-
-```
-./agent.sh cmd <session> <command> [--json '{"arg": "value"}'] [--timeout SECONDS]
-```
-
-Every response is one JSON object with `"ok": true|false`. Resuming
-commands additionally include `event` (`stop` / `exited` / `running` /
-`pending_decision` / `terminated`), a `console` field with any buffered
-stdout/stderr collected since the last drain, and a `stop` or `exit`
-object describing what happened.
-
-`--timeout` on a **resume** command bounds how long to wait for the next
-stop — omit it to block indefinitely; if it fires you get `event:
-"running"` and the process is still going (call `wait` to keep waiting, or
-`interrupt` from a separate `agent.sh cmd` to force a stop).
-
-`--timeout` on a **plain** command instead bounds how long the client
-waits for a response at all. Defaults to 60s — enough for the slow ones
-(`memory_search` with `scope: "all"`, `scan_live_strings` on a large
-process, `extract_strings` on a big binary). `--timeout 0` means "fail
-almost immediately," not "wait forever" — omit it entirely for the 60s
-default.
-
-**Every numeric field accepts either a JSON integer or a string** —
-`{"addr": "0x100003f88"}` and `{"addr": 4294983560}` resolve to the same
-address. Hex/octal/binary prefixes (`0x`, `0o`, `0b`) all work. Prefer the
-hex form for addresses; hand-converting to decimal is where transcription
-errors happen.
-
-## Command reference
-
-Lifecycle:
-- `status` — process state, pc, pending decision, tracer state.
-- `restart` — kill and relaunch the same target (not available when attached).
-- `interrupt` — force-stop a running process.
-- `save` — persist breakpoints to `~/.macdbg/<binary>-<sha>/state.json`
-  (also happens automatically on `stop`).
-
-Execution control (all take optional `{"timeout": N}`):
-- `continue`, `step_in` (single instruction), `step_over`, `step_out`,
-  `step_in_source`, `step_over_source`, `wait` (keep waiting without
-  issuing a new resume — use after a `running` timeout).
-- With `analysis_cloak` enabled, `step_in` remains a single instruction and
-  ordinary `step_over` plus non-inlined `step_out` use bounded hardware-only
-  plans. Source-level steps and step-out from an inline frame fail closed before
-  execution. A bounded plan reserves one hardware breakpoint slot until it
-  completes.
-
-Breakpoints:
-- `breakpoint_toggle {"addr": N}` — add if absent, remove if present.
-  Address-only; for symbol-name breakpoints see the "raw idioms" section
-  below.
-- `breakpoint_list {"hide_internal": true}` — internal tracer/defense
-  breakpoints are hidden by default.
-- `breakpoint_enable {"bp_id": N, "enabled": true|false}`
-- `breakpoint_condition {"bp_id": N, "condition": "x0 == 5"}`
-- `breakpoint_commands {"bp_id": N, "commands": ["print $x0"]}`
-- `breakpoint_delete {"bp_id": N}`
-- These all refuse to touch a breakpoint that belongs to a defense or the
-  tracer — otherwise you could silently disarm a defense while
-  `breakpoint_list` kept reporting it as armed. Use
-  `defense_disable`/`tracer_disable` to turn those off properly.
-
-Introspection:
-- `registers` — annotated register dump for the currently selected frame.
-  Each entry is `{"name", "value", "annotation"}` where `value` is a
-  hex-formatted string like `"0x000000010001d078"` (not a raw integer).
-  `annotation` dereferences pointer-shaped values into a string, symbol
-  name, or preview — usually the fastest way to read a
-  just-decoded/decrypted buffer (e.g. after `step_out` of a decoder,
-  check whether the return-value register's `annotation` already shows
-  the plaintext). Auto-selects thread 0 if no thread is currently
-  selected (LLDB clears that in some post-interrupt paths), so you don't
-  need to call `select_thread` first after every interrupt.
-- `backtrace`, `threads`, `modules`, `select_thread {"thread_id": N}`.
-- `disasm {"addr": N, "count": 64}` — both optional; defaults to a window
-  around the current pc. **Clamped to the enclosing function/symbol** (or
-  the `__text` section if nothing else covers `addr`) — never shows
-  adjacent functions even for large `count`. If you want a raw window
-  that ignores function boundaries (e.g. to inspect the byte
-  immediately after a function), use `raw {"command": "disassemble -s
-  ADDR -c N"}` instead.
-
-Memory:
-- `read_memory {"addr": N, "size": N}` — returns `hex` (always) and
-  `ascii` (only when the bytes look printable).
-- `write_memory {"addr": N, "hex": "9090"}` — patches persist in the live
-  process; do not persist across `restart` (the binary is re-mapped).
-- `write_register {"name": "x0", "value": N}`.
-- `set_pc {"addr": N}` — redirect execution by pointing the program counter
-  at `addr` (x64dbg's "Set New Origin Here"); does not run.
-- `memory_search {"needle_hex": "…", "scope": "target"|"all", "max_hits":
-  32, "budget_bytes": N}` — or `"needle_ascii"` instead of `needle_hex`.
-  `scope: "all"` can take tens of seconds; bound with `budget_bytes`
-  and/or a generous `--timeout`.
-
-Strings:
-- `extract_strings {"min_len": 5}` — from the executable's static string
-  sections; works before launch. Returns `{"strings": [{"addr": N,
-  "text": "…"}, …]}`.
-- `scan_live_strings {"min_len": 8, "budget_bytes": N}` — scans live
-  heap/stack memory; needs a running process. Same response shape.
-  Default `budget_bytes` is 512 MiB.
-
-Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
-`anti_csops`, `anti_parent`, `anti_sigtrap`,
-`anti_mach_ports`, `direct_syscall`, `fork_identity`, `exec_sandbox`,
-`analysis_cloak`, `auto_clock`, `anti_timing`):
-- `defense_enable {"name": "…"}` / `defense_disable {"name": "…"}`.
-- `auto_clock` is the automatic timing option. Enable at the initial entry
-  stop; it needs no timing rules or target-specific addresses. It compensates
-  observed debugger pauses at OS clock APIs for main-executable callers and
-  scans main text for supported ARM counter reads. Read
-  [Automatic clocks](references/automatic-clocks.md) before using it for the
-  coverage, deadline, stepping and validation contracts. `clock_status` reports
-  covered APIs/counters, partial coverage, hit counts and errors.
-  Clock calls use discovered Mach-O imports and `dlsym` forwarders rather than
-  breakpoints in shared system clock routines. The forwarder page is process-local
-  and read/execute after construction; `entry_points` reports its API addresses.
-- `anti_timing` enables configured, hardware-backed timing decision rules on
-  ARM64; it does not synthesize clocks or discover checks automatically.
-  Before configuring it, read [Timing rules](references/timing-rules.md) for
-  the register/mask/redirect commands, instruction guards and stepping limits.
-  Enabling with no rules fails; neither `analysis_cloak` nor Enable ALL arms it.
-- `analysis_cloak` is the composite environment, parent, VM/hardware identity,
-  loaded-image, text-integrity, and syscall-202 defense. Enable it at
-  the initial entry stop, before the first resume:
-
-  ```sh
-  ./agent.sh start --session cloak /path/to/binary
-  ./agent.sh cmd cloak defense_enable --json '{"name":"analysis_cloak"}'
-  ./agent.sh cmd cloak status
-  ./agent.sh cmd cloak continue --json '{"timeout":15}'
-  ./agent.sh stop cloak
-  ```
-
-  `status.defenses` reports `analysis_cloak`, `analysis_cloak_safe`, resolved
-  and deferred hook counts, and the exact error when unsafe. Enabling after the
-  target has begun executing is rejected; restart to the entry point first.
-  Opening or attaching to another target clears the previous target's defense
-  state; re-enable the cloak at the new entry stop. Same-target restart keeps
-  the requested cloak mode.
-  A deferred IOKit hook may retain unresolved locations after restart while
-  IOKit is unloaded; these are reported as deferred again. Disabled hooks or
-  unresolved locations after the framework loads still block execution.
-- The cloak removes `DYLD_INSERT_LIBRARIES`, `DYLD_FORCE_FLAT_NAMESPACE`,
-  `DYLD_PRINT_LIBRARIES`, `DYLD_PRINT_INITIALIZERS`, `DYLD_PRINT_BINDINGS`,
-  `DYLD_IMAGE_SUFFIX`, `MallocStackLogging`, `MallocStackLoggingNoCompact`, and
-  `NSZombieEnabled` from both the launch and live target environments, covering
-  `getenv`, `_NSGetEnviron`, and direct `environ` inspection.
-- Parent identity is scrubbed after `sysctl(KERN_PROC)` and `proc_pidpath`:
-  matching debugger/analyzer names become `launchd` or `/sbin/launchd`, while
-  clean results are left alone. Recognized `sysctlbyname` results are
-  deterministic: `kern.hv_vmm_present = 0`, `hw.model = Mac14,6`, and
-  `machdep.cpu.brand_string = Apple M2 Pro`. Successful length-only probes
-  update only the returned size so a subsequent data query can proceed.
-  `kern.hostuuid` is also covered by `sysctlbyname` and shares the IOKit UUID
-  below; its C-string result is 37 bytes including NUL. This is part of
-  `analysis_cloak`, with no separate toggle. Direct numeric-MIB UUID queries
-  and the `gethostuuid()` API are outside this addition's coverage.
-  If the kernel does not expose this key, its `ENOENT` result is preserved.
-  Failed reads inspect the stopped thread's `errno` through debugserver's TSD
-  metadata and memory reads, without calling `__error` inside the target.
-  Missing or unreadable metadata blocks the rewrite; worker threads and restart
-  use their current thread state rather than a cached main-thread address.
-- `IORegistryEntryCreateCFProperty` returns
-  `IOPlatformSerialNumber = C02ZQ0ABC123` and
-  `IOPlatformUUID = 8D4C7A12-3F65-4B90-A2DE-61C8E5079F34` for those two keys.
-  `_dyld_get_image_name` substitutes `/usr/lib/libSystem.B.dylib` for configured
-  instrumentation image names without modifying dyld-owned memory.
-- The cloak reuses `anti_sysctl` for both ordinary KERN_PROC calls and syscall
-  number 202. It does not change clocks. The former fixed-step synthetic clock
-  remains removed. Separate `anti_timing` rules can neutralize verified
-  decisions using clock APIs or direct counters without changing time itself.
-  Arbitrary private or undocumented inspection APIs remain outside scope.
-- It preserves the target's `__TEXT,__text` bytes rather than forging a hash.
-  Temporary cloak and flag-scrubbing return breakpoints remain installed until
-  macdbg dispatches the owning thread's stop, then are deleted explicitly.
-  This preserves stop IDs on LLDB versions that discard them when a one-shot
-  hardware breakpoint deletes itself.
-  A second exception at an immediately retired hardware return site is retried
-  once only when process, thread, PC, instruction bytes, and consecutive stop
-  IDs agree. The retry is logged and does not skip an instruction. Live user
-  breakpoints, concurrent real stops, and unmatched exceptions stay visible.
-  The same one-retry limit covers Darwin's interrupted-continue single-step
-  exception only when a hardware site was armed, the previous action was a
-  free continue, and the thread's PC and instruction have not changed.
-  Every macdbg-managed target-text breakpoint is required to be hardware-backed,
-  target-text patches block resume, and target-text tracer sites require
-  hardware mode. Hardware slots are finite; a bounded step reserves one, and
-  creation/resume fails explicitly instead of falling back to software when the
-  slots run out.
-- `analysis_cloak` and fork-tree tracing are mutually exclusive in v1 because
-  the fork-tree DYLD interposer creates the exact environment variable and
-  loaded image that the cloak must hide. Either enable order is rejected.
-- `anti_sysctl` clears `P_TRACED` from `sysctl(KERN_PROC)` results and
-  `anti_csops` clears `CS_DEBUGGED` from `csops(CS_OPS_STATUS)` results --
-  the two flag-based checks that otherwise see the debugger even with
-  `anti_ptrace` on. Enable them at the entry stop, before your first
-  `continue`, so the check can't run first.
-- `anti_parent` scrubs a debugger `p_comm` (`debugserver`/`lldb`/`gdb`) to
-  `launchd` in `sysctl(KERN_PROC)` results, defeating a parent-name check
-  whether it used `getppid` or read `e_ppid` from its own `kinfo_proc`. It
-  does not hook `getppid`, so legitimate callers get the real value. Shares
-  the sysctl breakpoint with `anti_sysctl`.
-- `anti_sigtrap` forwards a self-planted `brk #0` (EXC_BREAKPOINT that is
-  not one of your breakpoints) to the target's own SIGTRAP handler, the way
-  the kernel would with no debugger. Defeats self-trap checks that install a
-  SIGTRAP handler and execute `brk #0` to see whether the handler runs. It
-  reads the handler via an in-process `sigaction` call, so it needs a live
-  process; off by default. Limits: it only handles `brk`/SIGTRAP (not SIGILL
-  `udf` or Mach-exception-port self-handlers), and delivers the signal
-  without a real `siginfo`/`ucontext`, so a handler that inspects those
-  won't see valid values.
-  System-library traps, nonzero BRK immediates, and traps without a registered
-  handler are surfaced normally; the forwarder does not skip runtime assertions.
-- ptrace / sysctl-P_TRACED / csops-CS_DEBUGGED issued through the libc
-  `syscall()` wrapper (e.g. `syscall(SYS_ptrace, PT_DENY_ATTACH, …)`) are
-  neutralised automatically whenever the corresponding symbol defense is on
-  -- no separate toggle. Not covered: the raw syscall from an inline `svc`
-  in the sample's own code (only ptrace is svc-scanned), or the self-attach
-  ptrace trick.
-- All defenses now apply whether you `continue` past the checked call or
-  single-step *through* it; stepping no longer bypasses a defense.
-
-Fork/exec interactive decisions — by default these auto-resolve
-(identity/sandbox mode blocks/fakes the call and keeps going); set
-interactive mode first to inspect:
-- `exec_sandbox` also gates in-process OSA execution, including `OSAExecute`
-  and combined load/compile-and-execute APIs. Read
-  [Process and OSA execution interception](references/exec-sandbox.md) for
-  exact coverage, empty-result Fake semantics, captured OSA payload dumps, and
-  stepping/thread ownership. Enable **Prompt on execution** in the GUI, or
-  `exec_mode {"interactive":true}` headlessly, to get decisions rather than
-  automatic blocking. This is not a general containment sandbox.
-- `fork_mode {"interactive": true}`, `exec_mode {"interactive": true}`.
-- When interactive, a resume can come back with `event:
-  "pending_decision"` and a `decision` object (`kind: "fork"|"exec"`, plus
-  `symbol`/`command`).
-- `decide_fork {"decision": "parent"|"child"}` — resume as your choice;
-  bad strings are rejected rather than silently defaulting.
-- `decide_exec {"decision": "block"|"fake"|"allow"}` — block returns -1,
-  fake returns 0 without running, allow actually executes. Same
-  rejection rule.
-- `dump_exec` — while an exec decision is pending, write the full
-  command/argv or captured OSA input bytes to a dump file and return its path.
-  OSA responses also include `content_path` for readable source or static
-  reconstruction when available. The GUI shows this content before metadata.
-  Compiled reconstructions are approximate; preserve the raw `.scpt` artifact.
-  For OSA, enable the sandbox before descriptor creation/loading. Missing
-  capture is an explicit error; metadata is never substituted for script bytes.
-- Oversized commands/argv are dumped automatically. The on-screen preview may
-  be shortened, while disk dumps retain all data macdbg successfully captured.
-  Capture is bounded to 1 MiB per C string and 8,192 argv entries; an unreadable
-  string is captured as empty. A dump is therefore the full captured data, not
-  a guarantee that an unbounded target command or argv was recovered.
-- While a decision is pending, `continue`/`step_*` are refused — resuming
-  directly would bypass the shield.
-
-Tracing (libSystem/network/file call tracer, separate from breakpoints):
-- `tracer_enable {"hardware": false}`, `tracer_disable`,
-  `tracer_depth {"depth": 5}`.
-- Only captures calls made **after** it's enabled — nothing retroactive.
-  Enable it at the initial entry stop (before your first `continue`) if
-  you want the full call history from process start.
-- `trace_hits {"since": 0}` — poll accumulated hits newer than hit number
-  `since`. Each hit is `{"n": int, "category": "FILE"|"NET"|"PROC",
-  "call": "human-readable"}`.
-
-Escape hatch:
-- `raw {"command": "…"}` — run any literal lldb command through the
-  command interpreter; returns `output`/`error_output`. This is powerful
-  and unrestricted — it can delete internal defense/tracer breakpoints
-  the structured commands would refuse to touch, create software breakpoints,
-  or patch target text. Those actions can invalidate `analysis_cloak` integrity
-  guarantees. Do not use it to touch
-  a breakpoint id you got from `breakpoint_list {"hide_internal":
-  false}`. See "raw idioms" below for what to reach for.
-
-## Raw idioms you'll actually use
-
-Most reversing work on a Cocoa binary funnels through `raw` for the
-things LLDB does well and macdbg doesn't wrap. The workflows I hit
-constantly:
-
-**Address → function name.** By far the most common one — every time you
-see an address in a register or a xref and want to know what it is:
-```
-raw {"command": "image lookup -a 0x100004a20"}
-```
-
-**Symbol → address (exact name):**
-```
-raw {"command": "image lookup -n \"-[NSApplication run]\""}
-```
-
-**Symbol → address (regex, useful when you don't know the exact selector):**
-```
-raw {"command": "image lookup -r -n \"delegate\""}
-```
-
-**Break by symbol name** (the structured `breakpoint_toggle` is
-address-only):
-```
-raw {"command": "breakpoint set -n \"-[MyController doSomething:]\""}
-```
-The response's `output` includes the breakpoint id and the resolved
-address — read them back if you want to manage the breakpoint later.
-
-**Break on every call to an Objective-C selector.** On arm64 the compiler
-emits per-selector `objc_msgSend$foo` stubs; setting a breakpoint on that
-stub fires every time anyone calls `[obj foo]`. Discover them with
-`nm -a <binary> | grep 'objc_msgSend\$'`.
-```
-raw {"command": "breakpoint set -n \"objc_msgSend$description\""}
-```
-
-**Call an Objective-C method at runtime** (invaluable for
-reverse-engineering — poke at any Cocoa object without patching, or drive
-a decode routine with test input):
-```
-raw {"command": "expression -l objc -O -- [NSApp delegate]"}
-raw {"command": "expression -l objc -O -- [(id)0x12345 description]"}
-```
-`-l objc` selects the ObjC parser; `-O` prints via `-description` instead
-of dumping the raw struct. Watch out for two footguns: LLDB prints a
-`BOOL` return as `<nil>` when it's 0 (wrap in `[NSNumber
-numberWithBool:…]` for a clean value), and reading private ivars with
-`(Type *)ptr->_ivar` fails on stripped binaries (`does not have a member
-named` errors) — fall back to KVC with `[obj valueForKey:@"foo"]` or, if
-KVC's own accessor bailout throws, read the ivar offset from
-`_OBJC_IVAR_$_Class._ivar` (via `nm`) and add it to the object pointer
-manually.
-
-**Word-formatted memory dump** (nicer than `read_memory`'s raw hex when
-you're looking at instructions or pointer tables):
-```
-raw {"command": "memory read -f x -c 4 0x100003f88"}
-```
-`-f x` = hex words, `-c 4` = four words. For string content, use
-`-f s`; for byte-oriented dumps, `read_memory` is fine.
-
-**Disassemble past the auto-clamp** — `disasm` refuses addresses outside
-the enclosing function, which is usually right but occasionally not:
-```
-raw {"command": "disassemble -s 0x100003f88 -c 8"}
-```
-
-**Look up what module and section an address belongs to** (useful when
-you don't yet know if an address is in `__text`, a stub, or a data
-section):
-```
-raw {"command": "image lookup --verbose --address 0x1000a4210"}
-```
-
-## Verify analysis cloak
-
-Run the public contracts, rebuild every ARM64 fixture, run the real
-`agent.sh`/LLDB integration suite, then check for leftover sessions:
+## Start and inspect
 
 ```sh
-python3 -m unittest -v tests.test_anti_analysis_policy tests.test_analysis_cloak_surfaces
-make -C tests/integration clean all
-/usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak
-/usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak.AnalysisCloakIntegrationTests.test_combined_checks_recover_exact_chacha20_payload
+./agent.sh list
+./agent.sh start --session inspect /path/to/program arg1
+./agent.sh cmd inspect status
+./agent.sh cmd inspect registers
+./agent.sh cmd inspect disasm --json '{"count":32}'
+```
+
+`list` returns an array of session records; use `alive` to distinguish live
+sessions from old records. `logs` prints plain text. Other commands return JSON objects.
+Choose an unused session name. Start returns `session`, daemon `pid`, and `boot`;
+check `ok` and `boot.event` before proceeding. A normal launch stops at entry.
+For an existing process, use `start --session inspect --attach 1234` without a
+program path. Put `--session`, `--attach`, and `--boot-timeout` before the program;
+anything after its path is a target argument. Use short session names made from
+letters, digits, `_`, and `-`, starting with a letter (maximum 40 characters).
+
+## Configure before continuing
+
+Enable only the defenses needed for the task. These examples require the initial
+entry stop; attach sessions cannot enable entry-only modes.
+
+```sh
+./agent.sh cmd inspect defense_enable --json '{"name":"analysis_cloak"}'
+./agent.sh cmd inspect defense_enable --json '{"name":"auto_clock"}'
+./agent.sh cmd inspect status
+./agent.sh cmd inspect clock_status
+```
+
+Check each command's `ok`, then `defenses.analysis_cloak_safe` and
+`clock_status.safe`. A safe clock hook does not mean every counter is covered;
+also inspect `counter_coverage_complete` and `coverage_notes`.
+
+Read the relevant reference before using its mode:
+
+- [Defenses](references/defenses.md): choose toggles, check readiness, handle integrity errors.
+- [Automatic clocks](references/automatic-clocks.md): compensate pauses without locating a timing check.
+- [Timing rules](references/timing-rules.md): change a register or branch at a verified decision site.
+- [Exec and scripts](references/exec-sandbox.md): stop before execution, inspect and dump content, decide what runs.
+- [Commands](references/commands.md): arguments, return fields, tracing and raw LLDB examples.
+
+## Run, read the result, then choose the next action
+
+```sh
+./agent.sh cmd inspect continue --timeout 15
+```
+
+| Response | Next action |
+| --- | --- |
+| `ok:false` | Read `error` or `message`; do not assume the requested change happened. |
+| `event:stop` | Inspect `stop` for reason/PC/thread. Some interrupt responses contain only text; use `status` and `backtrace` to get the current context. |
+| `event:running` | The target is still executing. Use `wait --timeout 15`, or `interrupt` to stop it. Do not issue another continue. |
+| `event:pending_decision` | Read `decision.kind`, `symbol`, and `command`; use `decide_exec` or `decide_fork`. Continue/step will be refused. |
+| `event:exited` | Read `exit.code` and `console`; the daemon remains alive until stopped. |
+| `event:terminated` | Read `lldb_state` and `console`; the process crashed, detached, or became invalid. |
+
+`status` reports `process_state`, `pc`, `pending_decision`, and `defenses`.
+It does not resume execution. To pause a running target:
+
+```sh
+./agent.sh cmd inspect interrupt
+./agent.sh cmd inspect wait --timeout 15
+./agent.sh cmd inspect status
+./agent.sh cmd inspect registers
+./agent.sh cmd inspect backtrace
+```
+
+After a timed resume has returned, `wait` consumes the interrupt's stop event;
+polling status alone can leave LLDB reporting stale running state. If a resume
+call is still in flight in another client, let that call return the stop instead
+of sending a second wait. Handle the returned event: the target can exit before
+the interrupt arrives. Check `process_state` before inspecting frames.
+
+On resume commands, `--timeout` bounds the wait for a stop, not execution time.
+Omitting it waits indefinitely. On other commands it bounds only the client's
+response wait (60 seconds by default); a timed-out memory scan can still occupy
+the daemon. Prefer bounded scans. See [Commands](references/commands.md).
+
+The daemon accepts `status` and `interrupt` from a second client during a resume
+wait. Other concurrent commands return `session busy`. During a slow ordinary
+command, even status/interrupt can queue. Do not resend a timed-out mutation
+without checking whether it already took effect.
+
+## Finish or hand off
+
+```sh
+./agent.sh cmd inspect save
+./agent.sh stop inspect
 ./agent.sh list
 ```
 
-The focused test asserts the known synthetic fixture plaintext
-`macdbg analysis cloak recovered this payload` and repeats recovery after a
-restart. `agent.sh list` may include historical dead records, but it must not
-show a live test session.
+Stop sessions you created when finished, unless the user wants one left open.
+For a handoff, report the session, process state, stop location, enabled defenses,
+and dump paths. `stop` saves state and kills a launched target or detaches from
+an attached one. `restart` kills/relaunches the same target, clears pending
+choices, and preserves requested defenses; it is unavailable for attach sessions.
+New sessions start with defenses off. Use status to check what survived a restart.
 
-## Session management
-
-- `agent.sh status <session>` / `agent.sh interrupt <session>` — shorthands
-  for the same JSON commands.
-- `agent.sh list` — every known session, alive or not.
-- `agent.sh logs <session> [-n N]` — the daemon's own stderr/stdout, for
-  diagnosing a session that failed to start or crashed.
-- `agent.sh stop <session>` — saves breakpoint state, detaches or kills
-  the target, tears down the daemon. **Always do this when finished** —
-  don't just abandon a session.
-
-## Example: bypass PT_DENY_ATTACH and confirm
-
-```
-./agent.sh start --session s1 ./test/denyatt
-./agent.sh cmd s1 defense_enable --json '{"name": "anti_ptrace"}'
-./agent.sh cmd s1 continue --json '{"timeout": 10}'
-./agent.sh stop s1
-```
-
-## Concurrency
-
-The daemon's accept loop is single-threaded. During a **resume** command
-(`continue`/`step_*`/`wait`/`decide_*`), the daemon polls the socket
-between stops, so `status`/`interrupt`/`quit` sent from a *separate*
-`agent.sh cmd` invocation get answered promptly. Any other command sent
-during that window gets `{"error": "session busy"}` — retry when the
-in-flight command returns.
-
-During a **slow plain** command (a `scope: "all"` memory search, a big
-`scan_live_strings`, a long-running `raw`), the accept loop is fully
-blocked until it returns — even `status` and `interrupt` will queue and
-may hit the client's 60s default timeout. Bound such calls with
-`budget_bytes` and/or a larger `--timeout`.
-
-You can't interrupt a `continue` down the same blocked call — the
-interrupt must come from a fresh connection. If a target might genuinely
-loop forever, launch the resume with a `timeout` and send `interrupt`
-from a second `agent.sh cmd` if it doesn't come back.
-
-One daemon per target: don't juggle multiple targets in a single session,
-start a new named session per binary.
+For startup/connection failures use `./agent.sh logs inspect -n 80` and `list`.
+If using `MACDBG_STATE_DIR`, keep it absolute and short (for example `/tmp/md-run`)
+and set the same value on every call; macOS Unix-socket paths are limited.
