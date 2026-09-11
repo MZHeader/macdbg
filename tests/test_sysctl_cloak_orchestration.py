@@ -54,7 +54,13 @@ class FakeProcess:
 
 
 class FakeDebugger:
+    script_exec = types.SimpleNamespace(find_hit=lambda: None, breakpoint_ids=lambda: set(),
+        payloads=types.SimpleNamespace(apply_stop=lambda: False, hidden_ids=lambda: set()))
     def __init__(self):
+        from macdbg.core.timing import TimingDefense
+        from macdbg.core.auto_clock import AutomaticClock
+        self.timing = TimingDefense(self)
+        self.auto_clock = AutomaticClock(self)
         self.process = FakeProcess()
         self.analysis_cloak = FakeCloak()
         self.exec_bp_ids = {}
@@ -142,6 +148,10 @@ class GuiStopEventTests(unittest.TestCase):
     def test_raw_relaunch_forgets_stop_identity_even_when_command_fails(self):
         engine = Engine.__new__(Engine)
         engine.dbg = mock.Mock()
+        engine.dbg.script_exec.payloads.apply_stop.return_value = False
+        engine.dbg.script_exec.payloads.hidden_ids.return_value = set()
+        engine.dbg.script_exec.find_hit.return_value = None
+        engine.dbg.script_exec.breakpoint_ids.return_value = set()
         engine.dbg.process = None
         engine.dbg.handle_command.return_value = (False, "", "launch failed")
         engine.dbg.ensure_listening.return_value = False
@@ -157,6 +167,10 @@ class GuiStopEventTests(unittest.TestCase):
         engine.attach_pid = None
         engine.program_args = []
         engine.dbg = mock.Mock()
+        engine.dbg.script_exec.payloads.apply_stop.return_value = False
+        engine.dbg.script_exec.payloads.hidden_ids.return_value = set()
+        engine.dbg.script_exec.find_hit.return_value = None
+        engine.dbg.script_exec.breakpoint_ids.return_value = set()
         engine.dbg.target.IsValid.return_value = True
         engine.dbg.process = None
         engine.dbg.launch.side_effect = RuntimeError("launch failed")
@@ -196,8 +210,16 @@ class GuiStopEventTests(unittest.TestCase):
         process.GetStopID.return_value = 42
 
         debugger = mock.Mock()
+        debugger.script_exec.payloads.apply_stop.return_value = False
+        debugger.script_exec.payloads.hidden_ids.return_value = set()
+        debugger.script_exec.find_hit.return_value = None
+        debugger.script_exec.breakpoint_ids.return_value = set()
+        debugger._retired_hardware_return = None
+        debugger._hardware_continue = None
         debugger.process = process
         debugger.analysis_cloak.validate_integrity.return_value = (True, "ok")
+        debugger.timing.apply_stop.return_value = ([], False)
+        debugger.auto_clock.apply_stop.return_value = False
         debugger.in_user_step.return_value = False
         debugger.in_fork_shield.return_value = False
 
@@ -224,6 +246,56 @@ class GuiStopEventTests(unittest.TestCase):
         engine._console.assert_not_called()
         engine._emit_state.assert_not_called()
         self.assertFalse(engine._resuming)
+
+
+class AgentStopDeliveryTests(unittest.TestCase):
+    def test_duplicate_stop_resumes_once_and_new_stop_is_still_handled(self):
+        process = mock.Mock()
+        process.IsValid.return_value = True
+        current = [5, 1]
+        process.GetState.side_effect = lambda: current[0]
+        process.GetStopID.side_effect = lambda: current[1]
+        process.GetProcessID.return_value = 2079
+        events = iter([(5, 1), (5, 1), (5, 2), (10, 3)])
+        def wait(_timeout, event):
+            current[:] = next(events)
+            event.state = current[0]
+            event.GetType = lambda: 1
+            return True
+        debugger = mock.Mock()
+        debugger.script_exec.payloads.apply_stop.return_value = False
+        debugger.script_exec.payloads.hidden_ids.return_value = set()
+        debugger.script_exec.find_hit.return_value = None
+        debugger.script_exec.breakpoint_ids.return_value = set()
+        debugger._retired_hardware_return = None
+        debugger._hardware_continue = None
+        debugger.process = process
+        debugger.listener.WaitForEvent.side_effect = wait
+        debugger.analysis_cloak.validate_integrity.return_value = (True, '')
+        debugger.auto_clock.apply_stop.return_value = True
+        debugger.timing.apply_stop.return_value = ([], False)
+        debugger.in_user_step.return_value = False
+        session = AgentSession.__new__(AgentSession)
+        session.dbg = debugger
+        session.tracer = types.SimpleNamespace(hardware_bp_ids=set())
+        session._drain_lldb_pipe = mock.Mock()
+        session._drain_console = lambda: ''
+        session._describe_exit = lambda: {'code': 0}
+        fake = types.SimpleNamespace(
+            eStateInvalid=0, eStateStopped=5, eStateRunning=6,
+            eStateCrashed=8, eStateDetached=9, eStateExited=10,
+            SBEvent=types.SimpleNamespace,
+            SBProcess=types.SimpleNamespace(
+                eBroadcastBitStateChanged=1, eBroadcastBitSTDOUT=2,
+                eBroadcastBitSTDERR=4,
+                EventIsProcessEvent=lambda _event: True,
+                GetStateFromEvent=lambda event: event.state,
+                GetRestartedFromEvent=lambda _event: False))
+        with mock.patch.dict(AgentSession._pump.__globals__, {'lldb': fake}):
+            result = session._pump()
+        self.assertEqual(result['event'], 'exited')
+        self.assertEqual(debugger.cont.call_count, 2)
+        self.assertEqual(debugger.auto_clock.apply_stop.call_count, 2)
 
 
 if __name__ == "__main__":

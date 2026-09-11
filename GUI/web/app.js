@@ -89,10 +89,9 @@
     if (st.has_process) kind = st.running ? 'running' : 'paused';
     if (st.has_process && !st.pc && !st.running) kind = 'paused';
     setStatus(kind, st.pc, st.modules);
-    // `meta` fires once before the webview connects; recover the target name
-    // from the main module for subscribers that missed it.
+    // Snapshots identify the live target, including after Open/Attach changes.
     const mt = $('#menu-target');
-    if ((mt.textContent === '—' || !mt.textContent) && st.modules && st.modules.length)
+    if (st.modules && st.modules.length)
       mt.textContent = String(st.modules[0][0] || '').split('/').pop() || '—';
     if (defensesOpen) rebuildDefenses();
   }
@@ -816,10 +815,12 @@
   let defensesOpen = false;
   const DEF_SECTIONS = [
     ['Recommended', [
-      ['analysis_cloak', 'Analysis cloak', 'environment · parent · VM/hardware · images · text integrity']
+      ['analysis_cloak', 'Analysis cloak', 'environment · parent · VM/hardware · images · text integrity'],
+      ['auto_clock', 'Hide debugger pauses', 'automatic OS clocks and ARM counters · enable at entry']
     ]],
     ['Advanced / individual defenses', [
       ['all_anti', 'Enable ALL anti-debug bypasses', 'ptrace · sysctl · csops · mach · parent · sigtrap · direct-syscall'],
+      ['anti_timing', 'Timing rules', 'configured decisions only · hardware breakpoints · ARM64'],
       ['deny_attach', 'Defeat PT_DENY_ATTACH', 'libc ptrace hook + inline svc #0x80 scan'],
       ['mach', 'Cloak Mach exception ports', 'report none — look unattached'],
       ['flag_scrubs', 'Scrub debugger flags', 'P_TRACED (sysctl) + CS_DEBUGGED (csops)'],
@@ -836,8 +837,8 @@
       ['fork_trace', 'Trace the whole fork tree', 'DYLD interpose — relaunches the target']
     ]],
     ['Exec', [
-      ['exec_sandbox', 'Sandbox exec/spawn', 'intercept system/popen/exec/posix_spawn'],
-      ['exec_interactive', 'Prompt on each exec', 'Allow / Fake / Block / Dump']
+      ['exec_sandbox', 'Sandbox exec & scripts', 'process launches + AppleScript / OSA execution'],
+      ['exec_interactive', 'Prompt on execution', 'Allow / Fake / Block / Dump']
     ]]
   ];
   function openDefenses() {
@@ -846,6 +847,9 @@
     m.innerHTML = '<div class="m-head">Defenses <span class="m-sub">anti-anti-debug bypasses — click to toggle</span></div>';
     const body = el('div', 'm-body'); body.id = 'def-body'; m.appendChild(body);
     const foot = el('div', 'm-foot'); const close = el('button', 'btn', 'Close');
+    const timing = el('button', 'btn', 'Configure timing rules');
+    timing.onclick = () => { defensesOpen = false; openTimingRules(); };
+    foot.appendChild(timing);
     close.onclick = () => { defensesOpen = false; closeModal(); }; foot.appendChild(close); m.appendChild(foot);
     openModal(m, e => { if (e.key === 'Escape') { defensesOpen = false; closeModal(); } });
     rebuildDefenses();
@@ -858,8 +862,22 @@
       html += `<div class="toggle-section">${esc(title)}</div><div class="toggle-list">`;
       for (const [key, label, sub] of rows) {
         const on = !!st[key];
-        const unsafe = key === 'analysis_cloak' && on && st.analysis_cloak_safe === false;
+        const unsafe = on && ((key === 'analysis_cloak' && st.analysis_cloak_safe === false)
+          || (key === 'auto_clock' && (st.auto_clock_safe === false
+            || (st.auto_clock_status || {}).counter_coverage_complete === false))
+          || (key === 'anti_timing' && st.anti_timing_safe === false));
         let detail = sub;
+        if (key === 'auto_clock') {
+          const clock = st.auto_clock_status || {};
+          detail = clock.error || (on ? 'main executable · ' + (clock.apis || []).length + ' APIs · '
+            + (clock.counter_armed || 0) + '/' + (clock.counter_sites || 0) + ' counters · '
+            + ((clock.paused_ns || 0) / 1e9).toFixed(2) + 's paused'
+            + ((clock.coverage_notes || []).length ? ' · partial coverage: ' + clock.coverage_notes.join('; ') : '') : sub);
+        }
+        if (key === 'anti_timing') {
+          detail = st.anti_timing_error || ((st.timing_rules || []).length + ' configured · '
+            + Object.values(st.timing_hits || {}).reduce((a, b) => a + b, 0) + ' hits');
+        }
         if (key === 'analysis_cloak' && on) {
           detail = unsafe
             ? 'unsafe · ' + (st.analysis_cloak_error || 'integrity validation failed')
@@ -881,20 +899,77 @@
   }
 
   // ---- exec / fork decision dialogs (from `prompt` events) -----------------
+  function openTimingRules() {
+    const st = (lastState && lastState.trace_status && lastState.trace_status.defenses) || {};
+    const m = el('div', 'modal');
+    m.innerHTML = '<div class="m-head">Timing rules</div>';
+    const body = el('div', 'm-body');
+    body.appendChild(el('p', 'm-hint', 'Use a verified timing decision in the main executable. Disable Timing rules before editing. Addresses are current load addresses; rules save relative offsets.'));
+    for (const rule of st.timing_rules || []) {
+      const row = el('div', 'm-hint');
+      row.appendChild(el('span', 'mono', esc(rule.name + ' · +' + hx(rule.offset) + ' · '
+        + (rule.register ? rule.register + ' = ' + rule.value + ' · mask ' + rule.mask
+          : 'redirect +' + hx(rule.redirect_offset)))));
+      const remove = el('button', 'btn', 'Remove'); remove.disabled = !!st.anti_timing;
+      remove.onclick = () => { cmd('timing_rule_remove', { name: rule.name }); openDefenses(); };
+      row.appendChild(remove); body.appendChild(row);
+    }
+    const fields = {};
+    for (const [key, label, value] of [
+      ['name', 'Rule name', 'timing-result'],
+      ['addr', 'Instruction address', selDisasm == null ? '' : hx(selDisasm)],
+      ['register', 'Register (x0–x30 or w0–w30)', 'w0'],
+      ['value', 'Value', '0'],
+      ['mask', 'Bit mask (optional; other bits are preserved)', ''],
+      ['redirect', 'Redirect address (optional; replaces register action)', '']
+    ]) {
+      const input = el('input', 'm-input'); input.type = 'text'; input.value = value;
+      input.disabled = !!st.anti_timing; input.setAttribute('aria-label', label);
+      body.appendChild(el('label', 'm-hint', label)); body.appendChild(input); fields[key] = input;
+    }
+    m.appendChild(body);
+    const foot = el('div', 'm-foot');
+    const back = el('button', 'btn', 'Back'); back.onclick = openDefenses;
+    const add = el('button', 'btn', 'Add rule'); add.disabled = !!st.anti_timing;
+    add.onclick = () => {
+      const args = { name: fields.name.value.trim(), addr: fields.addr.value.trim() };
+      if (fields.redirect.value.trim()) args.redirect = fields.redirect.value.trim();
+      else {
+        args.register = fields.register.value.trim(); args.value = fields.value.value.trim();
+        if (fields.mask.value.trim()) args.mask = fields.mask.value.trim();
+      }
+      cmd('timing_rule_add', args); openDefenses();
+    };
+    foot.appendChild(back); foot.appendChild(add); m.appendChild(foot);
+    openModal(m, e => { if (e.key === 'Escape') openDefenses(); });
+  }
+
   function onPrompt(m) {
     if (m.kind === 'exec') {
-      const dlg = el('div', 'modal');
-      dlg.innerHTML = `<div class="m-head">exec intercepted <span class="m-sub">${esc(m.name)}</span></div>`
-        + `<div class="m-body"><div class="mono" style="white-space:pre-wrap;word-break:break-word">${esc(m.cmd || '')}</div>`
+      const osa = /^OSA/.test(m.name || '');
+      const dlg = el('div', osa ? 'modal modal-script' : 'modal');
+      const content = m.script_content;
+      const saved = m.raw_path
+        ? (m.content_path ? `<div class="m-hint">Readable content: <span class="mono">${esc(m.content_path)}</span></div>` : '')
+          + `<div class="m-hint">Original bytes (${m.raw_bytes}): <span class="mono">${esc(m.raw_path)}</span></div>`
+          + (m.content_error ? `<div class="m-hint c-red">${esc(m.content_error)}</div>` : '')
+        : (m.dump_result ? `<div class="m-hint">${esc(m.dump_result)}</div>` : '');
+      dlg.innerHTML = `<div class="m-head">${osa ? 'AppleScript / OSA execution intercepted' : 'exec intercepted'} <span class="m-sub">${esc(m.name)}</span></div>`
+        + `<div class="m-body">${saved}`
+        + (m.dump_error ? `<div class="m-hint c-red">${esc(m.dump_error)}</div>` : '')
+        + (content ? `<div class="m-hint">${esc(content.note)}</div>` : '')
+        + `<pre class="mono script-content" style="white-space:pre-wrap;word-break:break-word">${esc(content ? content.text : (m.cmd || ''))}</pre>`
+        + (content && content.truncated ? '<div class="m-hint">Preview truncated. Dump saves the full recovered text.</div>' : '')
+        + (m.metadata ? `<details class="m-hint"><summary>Capture details</summary><pre class="mono" style="white-space:pre-wrap">${esc(JSON.stringify(m.metadata, null, 2))}</pre></details>` : '')
         + (m.caller ? `<div class="m-hint">caller @ ${hx(m.caller)}</div>` : '') + '</div>';
       const foot = el('div', 'm-foot');
-      const mk = (lbl, dec, cls) => { const b = el('button', 'btn ' + (cls || ''), lbl); b.onclick = () => { cmd('decide_exec', { decision: dec }); if (dec !== 'dump') closeModal(); }; return b; };
+      const mk = (lbl, dec, cls) => { const b = el('button', 'btn ' + (cls || ''), lbl); b.onclick = () => { cmd('decide_exec', { decision: dec, token: m.token }); if (dec !== 'dump') closeModal(); }; return b; };
       foot.appendChild(mk('Block', 'block', 'danger'));
-      foot.appendChild(mk('Dump payload', 'dump'));
-      foot.appendChild(mk('Fake success', 'fake'));
+      foot.appendChild(mk(osa ? 'Dump content + raw' : 'Dump payload', 'dump'));
+      foot.appendChild(mk(osa ? 'Fake success (empty result)' : 'Fake success', 'fake'));
       foot.appendChild(mk('Allow (run)', 'allow', 'primary'));
       dlg.appendChild(foot);
-      openModal(dlg, e => { if (e.key === 'Escape') { cmd('decide_exec', { decision: 'block' }); closeModal(); } });
+      openModal(dlg, e => { if (e.key === 'Escape') { cmd('decide_exec', { decision: 'block', token: m.token }); closeModal(); } });
     } else if (m.kind === 'fork') {
       const dlg = el('div', 'modal');
       dlg.innerHTML = `<div class="m-head">fork intercepted <span class="m-sub">${esc(m.name)}</span></div>`

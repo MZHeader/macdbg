@@ -89,7 +89,10 @@ The composite defense covers these analysis signals:
   a suspicious full path becomes `/sbin/launchd`. Unrelated paths pass through.
 * It virtualizes recognized `sysctlbyname` queries with deterministic results:
   `kern.hv_vmm_present = 0`, `hw.model = Mac14,6`, and
-  `machdep.cpu.brand_string = Apple M2 Pro`. Successful length-only probes
+  `machdep.cpu.brand_string = Apple M2 Pro`. `kern.hostuuid` returns the same
+  UUID as the IOKit profile below (37 bytes including its terminating NUL).
+  Unsupported-query errors, including `ENOENT`, remain unchanged.
+  Successful length-only probes
   publish the spoofed size for the caller's subsequent data query.
 * It replaces the two recognized `IORegistryEntryCreateCFProperty` results with
   `IOPlatformSerialNumber = C02ZQ0ABC123` and
@@ -114,21 +117,163 @@ stepping instead. The headless `raw` command remains an unrestricted LLDB
 escape hatch and can create software breakpoints, patch text, or delete
 internal defenses, so it can invalidate the cloak's guarantees.
 
-Timing checks are not currently cloaked. The former fixed-step synthetic clock
-was removed because it was directly fingerprintable and changed normal
-monotonic-clock semantics. Direct `mrs cntvct_el0` reads, clock APIs, and
-arbitrary private or undocumented inspection APIs remain outside the current
-scope. The cloak is also deliberately incompatible with **Trace the whole fork
+Timing checks have a separate **Hide debugger pauses** automatic mode and
+advanced **Timing rules**, described below. The analysis cloak does not enable
+either mode or change clock values. The former
+fixed-step synthetic clock remains removed because it was fingerprintable and
+changed normal monotonic-clock semantics. Arbitrary private or undocumented
+inspection APIs remain outside the current scope.
+The cloak is also deliberately incompatible with **Trace the whole fork
 tree**: fork-tree tracing injects a DYLD interposer, which would itself trip the
 environment and loaded-image checks. Enabling either feature while the other is
 active is rejected.
 
-This intentionally removes the headless `anti_timing` command and its status
-field as well as the GUI toggle; clients should treat those interfaces as no
-longer available.
+**Hide debugger pauses (ARM64)** is the automatic option. Enable it at the
+initial entry stop from Defenses, or use the headless API:
 
-Exec interception is unchanged. Interactive calls still offer **Allow**,
-**Fake success**, **Block**, or **Dump**. The UI preview may be shortened, while
+```sh
+./agent.sh cmd SESSION defense_enable --json '{"name":"auto_clock"}'
+./agent.sh cmd SESSION clock_status
+```
+
+No timing-rule addresses, thresholds, registers or decoded symbol names are
+needed. macdbg resolves the OS implementations of `mach_absolute_time`,
+`mach_continuous_time`, `clock_gettime`, and `gettimeofday` itself. Calls from
+the main executable receive the corresponding host clock value minus observed
+debugger-stop time, with the appropriate tick/nanosecond conversion. Normal
+execution and deliberate program sleeps still advance time. Monotonic results
+are kept nondecreasing; there is no fixed increment per read.
+
+The same toggle scans up to 4 MiB of the main executable's current text for
+`mrs ..., cntvct_el0` and `cntpct_el0`. Recognized reads use hardware
+breakpoints and a host-only counter reader, which is compiled into the state
+directory on first use and never injected into the target. If hardware slots
+cannot cover the counter sites while reserving a step slot, API compensation
+stays available and the UI/status explicitly reports partial counter coverage.
+The executable's Mach-O clock imports and successful `dlsym` clock lookups
+are routed through small process-local forwarders. Their page is written first,
+then protected read/execute; clock arithmetic stays in the debugger. Software
+breakpoints live on these forwarders, leaving system clock routines and main
+`__text` unchanged. Use Analysis cloak alongside this mode for broader
+target-text protection.
+
+The pause budget is shared by all threads and updated across continue,
+instruction stepping and internal defense/tracer stops. GUI event observation
+timestamps include time spent waiting in its event queue. Clock calls from
+outside the main executable, unsupported clock IDs (including CPU clocks),
+and invalid output buffers run through the original API. Successful clock
+buffer writes are not recorded as code/data patches.
+
+`mach_wait_until` deadlines supplied by the main executable are interpreted
+as virtual Mach deadlines and translated back to real time at API entry.
+This preserves ordinary waits derived from the compensated clock. Pausing
+again during an already-running kernel wait is not virtualized; neither are
+other absolute-deadline APIs or deadlines obtained from external clock sources.
+Framework-internal clocks and scheduling remain on real time.
+
+`clock_status` reports enabled/safe/error, API names, per-source hit counts,
+passthrough count, forwarder `entry_points`, `import_bindings`,
+`dynamic_resolutions`, observed paused nanoseconds, and counter scan/coverage
+details. `safe` describes hook readiness, not universal timing coverage.
+Deleted/modified hooks, bindings, forwarders or counter instructions block resume. An enabled
+mode rearms on same-target restart; new sessions/targets start disabled.
+Automatic clocks and manual timing rules are mutually exclusive. Instruction
+stepping treats intercepted clock operations atomically; source-level stepping
+is refused. Disable with `defense_disable {"name":"auto_clock"}` and restart
+before enabling again or comparing timestamps across the mode change. Original
+owned import slots are restored on disable, while cached forwarder pointers
+remain callable until process exit. Use reported `entry_points` to break on
+virtualized calls; the original system entries only see unredirected calls.
+
+Limitations: Python/LLDB event timestamps cannot remove all debugserver and
+scheduling overhead, so extremely tight checks may still detect it. Accounting
+uses the host's monotonic clock and preserves the clocks' different system-sleep
+semantics. Other modules' clock callers, newly generated code, unrecognized
+counter instructions, pointers cached before activation, unsupported import
+layouts/resolution APIs, external timestamps and watchdogs are outside coverage.
+The raw LLDB escape hatch and target-side expressions can bypass the normal
+execution/accounting contract.
+
+**Timing rules (ARM64)** neutralize analyst-verified timing decisions using
+hardware breakpoints. Configure rules in **Defenses → Configure timing rules**,
+then enable the **Timing rules** toggle. The selected disassembly instruction
+prefills the address. Each rule either replaces an `x0`–`x30` / `w0`–`w30`
+register, replaces selected bits with a mask, or redirects execution to another
+instruction in the main executable. A W-register action zero-extends into X.
+For a mask, the update is `(old & ~mask) | value`; the value may contain only
+masked bits.
+
+The same mechanism can neutralize decisions based on Mach clocks,
+`clock_gettime`, `gettimeofday`, or direct counter reads, including decisions
+that corrupt a key rather than branch to failure. **These are explicit rules,
+not automatic timing-check discovery or global clock virtualization.** Timing
+rules do not change sleeps or deadlines, and they do not automatically handle
+checks in other modules, newly generated code, watchdogs, or external clocks.
+Verify the decision and its live-register meaning before adding a rule.
+
+Headless commands:
+
+```text
+timing_rule_add {"name":"elapsed-result","addr":"<load-address>","register":"w8","value":0}
+timing_rule_add {"name":"elapsed-flags","addr":"<load-address>","register":"x8","mask":"0xff","value":0}
+timing_rule_add {"name":"elapsed-branch","addr":"<load-address>","redirect":"<success-address>"}
+timing_rule_remove {"name":"elapsed-result"}
+timing_rules
+defense_enable {"name":"anti_timing"}
+defense_disable {"name":"anti_timing"}
+```
+
+Choose the appropriate rule for each site; only one action per instruction is
+allowed. Add/remove rules while stopped with the defense disabled. Enabling
+without rules fails. `timing_rules` reports configured rules, armed sites,
+per-rule hit counts and errors; `status.defenses` reports `anti_timing`,
+`anti_timing_safe`, `anti_timing_armed`, and `anti_timing_error`.
+
+Rules capture expected instruction bytes and save module-relative offsets in
+the existing SHA-256-keyed per-binary state on Save/Stop for launch sessions.
+Rules added to attached processes are session-local. A same-target restart
+revalidates and rearms an enabled defense; opening a target in a new session
+loads its rules disabled. Instruction mismatches, modified internal hooks, and
+hardware-slot exhaustion block activation or resume. Rules preserve user stops
+at shared sites, operate on the hitting thread, and support instruction
+step-in/over/out. Source-level stepping is rejected while timing rules are on.
+Enable the analysis cloak too when all target-text breakpoints must preserve
+code integrity. The unrestricted `raw` escape hatch can still invalidate
+debugger guarantees.
+
+The public timing fixtures are benign local programs: they read clocks, run
+arithmetic loops, optionally sleep, and print results. They cover minimum and
+maximum aggregation, register/mask/redirect actions, delayed key corruption,
+two threads, and unoptimized/optimized builds. Reproduce with:
+
+```sh
+make -C tests/integration build/timing_fixture build/timing_fixture_optimized
+/usr/bin/python3 -m unittest -v tests.integration.test_timing_rules
+/usr/bin/python3 -m unittest -v tests.integration.test_auto_clock
+```
+
+Build products stay in the ignored `tests/integration/build/` directory. Timing
+integration tests use temporary state directories and clean up their sessions.
+Set `MACDBG_STATE_DIR` to an absolute directory to isolate saved state and agent
+sessions; the default remains `~/.macdbg`.
+
+**Sandbox exec & scripts** also intercepts in-process AppleScript/OSA execution:
+`OSAExecute`, `OSAExecuteEvent`, `OSALoadExecute`, `OSACompileExecute`,
+`OSADoScript`, `OSADoEvent`, and `OSADoScriptFile`. Enable **Prompt on execution**
+for **Allow**, **Fake success**, **Block**, and **Dump** decisions; otherwise calls
+are blocked automatically. OSA Block returns cancellation (`-128`); Fake returns
+an empty result without executing the script. Enable the sandbox before script
+loading to capture payloads: Dump saves actual `.scpt` bytes or captured source
+text, plus a readable `.applescript.txt` companion when static reconstruction
+succeeds. The popup shows readable content first and keeps size and SHA-256 under
+**Capture details**. Run-only AppleScript reconstruction is approximate; the
+original bytes are preserved. Inspection never invokes the script engine.
+Uncaptured inputs produce an
+explicit error without a substitute metadata dump. See the
+[exec sandbox guide](.skills/macdbg-agent/references/exec-sandbox.md) for coverage
+and limitations. This gate does not provide general filesystem/network containment.
+
+For process-launch calls, the UI preview may be shortened, while
 Dump and oversized automatic dumps write all data macdbg successfully captured.
 Capture is bounded to 1 MiB per C string and 8,192 argv entries; an unreadable
 string is recorded as empty. Treat the disk file as the full captured data, not
@@ -142,6 +287,23 @@ make -C tests/integration clean all
 /usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak
 /usr/bin/python3 -m unittest -v tests.integration.test_analysis_cloak.AnalysisCloakIntegrationTests.test_combined_checks_recover_exact_chacha20_payload
 ./agent.sh list
+```
+
+For the full native regression suite, make LLDB's Python bindings available to
+the GUI event tests as well:
+
+```sh
+PYTHONPATH="$(xcrun lldb -P)" /usr/bin/python3 -m unittest discover -v -s tests/integration -t .
+```
+
+Run unit modules in separate interpreters so their LLDB test doubles remain
+isolated:
+
+```sh
+macdbg_lldb_python="$(xcrun lldb -P)"
+for test_file in tests/test_*.py; do
+    PYTHONPATH="$macdbg_lldb_python" /usr/bin/python3 -m unittest -v "tests.$(basename "$test_file" .py)" || break
+done
 ```
 
 The focused test verifies the known synthetic fixture plaintext

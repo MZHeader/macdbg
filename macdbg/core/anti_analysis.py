@@ -31,15 +31,18 @@ class SpoofValue:
     value: Union[int, str]
 
 
+PLATFORM_UUID = "8D4C7A12-3F65-4B90-A2DE-61C8E5079F34"
+
 SYSCTL_SPOOFS = {
     "kern.hv_vmm_present": SpoofValue("u32", 0),
     "hw.model": SpoofValue("cstring", "Mac14,6"),
     "machdep.cpu.brand_string": SpoofValue("cstring", "Apple M2 Pro"),
+    "kern.hostuuid": SpoofValue("cstring", PLATFORM_UUID),
 }
 
 IOKIT_SPOOFS = {
     "IOPlatformSerialNumber": "C02ZQ0ABC123",
-    "IOPlatformUUID": "8D4C7A12-3F65-4B90-A2DE-61C8E5079F34",
+    "IOPlatformUUID": PLATFORM_UUID,
 }
 
 ParentReturnHook = tuple[str, int, int]
@@ -94,8 +97,8 @@ class AnalysisCloak:
         self._bp_ids: set[int] = set()
         self._entry_hooks: dict[int, str] = {}
         self._return_hooks: dict[int, ReturnHook] = {}
-        # LLDB may delete a matching one-shot before its stop is delivered,
-        # and reports foreign-thread IDs at shared breakpoint sites as well.
+        # LLDB can report foreign-thread IDs at shared breakpoint sites;
+        # retain ownership independently until the matching thread dispatches.
         self._return_hook_threads: dict[int, int] = {}
         self._cfstring_cache: dict[str, int] = {}
         self._cstring_cache: dict[str, int] = {}
@@ -248,7 +251,8 @@ class AnalysisCloak:
             bp = target.FindBreakpointByID(bp_id)
             if not bp or not bp.IsValid():
                 continue
-            if bp.GetNumLocations() > 0:
+            if any(bp.GetLocationAtIndex(i).IsResolved()
+                   for i in range(bp.GetNumLocations())):
                 resolved += 1
             else:
                 deferred += 1
@@ -258,6 +262,9 @@ class AnalysisCloak:
         target = getattr(self.debugger, "target", None)
         for bp_id in list(bp_ids):
             if target is not None:
+                if bp_id in self._return_hooks:
+                    from .breakpoints import remember_hardware_return
+                    remember_hardware_return(self.debugger, bp_id)
                 target.BreakpointDelete(bp_id)
             getattr(self.debugger, "hardware_bp_ids", set()).discard(bp_id)
             self._return_hooks.pop(bp_id, None)
@@ -297,8 +304,7 @@ class AnalysisCloak:
             thread = process.GetSelectedThread()
             if thread.GetThreadID() != owner:
                 return None
-            # Validate before consuming, using metadata retained even when
-            # LLDB has already auto-deleted the actual one-shot breakpoint.
+            # Validate ownership before consuming the return breakpoint.
             self._delete_breakpoints((bp_id,))
             import lldb
             message = ""
@@ -350,9 +356,7 @@ class AnalysisCloak:
                     # The real read may therefore fail ENOMEM even though
                     # the caller's buffer is sufficient for this known,
                     # read-only spoof. Never turn other API errors into success.
-                    real_errno = self._eval_integer(
-                        "expression -l c++ --ignore-breakpoints true -- "
-                        "(int)*((int *(*)())__error)()")
+                    real_errno = self._read_errno(thread, lldb)
                     if real_errno is None:
                         message = self._critical(
                             "sysctlbyname({}) could not read return errno; "
@@ -458,7 +462,8 @@ class AnalysisCloak:
                 except RuntimeError as error:
                     return self._critical(str(error) + "; restart at entry after reducing hardware sites")
                 if bp.IsValid() and bp.GetNumLocations() > 0:
-                    bp.SetOneShot(True)
+                    # Keep the stop ID available until handle_hit consumes it.
+                    # Older LLDB versions can drop IDs for one-shot hardware stops.
                     bp.SetThreadID(thread.GetThreadID())
                     self._return_hooks[bp.GetID()] = ("image",)
                     self._return_hook_threads[bp.GetID()] = thread.GetThreadID()
@@ -509,7 +514,7 @@ class AnalysisCloak:
                 return self._critical(str(error) + "; restart at entry after reducing hardware sites")
             if (entry_kind != "sysctlbyname"
                     or (bp.IsValid() and bp.GetNumLocations() > 0)):
-                bp.SetOneShot(True)
+                # Delete during dispatch so LLDB retains the stop's breakpoint ID.
                 bp.SetThreadID(thread.GetThreadID())
                 self._return_hooks[bp.GetID()] = hook
                 self._return_hook_threads[bp.GetID()] = thread.GetThreadID()
@@ -622,6 +627,32 @@ class AnalysisCloak:
         if not matches:
             return None
         return int(matches[-1])
+
+    def _read_errno(self, thread, lldb_module) -> Optional[int]:
+        # Darwin reserves TSD slot 1 for the errno pointer (xnu/libsyscall/os/tsd.h).
+        # Ask debugserver for this thread's TSD base on every read. Calling
+        # __error through LLDB here can disturb runtime locks, and caching a
+        # pointer by thread ID alone is unsafe across thread exit or relaunch.
+        if self.debugger.target.GetAddressByteSize() != 8:
+            return None
+        stream = lldb_module.SBStream()
+        if not thread.GetInfoItemByPathAsString("tsd_address", stream):
+            return None
+        try:
+            base = int(stream.GetData().strip(), 0)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not 0 < base < (1 << 64) - 16 or base % 8:
+            return None
+        data = self._read_exact(base + 8, 8, lldb_module)
+        if data is None:
+            return None
+        pointer = int.from_bytes(data, "little")
+        if not 0 < pointer < (1 << 64) - 4 or pointer % 4:
+            return None
+        data = self._read_exact(pointer, 4, lldb_module)
+        return (int.from_bytes(data, "little", signed=True)
+                if data is not None else None)
 
     def _cfstring_text(self, pointer: int) -> Optional[str]:
         if not pointer:
@@ -740,9 +771,12 @@ class AnalysisCloak:
                     continue
                 failure = "did not resolve"
             else:
+                can_defer = (symbol == "IORegistryEntryCreateCFProperty"
+                             and not self._module_loaded("IOKit"))
                 for index in range(bp.GetNumLocations()):
                     location = bp.GetLocationAtIndex(index)
-                    if not location.IsEnabled() or not location.IsResolved():
+                    if (not location.IsEnabled()
+                            or (not location.IsResolved() and not can_defer)):
                         failure = "has a disabled or unresolved location"
                         break
             if failure:

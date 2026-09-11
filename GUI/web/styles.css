@@ -437,6 +437,9 @@ td.tcat-FILE { color: var(--cat-file); } td.tcat-NET { color: var(--cat-net); } 
 .modal .m-head { padding: 11px 15px; border-bottom: 1px solid var(--border); font-weight: 700; background: var(--bg-head); }
 .modal .m-head .m-sub { color: var(--text-dim); font-weight: 400; font-size: 12px; margin-left: 8px; }
 .modal .m-body { padding: 15px; overflow: auto; }
+.modal.modal-script { width: 960px; max-width: 94vw; }
+.modal-script .script-content { font-size: 12px; line-height: 1.5; tab-size: 4; }
+.modal-script .m-hint { white-space: pre-wrap; overflow-wrap: anywhere; }
 .modal .m-foot { padding: 11px 15px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; background: var(--bg-elev); }
 .modal input.m-input, .modal textarea.m-input {
   width: 100%; background: #16171a; border: 1px solid var(--border); border-radius: 6px;

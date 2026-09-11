@@ -1,7 +1,7 @@
 import unittest
 
 from macdbg.core.anti_analysis import (
-    FORBIDDEN_ENV, IMAGE_MARKERS, SYSCTL_SPOOFS, TOOL_MARKERS,
+    FORBIDDEN_ENV, IMAGE_MARKERS, IOKIT_SPOOFS, SYSCTL_SPOOFS, TOOL_MARKERS,
     contains_marker, filter_environment,
 )
 
@@ -31,3 +31,11 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(SYSCTL_SPOOFS["hw.model"].value, "Mac14,6")
         self.assertEqual(SYSCTL_SPOOFS["machdep.cpu.brand_string"].value,
                          "Apple M2 Pro")
+
+    def test_uuid_identity_agrees_across_sysctl_and_iokit(self):
+        import uuid
+        value = SYSCTL_SPOOFS["kern.hostuuid"]
+        self.assertEqual(value.kind, "cstring")
+        self.assertEqual(value.value, IOKIT_SPOOFS["IOPlatformUUID"])
+        self.assertEqual(str(uuid.UUID(value.value)).upper(), value.value)
+        self.assertEqual(len(value.value.encode("utf-8")) + 1, 37)

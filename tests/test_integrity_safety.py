@@ -265,6 +265,11 @@ class StepHookOwnershipTests(unittest.TestCase):
         mock.patch.object(fake_lldb, "LLDB_INVALID_THREAD_ID", 0, create=True).start()
         mock.patch.dict(sys.modules, {"lldb": fake_lldb}).start()
         self.dbg = debugger_class.__new__(debugger_class)
+        self.dbg.script_exec = types.SimpleNamespace(payloads=types.SimpleNamespace(apply_stop=lambda: False))
+        from macdbg.core.timing import TimingDefense
+        from macdbg.core.auto_clock import AutomaticClock
+        self.dbg.timing = TimingDefense(self.dbg)
+        self.dbg.auto_clock = AutomaticClock(self.dbg)
         self.dbg.target = Target([])
         self.dbg.hardware_bp_ids = set()
         self.dbg._step_cloak_handled_stop = None

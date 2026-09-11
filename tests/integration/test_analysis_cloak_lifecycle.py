@@ -1,9 +1,23 @@
 import unittest
 
-from .support import run_core_probe
+from .support import run_core_probe, AgentProcess, LATE_IOKIT_FIXTURE
 
 
 class TargetLifecycleTests(unittest.TestCase):
+    def test_late_iokit_restart_defers_retained_unresolved_locations(self):
+        with AgentProcess(LATE_IOKIT_FIXTURE, "iokit") as agent:
+            self.assertTrue(agent.enable_cloak()["ok"])
+            for run in range(2):
+                if run:
+                    self.assertTrue(agent.cmd("restart")["ok"])
+                    status = agent.cmd("status")["defenses"]
+                    self.assertTrue(status["analysis_cloak_safe"], status)
+                    self.assertEqual(status["analysis_cloak_deferred"], 1)
+                result = agent.continue_to_exit()
+                self.assertEqual(result.get("event"), "exited", result)
+                self.assertEqual(result["exit"]["code"], 0, result)
+                self.assertIn("LATE-IOKIT:clean", result["console"])
+
     def test_gui_open_disposes_previous_target_then_rearms_late_iokit(self):
         result = run_core_probe('''
             import json

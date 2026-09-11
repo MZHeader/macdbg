@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work only in `/Users/liamchugg/Projects/macdbg/testing`; do not modify `/Users/liamchugg/Projects/macdbg` source files.
+- Work only in the isolated `testing/` repository copy; do not modify the primary repository's source files.
 - Support ARM64 macOS 11.0 or later and the system LLDB Python bindings.
 - Add no PyPI runtime dependency.
 - Keep the cloak opt-in and off by default.

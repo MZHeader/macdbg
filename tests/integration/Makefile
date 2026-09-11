@@ -10,7 +10,34 @@ CFLAGS := -arch arm64 -O0 -g -Wall -Wextra
 FRAMEWORKS := -framework CoreFoundation -framework IOKit
 
 .PHONY: all clean
-all: $(FIXTURE) $(STRIPPED_FIXTURE) $(OPTIMIZED_FIXTURE) $(LATE_IOKIT_FIXTURE) $(FRIDA_FIXTURE) $(CONTROLLED_SYSCTL_FIXTURE)
+all: $(FIXTURE) $(STRIPPED_FIXTURE) $(OPTIMIZED_FIXTURE) $(LATE_IOKIT_FIXTURE) $(FRIDA_FIXTURE) $(CONTROLLED_SYSCTL_FIXTURE) $(BUILD)/timing_fixture $(BUILD)/timing_fixture_optimized $(BUILD)/framework_fixture $(BUILD)/clock_contention_fixture $(BUILD)/ClockWorker.dylib $(BUILD)/constant.scpt $(BUILD)/self_trap_fixture $(BUILD)/script_exec_fixture $(BUILD)/script_exec_late_fixture
+
+$(BUILD)/script_exec_late_fixture: script_exec_late_fixture.c | $(BUILD)
+	clang $(CFLAGS) -Wno-deprecated-declarations $< -o $@
+
+$(BUILD)/script_exec_fixture: script_exec_fixture.c | $(BUILD)
+	clang $(CFLAGS) -Wno-deprecated-declarations -framework Carbon $< -o $@
+
+$(BUILD)/self_trap_fixture: self_trap_fixture.c | $(BUILD)
+	clang $(CFLAGS) $< -o $@
+
+$(BUILD)/constant.scpt: | $(BUILD)
+	osacompile -x -e 'return 0' -o $@
+
+$(BUILD)/framework_fixture: framework_fixture.c | $(BUILD)
+	clang $(CFLAGS) -Wno-deprecated-declarations -framework Carbon -lobjc $< -o $@
+
+$(BUILD)/ClockWorker.dylib: ClockWorker.c | $(BUILD)
+	clang $(CFLAGS) -dynamiclib $< -o $@
+
+$(BUILD)/clock_contention_fixture: clock_contention_fixture.c | $(BUILD)
+	clang $(CFLAGS) $< -o $@
+
+$(BUILD)/timing_fixture: timing_fixture.c timing_decisions.S | $(BUILD)
+	clang $(CFLAGS) $^ -o $@
+
+$(BUILD)/timing_fixture_optimized: timing_fixture.c timing_decisions.S | $(BUILD)
+	clang -arch arm64 -O2 -g -Wall -Wextra $^ -o $@
 
 $(BUILD):
 	mkdir -p $@

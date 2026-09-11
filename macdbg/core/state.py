@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-STATE_DIR = os.path.expanduser("~/.macdbg")
+STATE_DIR = os.path.abspath(os.path.expanduser(os.environ.get("MACDBG_STATE_DIR", "~/.macdbg")))
 
 
 def _safe_name(name: str) -> str:
@@ -56,6 +56,7 @@ class BinaryState:
     breakpoints: List[StoredBP] = field(default_factory=list)
     patches: List[Patch] = field(default_factory=list)
     watches: List[Watch] = field(default_factory=list)
+    timing_rules: List[dict] = field(default_factory=list)
 
     def dir(self) -> str:
         return sample_dir(self.binary_path, self.sha256)
@@ -72,6 +73,7 @@ class BinaryState:
             payload = {
                 "sha256": self.sha256,
                 "binary_path": self.binary_path,
+                "timing_rules": self.timing_rules,
                 "comments": {"{:#x}".format(k): v for k, v in self.comments.items()},
                 "bookmarks": {"{:#x}".format(k): v for k, v in self.bookmarks.items()},
                 "breakpoints": [
@@ -155,6 +157,7 @@ def load_for(binary_path: str) -> BinaryState:
             d = json.load(f)
     except (OSError, json.JSONDecodeError):
         return state
+    state.timing_rules = d.get("timing_rules", [])
     for k, v in (d.get("comments") or {}).items():
         try:
             state.comments[int(k, 16)] = v

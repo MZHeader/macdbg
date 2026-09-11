@@ -5,10 +5,9 @@ description: Use when an AI coding agent needs to debug, trace, or reverse-engin
 
 # macdbg headless agent
 
-macdbg's interactive TUI (`./macdbg.sh <binary>`) is unusable from an agent
-because it owns the terminal. `./agent.sh` is the second, headless entry
-point: same LLDB-backed `Debugger` core (`macdbg/core/debugger.py`), driven
-by a JSON protocol over a Unix socket instead of the TUI. Only works on
+Use `./agent.sh` for headless control: the same LLDB-backed `Debugger` core
+(`macdbg/core/debugger.py`) as the native GUI, driven by a JSON protocol over
+a Unix socket. Only works on
 macOS with Xcode command line tools (`lldb`) installed. Run every command
 from the macdbg repo root.
 
@@ -156,8 +155,23 @@ Strings:
 Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
 `anti_csops`, `anti_parent`, `anti_sigtrap`,
 `anti_mach_ports`, `direct_syscall`, `fork_identity`, `exec_sandbox`,
-`analysis_cloak`):
+`analysis_cloak`, `auto_clock`, `anti_timing`):
 - `defense_enable {"name": "…"}` / `defense_disable {"name": "…"}`.
+- `auto_clock` is the automatic timing option. Enable at the initial entry
+  stop; it needs no timing rules or target-specific addresses. It compensates
+  observed debugger pauses at OS clock APIs for main-executable callers and
+  scans main text for supported ARM counter reads. Read
+  [Automatic clocks](references/automatic-clocks.md) before using it for the
+  coverage, deadline, stepping and validation contracts. `clock_status` reports
+  covered APIs/counters, partial coverage, hit counts and errors.
+  Clock calls use discovered Mach-O imports and `dlsym` forwarders rather than
+  breakpoints in shared system clock routines. The forwarder page is process-local
+  and read/execute after construction; `entry_points` reports its API addresses.
+- `anti_timing` enables configured, hardware-backed timing decision rules on
+  ARM64; it does not synthesize clocks or discover checks automatically.
+  Before configuring it, read [Timing rules](references/timing-rules.md) for
+  the register/mask/redirect commands, instruction guards and stepping limits.
+  Enabling with no rules fails; neither `analysis_cloak` nor Enable ALL arms it.
 - `analysis_cloak` is the composite environment, parent, VM/hardware identity,
   loaded-image, text-integrity, and syscall-202 defense. Enable it at
   the initial entry stop, before the first resume:
@@ -176,6 +190,9 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   Opening or attaching to another target clears the previous target's defense
   state; re-enable the cloak at the new entry stop. Same-target restart keeps
   the requested cloak mode.
+  A deferred IOKit hook may retain unresolved locations after restart while
+  IOKit is unloaded; these are reported as deferred again. Disabled hooks or
+  unresolved locations after the framework loads still block execution.
 - The cloak removes `DYLD_INSERT_LIBRARIES`, `DYLD_FORCE_FLAT_NAMESPACE`,
   `DYLD_PRINT_LIBRARIES`, `DYLD_PRINT_INITIALIZERS`, `DYLD_PRINT_BINDINGS`,
   `DYLD_IMAGE_SUFFIX`, `MallocStackLogging`, `MallocStackLoggingNoCompact`, and
@@ -187,17 +204,37 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   deterministic: `kern.hv_vmm_present = 0`, `hw.model = Mac14,6`, and
   `machdep.cpu.brand_string = Apple M2 Pro`. Successful length-only probes
   update only the returned size so a subsequent data query can proceed.
+  `kern.hostuuid` is also covered by `sysctlbyname` and shares the IOKit UUID
+  below; its C-string result is 37 bytes including NUL. This is part of
+  `analysis_cloak`, with no separate toggle. Direct numeric-MIB UUID queries
+  and the `gethostuuid()` API are outside this addition's coverage.
+  If the kernel does not expose this key, its `ENOENT` result is preserved.
+  Failed reads inspect the stopped thread's `errno` through debugserver's TSD
+  metadata and memory reads, without calling `__error` inside the target.
+  Missing or unreadable metadata blocks the rewrite; worker threads and restart
+  use their current thread state rather than a cached main-thread address.
 - `IORegistryEntryCreateCFProperty` returns
   `IOPlatformSerialNumber = C02ZQ0ABC123` and
   `IOPlatformUUID = 8D4C7A12-3F65-4B90-A2DE-61C8E5079F34` for those two keys.
   `_dyld_get_image_name` substitutes `/usr/lib/libSystem.B.dylib` for configured
   instrumentation image names without modifying dyld-owned memory.
 - The cloak reuses `anti_sysctl` for both ordinary KERN_PROC calls and syscall
-  number 202. Timing checks are not cloaked: the former fixed-step synthetic
-  clock was removed because it was fingerprintable and changed ordinary
-  monotonic-clock behavior. Direct `mrs cntvct_el0`, clock APIs, and arbitrary
-  private or undocumented inspection APIs remain outside the current scope.
+  number 202. It does not change clocks. The former fixed-step synthetic clock
+  remains removed. Separate `anti_timing` rules can neutralize verified
+  decisions using clock APIs or direct counters without changing time itself.
+  Arbitrary private or undocumented inspection APIs remain outside scope.
 - It preserves the target's `__TEXT,__text` bytes rather than forging a hash.
+  Temporary cloak and flag-scrubbing return breakpoints remain installed until
+  macdbg dispatches the owning thread's stop, then are deleted explicitly.
+  This preserves stop IDs on LLDB versions that discard them when a one-shot
+  hardware breakpoint deletes itself.
+  A second exception at an immediately retired hardware return site is retried
+  once only when process, thread, PC, instruction bytes, and consecutive stop
+  IDs agree. The retry is logged and does not skip an instruction. Live user
+  breakpoints, concurrent real stops, and unmatched exceptions stay visible.
+  The same one-retry limit covers Darwin's interrupted-continue single-step
+  exception only when a hardware site was armed, the previous action was a
+  free continue, and the thread's PC and instruction have not changed.
   Every macdbg-managed target-text breakpoint is required to be hardware-backed,
   target-text patches block resume, and target-text tracer sites require
   hardware mode. Hardware slots are finite; a bounded step reserves one, and
@@ -225,6 +262,8 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
   `udf` or Mach-exception-port self-handlers), and delivers the signal
   without a real `siginfo`/`ucontext`, so a handler that inspects those
   won't see valid values.
+  System-library traps, nonzero BRK immediates, and traps without a registered
+  handler are surfaced normally; the forwarder does not skip runtime assertions.
 - ptrace / sysctl-P_TRACED / csops-CS_DEBUGGED issued through the libc
   `syscall()` wrapper (e.g. `syscall(SYS_ptrace, PT_DENY_ATTACH, …)`) are
   neutralised automatically whenever the corresponding symbol defense is on
@@ -237,6 +276,13 @@ Anti-anti-debug defenses (`name` is one of `anti_ptrace`, `anti_sysctl`,
 Fork/exec interactive decisions — by default these auto-resolve
 (identity/sandbox mode blocks/fakes the call and keeps going); set
 interactive mode first to inspect:
+- `exec_sandbox` also gates in-process OSA execution, including `OSAExecute`
+  and combined load/compile-and-execute APIs. Read
+  [Process and OSA execution interception](references/exec-sandbox.md) for
+  exact coverage, empty-result Fake semantics, captured OSA payload dumps, and
+  stepping/thread ownership. Enable **Prompt on execution** in the GUI, or
+  `exec_mode {"interactive":true}` headlessly, to get decisions rather than
+  automatic blocking. This is not a general containment sandbox.
 - `fork_mode {"interactive": true}`, `exec_mode {"interactive": true}`.
 - When interactive, a resume can come back with `event:
   "pending_decision"` and a `decision` object (`kind: "fork"|"exec"`, plus
@@ -247,7 +293,12 @@ interactive mode first to inspect:
   fake returns 0 without running, allow actually executes. Same
   rejection rule.
 - `dump_exec` — while an exec decision is pending, write the full
-  command/argv to a dump file and return its path.
+  command/argv or captured OSA input bytes to a dump file and return its path.
+  OSA responses also include `content_path` for readable source or static
+  reconstruction when available. The GUI shows this content before metadata.
+  Compiled reconstructions are approximate; preserve the raw `.scpt` artifact.
+  For OSA, enable the sandbox before descriptor creation/loading. Missing
+  capture is an explicit error; metadata is never substituted for script bytes.
 - Oversized commands/argv are dumped automatically. The on-screen preview may
   be shortened, while disk dumps retain all data macdbg successfully captured.
   Capture is bounded to 1 MiB per C string and 8,192 argv entries; an unreadable

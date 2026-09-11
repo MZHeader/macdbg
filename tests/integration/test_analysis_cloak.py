@@ -158,12 +158,13 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
                 self.assertEqual(result["exit"]["code"], 0, result)
                 self.assertIn("INTEGRITY:clean", result["console"])
 
-    def test_synthetic_timing_defense_is_removed_and_cloak_does_not_claim_it(self):
+    def test_timing_requires_rules_and_cloak_does_not_enable_it(self):
         with AgentProcess(FIXTURE, "timing") as agent:
-            removed = agent.cmd("defense_enable", {"name": "anti_timing"})
-            self.assertFalse(removed["ok"], removed)
+            unconfigured = agent.cmd("defense_enable", {"name": "anti_timing"})
+            self.assertFalse(unconfigured["ok"], unconfigured)
+            self.assertIn("configure at least one timing rule", unconfigured["message"])
             self.assertTrue(agent.enable_cloak()["ok"])
-            self.assertNotIn("anti_timing", agent.cmd("status")["defenses"])
+            self.assertFalse(agent.cmd("status")["defenses"]["anti_timing"])
             result = agent.continue_to_exit()
             self.assertEqual(result["event"], "exited", result)
             self.assertEqual(result["exit"]["code"], 1, result)
@@ -299,9 +300,15 @@ class AnalysisCloakIntegrationTests(unittest.TestCase):
             result = script_json("\n".join([
                 "from macdbg.core.debugger import Debugger",
                 "from macdbg.core.anti_analysis import AnalysisCloak",
+                "from macdbg.core.timing import TimingDefense",
+                "from macdbg.core.auto_clock import AutomaticClock",
+                "from macdbg.core.script_exec import ScriptExec",
                 "d = Debugger.__new__(Debugger)",
+                "d.timing = TimingDefense(d)",
+                "d.auto_clock = AutomaticClock(d)",
                 "d.target = lldb.debugger.GetSelectedTarget()",
                 "d.process = d.target.GetProcess()",
+                "d.script_exec = ScriptExec(d)",
                 "thread = d.process.GetSelectedThread()",
                 "before = {'reason': thread.GetStopReason(), 'ids': [thread.GetStopReasonDataAtIndex(i) for i in range(0, thread.GetStopReasonDataCount(), 2)]}",
                 "before['valid'] = [d.target.FindBreakpointByID(i).IsValid() for i in {!r}]".format(ids),

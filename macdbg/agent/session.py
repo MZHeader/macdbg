@@ -65,6 +65,8 @@ def _int_arg(v) -> int:
     )
 
 _DEFENSES = {
+    "auto_clock": ("enable_auto_clock", "disable_auto_clock"),
+    "anti_timing": ("enable_anti_timing", "disable_anti_timing"),
     "analysis_cloak": ("enable_analysis_cloak", "disable_analysis_cloak"),
     "anti_ptrace": ("enable_anti_ptrace", "disable_anti_ptrace"),
     "anti_sysctl": ("enable_anti_sysctl", "disable_anti_sysctl"),
@@ -96,6 +98,7 @@ class AgentSession:
         self._trace_count = 0
         self._console: List[str] = []
         self._pending: Optional[dict] = None
+        self._last_handled_stop = None
 
     # -- lifecycle -----------------------------------------------------
 
@@ -181,6 +184,8 @@ class AgentSession:
 
     def _dispatch_resume(self, cmd: str, args: dict, poll_cb) -> dict:
         timeout = args.get("timeout")
+        self.dbg.auto_clock.require_ready()
+        self.dbg.timing.require_ready()
         cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_resume()
         if not cloak_ok:
             return {"ok": False, "error": cloak_error}
@@ -218,6 +223,16 @@ class AgentSession:
         raise SessionError("unknown resume command {!r}".format(cmd))
 
     def _dispatch_plain(self, cmd: str, args: dict) -> dict:
+        if cmd == "clock_status":
+            return {"ok": True, **self.dbg.auto_clock.status()}
+        if cmd == "timing_rule_add":
+            return {"ok": True, "rule": self.dbg.timing.add(
+                {key: value for key, value in args.items() if key != "timeout"})}
+        if cmd == "timing_rule_remove":
+            self.dbg.timing.remove(args["name"])
+            return {"ok": True}
+        if cmd == "timing_rules":
+            return {"ok": True, **self.dbg.timing.status()}
         if cmd == "status":
             return self.cmd_status()
         if cmd == "restart":
@@ -405,6 +420,15 @@ class AgentSession:
             return {"ok": False, "error": "invalid exec decision {!r}; choose one of {}".format(
                 decision, self._EXEC_DECISIONS)}
         pending = self._pending
+        from macdbg.core.script_exec import OSA_CALLS
+        if pending.get('symbol') in OSA_CALLS:
+            resumed = self.dbg.resolve_exec(decision, name=pending['symbol'])
+            self._pending = None
+            if resumed is False:
+                self._pending = self._check_pending_interactive()
+                return {'ok': True, 'event': 'pending_decision',
+                        'decision': self._pending, 'console': self._drain_console()}
+            return self._pump(resume=None, max_wait=timeout, poll_cb=poll_cb)
         self._pending = None
         return self._pump(
             resume=lambda: self.dbg.resolve_exec(decision, name=pending.get("symbol", "")),
@@ -413,11 +437,16 @@ class AgentSession:
     def cmd_dump_exec(self) -> dict:
         if not self._pending or self._pending.get("kind") != "exec":
             return {"ok": False, "error": "no pending exec decision"}
-        res = self.dbg.dump_exec_payload(self._pending["bp_id"])
+        try:
+            res = self.dbg.dump_exec_payload(self._pending["bp_id"])
+        except RuntimeError as error:
+            return {'ok': False, 'error': str(error)}
         if res is None:
             return {"ok": False, "error": "dump failed"}
         path, n = res
-        return {"ok": True, "path": path, "bytes": n}
+        details = (self.dbg.script_exec.pending['dump']
+                   if self._pending.get('symbol', '').startswith('OSA') else {})
+        return {"ok": True, "path": path, "bytes": n, **details}
 
     def _defense(self, name: str, enable: bool) -> dict:
         pair = _DEFENSES.get(name)
@@ -435,6 +464,8 @@ class AgentSession:
         p = d.process
         state = lldb.SBDebugger.StateAsCString(p.GetState()) if p and p.IsValid() else "none"
         cloak = d.analysis_cloak.status()
+        timing = d.timing.status()
+        automatic = d.auto_clock.status()
         safe, error = d.analysis_cloak.validate_resume()
         if safe:
             safe, error = d.analysis_cloak.validate_integrity(self.tracer.hardware_bp_ids)
@@ -448,6 +479,13 @@ class AgentSession:
             "tracer_enabled": self.tracer.enabled,
             "trace_hit_count": self._trace_count,
             "defenses": {
+                "auto_clock": automatic["enabled"],
+                "auto_clock_safe": automatic["safe"],
+                "auto_clock_error": automatic["error"],
+                "anti_timing": d.timing.enabled,
+                "anti_timing_safe": timing["safe"],
+                "anti_timing_armed": timing["armed"],
+                "anti_timing_error": timing["error"],
                 "analysis_cloak": cloak["enabled"],
                 "analysis_cloak_safe": bool(cloak["enabled"] and safe),
                 "analysis_cloak_resolved": cloak["resolved"],
@@ -678,7 +716,7 @@ class AgentSession:
         p = self.dbg.process
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
-        hidden = self._hidden_bp_ids()
+        hidden = self._hidden_bp_ids() - self.dbg.script_exec.breakpoint_ids()
         for bid in hidden:
             self.dbg.set_bp_enabled(bid, False)
         try:
@@ -758,6 +796,7 @@ class AgentSession:
 
         while True:
             got = self.dbg.listener.WaitForEvent(wait_timeout, event)
+            observed_ns = time.monotonic_ns()
             self._drain_lldb_pipe()
             if poll_cb is not None:
                 poll_cb()
@@ -802,13 +841,51 @@ class AgentSession:
                     return hit
                 continue
             if state == lldb.eStateStopped:
+                # Ignored/conditional breakpoints can broadcast a stop that
+                # LLDB has already restarted. It is not an actionable user stop.
+                if lldb.SBProcess.GetRestartedFromEvent(event) or p.GetState() != lldb.eStateStopped:
+                    hit = _deadline_hit()
+                    if hit is not None:
+                        return hit
+                    continue
+                stop_key = (p.GetProcessID(), p.GetStopID())
+                # A duplicate event must not resume an already-handled clock
+                # or defense stop a second time.
+                if getattr(self, "_last_handled_stop", None) == stop_key:
+                    hit = _deadline_hit()
+                    if hit is not None:
+                        return hit
+                    continue
+                self._last_handled_stop = stop_key
                 self.dbg.select_stopped_thread()
+                self.dbg.auto_clock.observe_stop(observed_ns)
+                from macdbg.core.breakpoints import consume_hardware_debugger_duplicate
+                if consume_hardware_debugger_duplicate(self.dbg):
+                    self._log('[debugger] retried duplicate hardware debugger stop')
+                    self.dbg.cont()
+                    continue
+                payload_only = self.dbg.script_exec.payloads.apply_stop()
+                clock_only = self.dbg.auto_clock.apply_stop()
+                messages, timing_only = self.dbg.timing.apply_stop()
+                for message in messages:
+                    self._log(message)
                 cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
                     self.tracer.hardware_bp_ids)
                 if not cloak_ok:
                     self.dbg.cancel_user_step()
                     return {"ok": False, "error": cloak_error,
                             "console": self._drain_console()}
+                script_bp = self.dbg.script_exec.find_hit()
+                if script_bp is not None:
+                    self.dbg.cancel_user_step()
+                    if self.dbg.exec_interactive:
+                        self._pending = self._check_pending_interactive()
+                        return {'ok': True, 'event': 'pending_decision',
+                                'decision': self._pending, 'console': self._drain_console()}
+                    while script_bp is not None:
+                        self._log('[exec sandbox] ' + self.dbg.handle_exec_hit(script_bp))
+                        script_bp = self.dbg.script_exec.find_hit()
+                    continue
                 if self.dbg.in_user_step():
                     # Completing a user step: log this stop first if it is a
                     # tracer hit, then drive the step -- never letting the tracer
@@ -827,6 +904,12 @@ class AgentSession:
                     # auto-continue handlers below.
                     return {"ok": True, "event": "stop", "stop": self._describe_stop(),
                             "console": self._drain_console()}
+                if timing_only or clock_only or payload_only:
+                    self.dbg.cont()
+                    hit = _deadline_hit()
+                    if hit is not None:
+                        return hit
+                    continue
                 if self.dbg.in_fork_shield():
                     self.dbg.finish_fork_shield()
                     self.dbg.cont()
@@ -883,12 +966,13 @@ class AgentSession:
         process = self.dbg.process
         if not process or not process.IsValid():
             return None
+        script_bp = self.dbg.script_exec.find_hit()
         thread = process.GetSelectedThread()
         if not thread or not thread.IsValid():
             return None
-        if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
+        if thread.GetStopReason() != lldb.eStopReasonBreakpoint and script_bp is None:
             return None
-        bp_ids = self._stop_bp_ids(thread)
+        bp_ids = [script_bp] if script_bp is not None else self._stop_bp_ids(thread)
         if not bp_ids:
             return None
         if self.dbg.exec_bp_ids:
@@ -1025,7 +1109,10 @@ class AgentSession:
 
     def _hidden_bp_ids(self) -> set:
         ids = set(self.tracer._bp_to_name)
+        ids.update(self.dbg.auto_clock.hidden_bp_ids())
+        ids.update(self.dbg.timing.hidden_bp_ids())
         ids.update(self.dbg.analysis_cloak.hidden_bp_ids())
+        ids.update(self.dbg.script_exec.payloads.hidden_ids())
         if self.dbg.anti_ptrace_bp_id:
             ids.add(self.dbg.anti_ptrace_bp_id)
         if self.dbg.anti_sysctl_bp_id:

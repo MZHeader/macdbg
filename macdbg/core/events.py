@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -13,6 +14,7 @@ class StopEvent:
     description: str
     process_id: int = 0
     stop_id: int = 0
+    observed_ns: int = 0
 
 
 @dataclass
@@ -46,10 +48,13 @@ class EventPump:
         while not self._stop.is_set():
             if not self.listener.WaitForEvent(1, event):
                 continue
+            observed_ns = time.monotonic_ns()
             if lldb.SBProcess.EventIsProcessEvent(event):
                 etype = event.GetType()
                 if etype & lldb.SBProcess.eBroadcastBitStateChanged:
                     state = lldb.SBProcess.GetStateFromEvent(event)
+                    if state == lldb.eStateStopped and lldb.SBProcess.GetRestartedFromEvent(event):
+                        continue
                     desc = lldb.SBDebugger.StateAsCString(state)
                     proc = lldb.SBProcess.GetProcessFromEvent(event)
                     process_id = (proc.GetProcessID()
@@ -62,6 +67,7 @@ class EventPump:
                         description=desc,
                         process_id=process_id,
                         stop_id=stop_id,
+                        observed_ns=observed_ns,
                     ))
                 elif etype & lldb.SBProcess.eBroadcastBitSTDOUT:
                     proc = lldb.SBProcess.GetProcessFromEvent(event)

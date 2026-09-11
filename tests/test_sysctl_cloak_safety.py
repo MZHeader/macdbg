@@ -15,7 +15,12 @@ class FakeError:
         return self.ok
 
 
-FAKE_LLDB = types.SimpleNamespace(SBError=FakeError)
+class FakeStream:
+    def GetData(self):
+        return self.data
+
+
+FAKE_LLDB = types.SimpleNamespace(SBError=FakeError, SBStream=FakeStream)
 
 
 class FakeRegister:
@@ -53,6 +58,12 @@ class FakeThread:
     def __init__(self, frame, thread_id=0x1234):
         self.frame = frame
         self.thread_id = thread_id
+        self.tsd = "0x6000"
+
+    def GetInfoItemByPathAsString(self, path, stream):
+        assert path == "tsd_address"
+        stream.data = self.tsd
+        return self.tsd is not None
 
     def GetFrameAtIndex(self, _index):
         return self.frame
@@ -89,6 +100,9 @@ class FakeBreakpoint:
 
 
 class FakeTarget:
+    def GetAddressByteSize(self):
+        return 8
+
     def __init__(self, *, return_bp_valid=True, return_bp_locations=1):
         self.created = []
         self.deleted = []
@@ -177,7 +191,10 @@ def make_return_cloak(name="hw.model", *, returned=0, capacity=128,
     memory = {
         buffer_address: bytearray(buffer.ljust(capacity, b"\0")),
         size_address: bytearray((len(buffer)).to_bytes(8, "little")),
+        0x6008: bytearray((0x7000).to_bytes(8, "little")),
     }
+    if syscall_errno is not None:
+        memory[0x7000] = bytearray(syscall_errno.to_bytes(4, "little", signed=True))
     process = FakeProcess(frame, memory=memory, write_results=write_results)
     cloak = AnalysisCloak(FakeDebugger(process, syscall_errno=syscall_errno))
     cloak.enabled = True
@@ -188,8 +205,46 @@ def make_return_cloak(name="hw.model", *, returned=0, capacity=128,
     return cloak, process, buffer_address, size_address
 
 
+class ThreadErrnoTests(unittest.TestCase):
+    def test_reads_current_thread_and_does_not_cache_across_relaunch(self):
+        cloak, process, _, _ = make_return_cloak(syscall_errno=errno.ENOMEM)
+        with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
+            self.assertEqual(cloak._read_errno(process.thread, FAKE_LLDB), errno.ENOMEM)
+            worker = FakeThread(process.thread.frame, thread_id=0x5678)
+            worker.tsd = "0x8000"
+            process.memory[0x8008] = (0x9000).to_bytes(8, "little")
+            process.memory[0x9000] = errno.EPERM.to_bytes(4, "little")
+            self.assertEqual(cloak._read_errno(worker, FAKE_LLDB), errno.EPERM)
+            cloak.clear_return_hooks()
+            process.thread.tsd = worker.tsd
+            self.assertEqual(cloak._read_errno(process.thread, FAKE_LLDB), errno.EPERM)
+        self.assertEqual(cloak.debugger.commands, [])
+
+    def test_unavailable_or_malformed_thread_info_never_executes_target_code(self):
+        cloak, process, _, _ = make_return_cloak()
+        for value in (None, "", "garbage", "0", "-8", "0xffffffffffffffff", "0x6001"):
+            with self.subTest(value=value):
+                process.thread.tsd = value
+                self.assertIsNone(cloak._read_errno(process.thread, FAKE_LLDB))
+        self.assertEqual(process.reads, [])
+        self.assertEqual(cloak.debugger.commands, [])
+
+    def test_missing_tsd_slot_invalid_pointer_and_short_errno_are_rejected(self):
+        for value in (None, b"\0" * 8, b"\xff" * 8, (0x7001).to_bytes(8, "little"), b"\0" * 4):
+            cloak, process, _, _ = make_return_cloak()
+            if value is None:
+                del process.memory[0x6008]
+            else:
+                process.memory[0x6008] = value
+            self.assertIsNone(cloak._read_errno(process.thread, FAKE_LLDB))
+            self.assertEqual(cloak.debugger.commands, [])
+        cloak, process, _, _ = make_return_cloak()
+        process.memory[0x7000] = b"\x0c\0"
+        self.assertIsNone(cloak._read_errno(process.thread, FAKE_LLDB))
+
+
 class SysctlEntrySafetyTests(unittest.TestCase):
-    def test_recognized_name_captures_capacity_on_thread_owned_one_shot(self):
+    def test_recognized_name_retains_thread_owned_return_until_dispatch(self):
         name_address = 0x1000
         buffer_address = 0x2000
         size_address = 0x3000
@@ -218,7 +273,7 @@ class SysctlEntrySafetyTests(unittest.TestCase):
         self.assertEqual(len(cloak.debugger.target.created), 1)
         address, bp = cloak.debugger.target.created[0]
         self.assertEqual(address, return_address)
-        self.assertTrue(bp.one_shot)
+        self.assertFalse(bp.one_shot)
         self.assertEqual(bp.thread_id, process.thread.thread_id)
         self.assertEqual(
             cloak._return_hooks[bp.bp_id],
@@ -328,6 +383,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
 
     def test_length_only_probe_publishes_spoof_size_without_data_write(self):
         for name, kind, expected_size in (("hw.model", "cstring", 8),
+                                           ("kern.hostuuid", "cstring", 37),
                                            ("machdep.cpu.brand_string", "cstring", 13),
                                            ("kern.hv_vmm_present", "u32", 4)):
             with self.subTest(name=name):
@@ -413,6 +469,34 @@ class SysctlReturnSafetyTests(unittest.TestCase):
         self.assertIsNone(cloak.last_error)
         self.assertEqual(process.continues, 1)
 
+    def test_host_uuid_exact_buffer_and_enomem_recovery_preserve_guard(self):
+        from macdbg.core.anti_analysis import IOKIT_SPOOFS
+        expected = IOKIT_SPOOFS["IOPlatformUUID"].encode() + b"\0"
+        for returned in (0, (1 << 32) - 1):
+            with self.subTest(returned=returned):
+                cloak, process, buffer_address, size_address = make_return_cloak(
+                    name="kern.hostuuid", returned=returned, capacity=37,
+                    buffer=b"\xa5" * 45, syscall_errno=errno.ENOMEM)
+                process.memory[size_address] = bytearray((0 if returned else 37).to_bytes(8, "little"))
+                with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
+                    message = cloak.handle_hit(9)
+                self.assertIsNone(cloak.last_error, message)
+                self.assertEqual(bytes(process.memory[buffer_address]), expected + b"\xa5" * 8)
+                self.assertEqual(int.from_bytes(process.memory[size_address], "little"), 37)
+                self.assertEqual(process.thread.frame.FindRegister("x0").value, 0)
+
+    def test_host_uuid_short_buffer_and_real_failure_are_not_spoofed(self):
+        for capacity, error in ((36, errno.ENOMEM), (37, errno.EPERM), (37, errno.ENOENT)):
+            with self.subTest(capacity=capacity, error=error):
+                cloak, process, _, _ = make_return_cloak(
+                    name="kern.hostuuid", returned=(1 << 64) - 1,
+                    capacity=capacity, buffer=b"\xa5" * 45, syscall_errno=error)
+                before = {address: bytes(data) for address, data in process.memory.items()}
+                with mock.patch.dict(sys.modules, {"lldb": FAKE_LLDB}):
+                    cloak.handle_hit(9)
+                self.assertEqual(process.memory, before)
+                self.assertEqual(process.writes, [])
+
     def test_enomem_query_with_spoof_capacity_returns_success_and_exact_outputs(self):
         for resume in (True, False):
             with self.subTest(resume=resume):
@@ -428,9 +512,7 @@ class SysctlReturnSafetyTests(unittest.TestCase):
                 self.assertEqual(process.thread.frame.FindRegister("x0").value, 0)
                 self.assertEqual(process.continues, int(resume))
                 self.assertIsNone(cloak.last_error)
-                self.assertEqual(len(cloak.debugger.commands), 1)
-                self.assertIn("__error", cloak.debugger.commands[0])
-                self.assertIn("--ignore-breakpoints true", cloak.debugger.commands[0])
+                self.assertEqual(cloak.debugger.commands, [])
 
     def test_other_real_failures_and_insufficient_spoof_capacity_stay_failed(self):
         for error, capacity in ((errno.EFAULT, 8), (errno.EINVAL, 8),

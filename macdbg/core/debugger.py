@@ -9,6 +9,9 @@ from typing import Dict, List, Optional, Tuple
 import lldb
 
 from .anti_analysis import AnalysisCloak, TOOL_MARKERS, contains_marker
+from .timing import TimingDefense
+from .auto_clock import AutomaticClock
+from .script_exec import ScriptExec, OSA_CALLS
 from .state import BinaryState, StoredBP, Patch, load_for, STATE_DIR
 
 
@@ -31,6 +34,9 @@ class Debugger:
         self.dbg.SetAsync(True)
         self.ci = self.dbg.GetCommandInterpreter()
         self.target: Optional[lldb.SBTarget] = None
+        self._retired_hardware_return = None
+        self._hardware_continue = None
+        self._suppress_duplicate_retry = False
         self.process: Optional[lldb.SBProcess] = None
         self.listener: lldb.SBListener = self.dbg.GetListener()
         self._attached: bool = False
@@ -52,6 +58,9 @@ class Debugger:
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("settings set target.disable-aslr true", ret, False)
         self.analysis_cloak = AnalysisCloak(self)
+        self.timing = TimingDefense(self)
+        self.auto_clock = AutomaticClock(self)
+        self.script_exec = ScriptExec(self)
         self.hardware_bp_ids: set[int] = set()
         self.extra_hardware_bp_ids = lambda: set()
         self._step_hardware_policy = None
@@ -67,6 +76,37 @@ class Debugger:
             return ""
         return data.decode("utf-8", errors="replace") if data else ""
 
+    def enable_anti_timing(self):
+        return self.timing.enable()
+
+    def disable_anti_timing(self):
+        return self.timing.disable()
+
+    def enable_auto_clock(self):
+        return self.auto_clock.enable()
+
+    def disable_auto_clock(self):
+        return self.auto_clock.disable()
+
+    def _run_execution(self, action):
+        """One accounting boundary for LLDB continue and thread-plan resumes."""
+        self.script_exec.payloads.apply_stop()
+        self.script_exec.require_ready()
+        clock = self.auto_clock
+        if not clock.enabled:
+            return action()
+        clock.observe_stop()
+        clock.require_ready()
+        token = clock.pauses.resume()
+        try:
+            result = action()
+            if isinstance(result, lldb.SBError) and result.Fail():
+                clock.pauses.rollback(token)
+            return result
+        except Exception:
+            clock.pauses.rollback(token)
+            raise
+
     def create_target(self, path: str) -> lldb.SBTarget:
         self._dispose_target()
         err = lldb.SBError()
@@ -78,6 +118,7 @@ class Debugger:
             self.state = load_for(path)
         except Exception:
             self.state = None
+        self.timing.rules = self.state.timing_rules if self.state else []
         return self.target
 
     def _dispose_target(self) -> None:
@@ -87,7 +128,13 @@ class Debugger:
         only within their original SBTarget. A replacement starts with all
         target-owned defenses off and can opt in again at its own entry stop.
         """
+        self.script_exec.reset()
         self.cancel_user_step()
+        self.auto_clock.disable()
+        self.auto_clock.hits.clear()
+        self.timing.disable()
+        self.timing.rules = []
+        self.timing.hits.clear()
         self.analysis_cloak.disable()
         self._clear_flag_scrub_returns()
         if self.process and self.process.IsValid():
@@ -237,7 +284,17 @@ class Debugger:
         ]
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
+        self.script_exec.reset(keep_hooks=True)
+        self._retired_hardware_return = None
+        self._hardware_continue = None
+        self._suppress_duplicate_retry = False
         self.cancel_user_step()
+        automatic_requested = self.auto_clock.enabled
+        self.auto_clock.disable()
+        self.auto_clock.hits.clear()
+        timing_requested = self.timing.enabled
+        self.timing.disable()
+        self.timing.hits.clear()
         self._step_cloak_messages.clear()
         self._step_cloak_handled_stop = None
         assert self.target is not None
@@ -256,8 +313,9 @@ class Debugger:
         # sees no PATH and anything it shells out to (do shell script, system,
         # posix_spawn) falls back to /usr/bin:/bin and can't find tools in
         # /usr/sbin like system_profiler. Inherit our environment, minus the
-        # PYTHONPATH macdbg.sh injected for its own use.
-        env = ["{}={}".format(k, v) for k, v in os.environ.items() if k != "PYTHONPATH"]
+        # debugger-only Python path and state-directory configuration.
+        env = ["{}={}".format(k, v) for k, v in os.environ.items()
+               if k not in {"PYTHONPATH", "MACDBG_STATE_DIR"}]
         # The interposer rides DYLD_INSERT_LIBRARIES into every child of the fork
         # tree and reports to a temp file macdbg tails, so children get traced
         # even though lldb can't follow a fork on macOS.
@@ -279,6 +337,18 @@ class Debugger:
         finally:
             self.dbg.SetAsync(was_async)
         self._hook_listener(self.process)
+        if timing_requested:
+            ok, message = self.timing.enable()
+            if not ok:
+                # Retain a blocked requested mode so restart cannot silently
+                # resume with a previously armed defense missing.
+                self.timing.enabled = True
+                raise RuntimeError(message)
+        if automatic_requested:
+            ok, message = self.auto_clock.enable()
+            if not ok:
+                self.auto_clock.enabled = True
+                raise RuntimeError(message)
         return self.process
 
     def is_stopped_at_entry_point(self) -> bool:
@@ -368,8 +438,13 @@ class Debugger:
             return
         bp.SetOneShot(True)
         bp_id = bp.GetID()
-        self.process.Continue()
-        self.delete_breakpoint(bp_id)
+        try:
+            while True:
+                self._run_execution(self.process.Continue)
+                if not self.script_exec.payloads.apply_stop():
+                    break
+        finally:
+            self.delete_breakpoint(bp_id)
 
     def attach_pid(self, pid: int) -> lldb.SBProcess:
         self._dispose_target()
@@ -422,13 +497,19 @@ class Debugger:
 
     def cont(self) -> None:
         if self.process:
+            self.auto_clock.apply_stop()
+            self.timing.require_ready()
+            messages, _ = self.timing.apply_stop()
+            self._step_cloak_messages.extend(messages)
             ok, error = self.analysis_cloak.validate_resume()
             if not ok:
                 raise RuntimeError(error)
             ok, error = self.analysis_cloak.validate_integrity(self.extra_hardware_bp_ids())
             if not ok:
                 raise RuntimeError(error)
-            result = self.process.Continue()
+            from .breakpoints import remember_continue_positions
+            remember_continue_positions(self)
+            result = self._run_execution(self.process.Continue)
             if result.Fail():
                 raise RuntimeError("resume failed: {}".format(result.GetCString()))
 
@@ -472,7 +553,7 @@ class Debugger:
             self._step_active = True
             self._step_target_depth = None
             self._pending_step_scrubs = None
-            t.StepInstruction(False)
+            self._run_execution(lambda: t.StepInstruction(False))
 
     def step_out(self) -> None:
         """Run until the current frame returns (gdb's 'finish')."""
@@ -497,7 +578,7 @@ class Debugger:
 
     def _hardware_step_out(self, thread):
         if not self.analysis_cloak.enabled:
-            thread.StepOut()
+            self._run_execution(thread.StepOut)
             return
         self._check_step_out_frame(thread)
         self._require_step_slot()
@@ -511,7 +592,7 @@ class Debugger:
         if self._step_hardware_policy is not None:
             self._step_plan_depth = thread.GetNumFrames() - 1
             self._step_plan_active = True
-            thread.StepOut()
+            self._run_execution(thread.StepOut)
             return
         values = self.dbg.GetInternalVariableValue(
             "target.require-hardware-breakpoint", self.dbg.GetInstanceName())
@@ -526,7 +607,7 @@ class Debugger:
         try:
             self._step_plan_depth = thread.GetNumFrames() - 1
             self._step_plan_active = True
-            thread.StepOut()
+            self._run_execution(thread.StepOut)
         except Exception:
             self.cancel_user_step()
             raise
@@ -561,6 +642,9 @@ class Debugger:
         if not frame or not frame.IsValid():
             return
         self._process_cloak_step_stop(t)
+        frame = t.GetFrameAtIndex(0)
+        if not frame.IsValid():
+            return
         if self._is_call_at(frame.GetPC()):
             self._require_step_slot()
         self._step_active = True
@@ -569,7 +653,7 @@ class Debugger:
             self._step_target_depth = t.GetNumFrames()
         else:
             self._step_target_depth = None
-        t.StepInstruction(False)
+        self._run_execution(lambda: t.StepInstruction(False))
 
     def advance_user_step(self, auto_bp_ids=None) -> str:
         """Called on every stop. Drives an in-flight user step to completion.
@@ -754,7 +838,7 @@ class Debugger:
             self._arm_step_scrub(thread, "csops")
             return
         if self._flag_scrub_returns and bp_id in self._flag_scrub_returns:
-            # A return one-shot armed by a prior non-step hit fired during the
+            # A return hook armed by a prior non-step hit fired during the
             # step; scrub now and retire it.
             message = self._consume_flag_scrub_return(bp_id, thread)
             if message:
@@ -806,6 +890,11 @@ class Debugger:
         step-out progress. LLDB may report only plan-complete at an API's PC,
         so constituent hooks need the same address matching as new cloak hooks.
         """
+        self.script_exec.payloads.apply_stop()
+        self.auto_clock.apply_stop()
+        self.timing.require_ready()
+        messages, _ = self.timing.apply_stop()
+        self._step_cloak_messages.extend(messages)
         cloak = self.analysis_cloak
         if not cloak.enabled:
             return
@@ -874,18 +963,26 @@ class Debugger:
             thread.GetFrameAtIndex(0).GetPC())
 
     def step_in_source(self) -> None:
+        if self.auto_clock.enabled:
+            raise RuntimeError("automatic clocks require instruction stepping")
+        if self.timing.enabled:
+            raise RuntimeError("timing rules require instruction stepping")
         if self.analysis_cloak.enabled:
             raise RuntimeError("source-level stepping cannot guarantee text integrity; use instruction stepping")
         t = self._thread()
         if t:
-            t.StepInto()
+            self._run_execution(t.StepInto)
 
     def step_over_source(self) -> None:
+        if self.auto_clock.enabled:
+            raise RuntimeError("automatic clocks require instruction stepping")
+        if self.timing.enabled:
+            raise RuntimeError("timing rules require instruction stepping")
         if self.analysis_cloak.enabled:
             raise RuntimeError("source-level stepping cannot guarantee text integrity; use instruction stepping")
         t = self._thread()
         if t:
-            t.StepOver()
+            self._run_execution(t.StepOver)
 
     def interrupt(self) -> None:
         if self.process:
@@ -1040,14 +1137,14 @@ class Debugger:
     # defenses is on, so the same checks issued through the syscall() wrapper
     # (bypassing the libc symbol and the __text svc scan) are still neutralised.
     syscall_bp_ids: Optional[List[int]] = None
-    # return-address one-shots waiting to scrub a flag out of a syscall's output
+    # Return-address hooks waiting to scrub a flag out of a syscall's output
     # buffer once the call fills it: {ret_bp_id: (kind, buffer_addr)}.
     _flag_scrub_returns: Optional[Dict[int, tuple]] = None
     # Retained separately from LLDB's object, which may already be auto-deleted
     # by the time a shared-site stop reports its ID.
     _flag_scrub_return_threads: Optional[Dict[int, int]] = None
     # scrubs deferred while a user step runs: [(frame_depth_at_call, kind, buf)].
-    # We can't Continue mid-step, so instead of a return one-shot we let the
+    # We can't Continue mid-step, so instead of a return hook we let the
     # step's own StepOut run the call, then scrub once its frame has returned.
     _pending_step_scrubs: Optional[List[tuple]] = None
     anti_mach_bp_id: int = 0
@@ -1189,7 +1286,14 @@ class Debugger:
         if not frame or not frame.IsValid():
             return None
         pc = frame.GetPC()
-        # Only act on a real brk instruction -- leave other exceptions alone.
+        module = frame.GetModule()
+        path = str(module.GetFileSpec()) if module and module.IsValid() else ''
+        if path.startswith(('/System/Library/', '/usr/lib/')):
+            return None
+        # Runtime assertions use other BRK immediates. They are faults, not
+        # probes to forward or skip.
+        if self.read_memory(pc, 4) != b'\x00\x00\x20\xd4':
+            return None
         insns = self.target.ReadInstructions(lldb.SBAddress(pc, self.target), 1)
         if insns.GetSize() < 1:
             return None
@@ -1200,11 +1304,7 @@ class Debugger:
         handler = self._read_signal_handler(SIGTRAP)
         ret = lldb.SBCommandReturnObject()
         if handler is None or handler in (0, 1):
-            # SIG_DFL / SIG_IGN / unreadable: step past the brk so we don't trap
-            # on it forever. Keeps the session usable even if we can't forward.
-            self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
-            self.cont()
-            return "self-trap: no SIGTRAP handler, skipped brk at {:#x}".format(pc)
+            return None
         # Deliver: x0 = signo, lr = after the brk (so a handler that returns
         # normally resumes past it), pc = the handler.
         self.ci.HandleCommand("register write x0 {}".format(SIGTRAP), ret, False)
@@ -1264,8 +1364,8 @@ class Debugger:
     _KERN_PROC_PID = 1
 
     def _clear_flag_scrub_returns(self) -> None:
-        """Drop any pending return-address one-shots. Called on (re)launch so a
-        one-shot armed but never reached (process died mid-call) can't fire in a
+        """Drop pending return-address hooks. Called on (re)launch so a
+        hook armed but never reached (process died mid-call) can't fire in a
         fresh run -- with ASLR off its address recurs -- and scrub a stale
         buffer. The entry breakpoints stay; only the transient returns go."""
         if self._flag_scrub_returns and self.target and self.target.IsValid():
@@ -1342,7 +1442,7 @@ class Debugger:
             self.analysis_cloak._critical(
                 str(error) + "; restart at entry after reducing hardware sites")
             return
-        bp.SetOneShot(True)
+        # Consume explicitly: one-shot hardware stops can lose their ID in LLDB.
         bp.SetThreadID(thread.GetThreadID())
         if self._flag_scrub_returns is None:
             self._flag_scrub_returns = {}
@@ -1362,6 +1462,8 @@ class Debugger:
             return None
         kind, buf, oldlenp = self._flag_scrub_returns.pop(bp_id)
         self._flag_scrub_return_threads.pop(bp_id)
+        from .breakpoints import remember_hardware_return
+        remember_hardware_return(self, bp_id)
         self.delete_breakpoint(bp_id)
         return self._scrub_flag(kind, buf, oldlenp) or ""
 
@@ -1433,7 +1535,7 @@ class Debugger:
 
     def handle_flag_scrub_hit(self, bp_id: int) -> Optional[str]:
         """Entry side tags a P_TRACED/CS_DEBUGGED query and arms a return-address
-        one-shot; return side clears the bit in the now-filled buffer. Returns a
+        return hook; return side clears the bit in the now-filled buffer. Returns a
         message to log, "" for handled-but-silent, or None if not ours."""
         if not self.process:
             return None
@@ -1642,7 +1744,7 @@ class Debugger:
     _SETSID_SYMBOLS = ("setsid",)
     setsid_bp_ids: Optional[List[int]] = None
     _EXEC_SYMBOLS = ("system", "popen", "execve", "execvp",
-                     "posix_spawn", "posix_spawnp")
+                     "posix_spawn", "posix_spawnp") + tuple(OSA_CALLS)
 
     def enable_fork_identity(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
@@ -1784,9 +1886,29 @@ class Debugger:
         if self.exec_bp_ids:
             return True, "already enabled"
         for name in self._EXEC_SYMBOLS:
-            bp = self.target.BreakpointCreateByName(name)
+            if name in OSA_CALLS:
+                before = {self.target.GetBreakpointAtIndex(i).GetID()
+                          for i in range(self.target.GetNumBreakpoints())}
+                result = lldb.SBCommandReturnObject()
+                self.ci.HandleCommand('breakpoint set --name {} --shlib OpenScripting --skip-prologue false'.format(name), result, False)
+                created = [self.target.GetBreakpointAtIndex(i)
+                           for i in range(self.target.GetNumBreakpoints())
+                           if self.target.GetBreakpointAtIndex(i).GetID() not in before]
+                if not result.Succeeded() or len(created) != 1:
+                    for item in created:
+                        self.target.BreakpointDelete(item.GetID())
+                    self.disable_exec_sandbox()
+                    return False, 'could not arm OSA execution gate: ' + (result.GetError() or name)
+                bp = created[0]
+            else:
+                bp = self.target.BreakpointCreateByName(name)
             if bp.IsValid():
                 self.exec_bp_ids[bp.GetID()] = name
+        try:
+            self.script_exec.payloads.enable()
+        except RuntimeError as error:
+            self.disable_exec_sandbox()
+            return False, str(error)
         return True, "exec sandbox armed ({} symbol(s))".format(len(self.exec_bp_ids))
 
     def disable_exec_sandbox(self) -> Tuple[bool, str]:
@@ -1795,6 +1917,7 @@ class Debugger:
         for bp_id in self.exec_bp_ids:
             self.delete_breakpoint(bp_id)
         self.exec_bp_ids = {}
+        self.script_exec.reset()
         return True, "exec sandbox disabled"
 
     def _read_full_cstr(self, addr: int, cap: int = 1 << 20) -> str:
@@ -1826,6 +1949,8 @@ class Debugger:
         if not self.exec_bp_ids or bp_id not in self.exec_bp_ids or not self.process:
             return None
         name = self.exec_bp_ids[bp_id]
+        if name in OSA_CALLS:
+            return self.script_exec.capture(bp_id)
         thread = self.process.GetSelectedThread()
         if not thread or not thread.IsValid():
             return None
@@ -1860,6 +1985,8 @@ class Debugger:
 
     @staticmethod
     def exec_payload_len(cap: dict) -> int:
+        if cap.get('kind') == 'osa':
+            return cap.get('payload_bytes') or 0
         if cap["cmd"] is not None:
             return len(cap["cmd"])
         return len(cap["path"] or "") + sum(len(a) for a in (cap["argv"] or []))
@@ -1880,11 +2007,49 @@ class Debugger:
         return os.path.join(STATE_DIR, "unknown", "dumps")
 
     def dump_exec_payload(self, bp_id: int) -> Optional[Tuple[str, int]]:
-        """Write the full command / argv for the exec we're paused on to
-        ~/.macdbg/dumps/ and return (path, bytes). None if not on an exec BP."""
+        """Save captured input and any readable OSA companion; return raw (path, bytes)."""
         cap = self._capture_exec(bp_id)
         if cap is None:
             return None
+        if cap.get('kind') == 'osa':
+            import tempfile
+            payload = self.script_exec.payload_for_dump()
+            directory = self._dumps_dir()
+            os.makedirs(directory, exist_ok=True)
+            fd, path = tempfile.mkstemp(prefix='{}-pid{}-{}-'.format(
+                time.strftime('%Y%m%d-%H%M%S'), self.process.GetProcessID(), cap['sym']),
+                suffix=payload.suffix, dir=directory)
+            try:
+                with os.fdopen(fd, 'wb') as output:
+                    if output.write(payload.data) != len(payload.data):
+                        raise OSError('incomplete script payload dump')
+            except Exception:
+                os.unlink(path)
+                raise
+            details = {'raw_path': path, 'raw_bytes': len(payload.data)}
+            content = self.script_exec.pending['content']
+            if content.kind != 'unavailable':
+                if payload.suffix == '.applescript.txt' and content.kind == 'source':
+                    details.update(content_path=path, content_bytes=len(payload.data))
+                else:
+                    content_path = path + '.applescript.txt'
+                    created = False
+                    try:
+                        content_fd = os.open(content_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        created = True
+                        with os.fdopen(content_fd, 'wb') as output:
+                            body = content.dump_bytes()
+                            if output.write(body) != len(body):
+                                raise OSError('incomplete readable script dump')
+                        details.update(content_path=content_path, content_bytes=len(body))
+                    except OSError as error:
+                        if created:
+                            os.unlink(content_path)
+                        details['content_error'] = 'Readable dump failed: ' + str(error)
+            else:
+                details['content_error'] = content.note
+            self.script_exec.pending['dump'] = details
+            return path, len(payload.data)
         lines = ["symbol: {}".format(cap["sym"])]
         if cap["path"] is not None:
             lines.append("path: {}".format(cap["path"]))
@@ -1910,16 +2075,27 @@ class Debugger:
             f.write(body)
         return path, len(body)
 
-    def resolve_exec(self, decision: str = "block", name: str = "") -> None:
-        if not self.process:
-            return
+    def resolve_exec(self, decision: str = "block", name: str = "") -> bool:
+        if decision not in ('block', 'fake', 'allow'):
+            raise ValueError('invalid exec decision')
+        if not self.process or self.process.GetState() != lldb.eStateStopped:
+            raise RuntimeError('exec decision requires a stopped process')
+        if name in OSA_CALLS:
+            self.script_exec.resolve(decision)
+            if self.script_exec.find_hit() is not None:
+                return False
+            self.cont()
+            return True
         ret = lldb.SBCommandReturnObject()
         if decision == "block":
             self.ci.HandleCommand("thread return -1", ret, False)
         elif decision == "fake":
             self.ci.HandleCommand(
                 "thread return {}".format(self._exec_success_value(name)), ret, False)
+        if decision != 'allow' and not ret.Succeeded():
+            raise RuntimeError('could not resolve exec call: ' + (ret.GetError() or 'return failed'))
         self.cont()
+        return True
 
     @staticmethod
     def _exec_success_value(name: str) -> int:
@@ -1951,8 +2127,8 @@ class Debugger:
         if dumped:
             note = " — full payload ({} B) → {}".format(dumped[1], dumped[0])
         self.resolve_exec("block", name)
-        return 'blocked {}("{}") — returned -1{}'.format(
-            name, self._exec_preview(cap)[:120], note)
+        return 'blocked {}("{}") — returned {}{}'.format(
+            name, self._exec_preview(cap)[:120], -128 if name in OSA_CALLS else -1, note)
 
     def handle_anti_ptrace_hit(self, bp_id: int) -> Optional[str]:
         if bp_id != self.anti_ptrace_bp_id or not self.process:

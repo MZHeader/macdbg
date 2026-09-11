@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # Build macdbg.app (at the repo root) — the double-clickable entry point.
 #
-# The bundle is a thin launcher: it hard-codes this checkout's path, sets
-# PYTHONPATH to the system LLDB Python bindings, and execs GUI/main.py under
-# /usr/bin/python3 (the only interpreter that can `import lldb` AND has tkinter).
-# It runs unsigned for local use — launch + attach work because LLDB spawns
-# Apple-signed debugserver.
+# The native launcher resolves the adjacent checkout and invokes GUI/run.sh.
+# The complete bundle is ad-hoc signed after its resources are populated.
 set -eu
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/.." && pwd)"
+VERSION="$(/usr/bin/python3 -c 'import runpy,sys; print(runpy.run_path(sys.argv[1])["__version__"])' "$REPO/macdbg/__init__.py")"
 APP="$REPO/macdbg.app"
 CONTENTS="$APP/Contents"
 
@@ -24,8 +22,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key>     <string>macdbg</string>
     <key>CFBundleExecutable</key>      <string>macdbg</string>
     <key>CFBundleIdentifier</key>      <string>tech.mzheader.macdbg.gui</string>
-    <key>CFBundleVersion</key>         <string>1.2.0</string>
-    <key>CFBundleShortVersionString</key> <string>1.2.0</string>
+    <key>CFBundleVersion</key>         <string>$VERSION</string>
+    <key>CFBundleShortVersionString</key> <string>$VERSION</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>

@@ -147,6 +147,10 @@ class AllAntiDebugger:
     """Stateful GUI boundary fake that models breakpoint mode and ownership."""
 
     def __init__(self, *, preenabled_direct=False):
+        from macdbg.core.timing import TimingDefense
+        from macdbg.core.auto_clock import AutomaticClock
+        self.timing = TimingDefense(self)
+        self.auto_clock = AutomaticClock(self)
         self.calls = []
         self.analysis_cloak = FakeCloak()
         self.analysis_cloak.debugger = self
@@ -282,6 +286,10 @@ def make_engine(*, enabled=False, safe=True, error=None):
         exec_bp_ids={},
         exec_interactive=False,
     )
+    from macdbg.core.timing import TimingDefense
+    from macdbg.core.auto_clock import AutomaticClock
+    debugger.timing = TimingDefense(debugger)
+    debugger.auto_clock = AutomaticClock(debugger)
     debugger.enable_analysis_cloak = operation(
         "enable_analysis_cloak", ("analysis_cloak", cloak))
     debugger.disable_analysis_cloak = operation(

@@ -1,0 +1,2 @@
+# Preserve formatting in the vendored scripting dictionaries.
+macdbg/_vendor/osa/applescript_decompiler/data/*.sdef -whitespace

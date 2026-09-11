@@ -108,6 +108,10 @@ class HookBreakpoint:
     def GetNumLocations(self):
         return self.locations
 
+    def GetLocationAtIndex(self, index):
+        assert 0 <= index < self.locations
+        return types.SimpleNamespace(IsResolved=lambda: True)
+
     def IsValid(self):
         return self.valid
 

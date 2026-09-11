@@ -3,6 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <pthread.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <mach-o/loader.h>
@@ -127,12 +128,12 @@ static int check_sysctl(void) {
     return bad;
 }
 
-static int check_sysctl_two_stage(void) {
-    const char *names[] = {"kern.hv_vmm_present", "hw.model", "machdep.cpu.brand_string"};
-    const size_t expected_sizes[] = {4, 8, 13};
-    const char *expected_strings[] = {NULL, "Mac14,6", "Apple M2 Pro"};
+static int check_sysctl_two_stage(int include_uuid) {
+    const char *names[] = {"kern.hv_vmm_present", "hw.model", "machdep.cpu.brand_string", "kern.hostuuid"};
+    const size_t expected_sizes[] = {4, 8, 13, 37};
+    const char *expected_strings[] = {NULL, "Mac14,6", "Apple M2 Pro", "8D4C7A12-3F65-4B90-A2DE-61C8E5079F34"};
     int bad = 0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < (include_uuid ? 4 : 3); i++) {
         size_t size = 0;
         int rc = sysctlbyname(names[i], NULL, &size, NULL, 0);
         if (rc != 0 || size == 0 || size > 4096) return 2;
@@ -152,8 +153,9 @@ static int check_sysctl_two_stage(void) {
     return bad;
 }
 
-static int check_sysctl_failure(const char *call, int expected_errno) {
-    unsigned char value[32], original[32];
+static int check_sysctl_failure(const char *call, int expected_errno, const char *name) {
+    if (strcmp(name, "hw.model") && strcmp(name, "kern.hostuuid")) return 64;
+    unsigned char value[96], original[96];
     memset(value, 0xa5, sizeof(value));
     memcpy(original, value, sizeof(value));
     size_t size = strcmp(call, "short") == 0 ? 4 : sizeof(value);
@@ -161,7 +163,7 @@ static int check_sysctl_failure(const char *call, int expected_errno) {
     void *newp = strcmp(call, "write") == 0 ? &proposed : NULL;
     size_t newlen = newp || strcmp(call, "newlen") == 0 ? sizeof(proposed) : 0;
     errno = 0;
-    int rc = sysctlbyname("hw.model", value, &size, newp, newlen);
+    int rc = sysctlbyname(name, value, &size, newp, newlen);
     int actual_errno = errno;
     int bad = rc != -1 || actual_errno != expected_errno ||
               size != (strcmp(call, "short") == 0 ? 0 : sizeof(value)) ||
@@ -169,6 +171,23 @@ static int check_sysctl_failure(const char *call, int expected_errno) {
     printf("SYSCTL-FAILURE:%s call=%s rc=%d errno=%d\n",
            bad ? "DETECTED" : "preserved", call, rc, actual_errno);
     return bad;
+}
+
+static void *sysctl_worker(void *unused) {
+    (void)unused;
+    return (void *)(uintptr_t)check_sysctl_two_stage(1);
+}
+
+static int check_sysctl_workers(void) {
+    for (int round = 0; round < 2; round++) {
+        pthread_t thread;
+        void *result = NULL;
+        errno = EBUSY;
+        if (pthread_create(&thread, NULL, sysctl_worker, NULL) ||
+            pthread_join(thread, &result) || result) return 2;
+    }
+    puts("SYSCTL-WORKERS:clean");
+    return 0;
 }
 
 static int copy_cfstring_property(io_registry_entry_t service,
@@ -206,6 +225,40 @@ static int check_iokit(void) {
     return bad;
 }
 
+static int check_uuid_identity(int allow_missing) {
+    const char expected[] = "8D4C7A12-3F65-4B90-A2DE-61C8E5079F34";
+    io_registry_entry_t service = IOServiceGetMatchingService(
+        kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"));
+    char iokit_uuid[128] = {0};
+    int readable = service && copy_cfstring_property(
+        service, CFSTR("IOPlatformUUID"), iokit_uuid, sizeof(iokit_uuid));
+    if (service) IOObjectRelease(service);
+    int bad = !readable || strcmp(iokit_uuid, expected) != 0;
+    size_t size = 0;
+    errno = 0;
+    int rc = sysctlbyname("kern.hostuuid", NULL, &size, NULL, 0);
+    if (allow_missing && rc == -1 && errno == ENOENT && size == 0) {
+        printf("UUID-IDENTITY:unavailable errno=%d iokit=%s\n", errno, bad ? "DETECTED" : "clean");
+        return bad;
+    }
+    if (rc || size != sizeof(expected))
+        return 1;
+    unsigned char exact[sizeof(expected) + 8];
+    memset(exact, 0xa5, sizeof(exact));
+    if (sysctlbyname("kern.hostuuid", exact, &size, NULL, 0) || size != sizeof(expected))
+        return 1;
+    bad |= memcmp(exact, expected, sizeof(expected)) != 0;
+    for (size_t i = sizeof(expected); i < sizeof(exact); ++i) bad |= exact[i] != 0xa5;
+    unsigned char oversized[96];
+    memset(oversized, 0xa5, sizeof(oversized));
+    size_t capacity = sizeof(oversized);
+    if (sysctlbyname("kern.hostuuid", oversized, &capacity, NULL, 0) || capacity != sizeof(expected))
+        return 1;
+    bad |= memcmp(oversized, expected, sizeof(expected)) != 0;
+    printf("UUID-IDENTITY:%s size=%zu\n", bad ? "DETECTED" : "clean", size);
+    return bad;
+}
+
 static int check_images(const char *path) {
     void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
@@ -228,6 +281,17 @@ static int check_images(const char *path) {
            bad ? " path=" : "", detected);
     dlclose(handle);
     return bad;
+}
+
+static int check_image_stress(void) {
+    uint32_t count = _dyld_image_count();
+    if (!count) return 2;
+    for (uint32_t i = 0; i < 1024; i++) {
+        const char *name = _dyld_get_image_name(i % count);
+        if (!name || !*name || contains_image_marker(name)) return 1;
+    }
+    puts("IMAGE-STRESS:clean");
+    return 0;
 }
 
 __attribute__((used, noinline)) void integrity_breakpoint_site(void) {
@@ -440,12 +504,21 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "sysctl") == 0)
         return check_sysctl();
     if (strcmp(argv[1], "sysctl_two_stage") == 0)
-        return check_sysctl_two_stage();
+        return check_sysctl_two_stage(0);
+    if (strcmp(argv[1], "sysctl_uuid_two_stage") == 0)
+        return check_sysctl_two_stage(1);
+    if (strcmp(argv[1], "sysctl_workers") == 0)
+        return check_sysctl_workers();
     if (strcmp(argv[1], "sysctl_failure") == 0)
-        return argc == 4 ? check_sysctl_failure(argv[2], atoi(argv[3])) : 64;
+        return argc == 4 || argc == 5 ? check_sysctl_failure(
+            argv[2], atoi(argv[3]), argc == 5 ? argv[4] : "hw.model") : 64;
     if (strcmp(argv[1], "iokit") == 0)
         return check_iokit();
+    if (strcmp(argv[1], "uuid_identity") == 0)
+        return check_uuid_identity(argc == 3 && !strcmp(argv[2], "allow_missing"));
     if (strcmp(argv[1], "images") == 0)
         return argc == 3 ? check_images(argv[2]) : 64;
+    if (strcmp(argv[1], "image_stress") == 0)
+        return check_image_stress();
     return 65;
 }

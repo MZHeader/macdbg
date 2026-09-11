@@ -10,7 +10,7 @@ fixtures, including a combined fixture whose failed checks corrupt a derived
 ChaCha20 key and prevent recovery of a known payload.
 
 All development and testing takes place in the isolated
-`/Users/liamchugg/Projects/macdbg/testing` repository copy. The original
+`testing/` repository copy. The original
 repository remains untouched.
 
 ## Scope
@@ -243,7 +243,7 @@ debugged child or agent daemon remains alive.
 
 ## Acceptance Criteria
 
-- The original `/Users/liamchugg/Projects/macdbg` working tree has no new source
+- The original repository working tree has no new source
   modifications from this project.
 - All new unit and integration tests pass in the isolated `testing` copy.
 - Each supported standalone fixture demonstrates detection without its

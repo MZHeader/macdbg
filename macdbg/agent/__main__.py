@@ -20,7 +20,8 @@ import sys
 import time
 from typing import Optional
 
-SESSIONS_ROOT = os.path.expanduser("~/.macdbg/agent-sessions")
+SESSIONS_ROOT = os.path.join(os.path.abspath(os.path.expanduser(
+    os.environ.get("MACDBG_STATE_DIR", "~/.macdbg"))), "agent-sessions")
 
 # AF_UNIX sockaddr paths are limited to ~104 bytes on macOS; a session name
 # long enough to blow that budget makes the daemon die at bind() with an

@@ -73,6 +73,7 @@ class Engine:
         self._resuming = False
         self._last_stop_event_key = None
         self._pending_exec = None   # (name, cmd, bp_id)
+        self._pending_exec_token = None
         self._pending_fork = None   # (name,)
 
         self._q: "queue.Queue" = queue.Queue()
@@ -221,8 +222,23 @@ class Engine:
         with self._subs_lock:
             self._subs.add(q)
         # a fresh subscriber gets the current state immediately
-        self.submit(self._emit_state)
+        self.submit(self._emit_subscriber_state)
         return q
+
+    def _emit_subscriber_state(self):
+        self._emit_state()
+        if self._pending_exec is not None:
+            self._emit_exec_prompt()
+        elif self._pending_fork is not None:
+            self._emit({'t': 'prompt', 'kind': 'fork', 'name': self._pending_fork[0]})
+
+    def _emit_exec_prompt(self, **details):
+        if self._pending_exec is None:
+            return
+        name, command, _bid = self._pending_exec
+        script_details = (self.dbg.script_exec.prompt_details() if name.startswith('OSA') else {})
+        self._emit({'t': 'prompt', 'kind': 'exec', 'name': name, 'cmd': command,
+                    'token': self._pending_exec_token, **script_details, **details})
 
     def unsubscribe(self, q) -> None:
         with self._subs_lock:
@@ -380,12 +396,36 @@ class Engine:
             self._resuming = False
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
+            try:
+                self.dbg.auto_clock.observe_stop(e.observed_ns or None)
+                from macdbg.core.breakpoints import consume_hardware_debugger_duplicate
+                if consume_hardware_debugger_duplicate(self.dbg):
+                    self._console('[debugger] retried duplicate hardware debugger stop')
+                    self.dbg.cont()
+                    self._resuming = True
+                    return
+                payload_only = self.dbg.script_exec.payloads.apply_stop()
+                clock_only = self.dbg.auto_clock.apply_stop()
+                messages, timing_only = self.dbg.timing.apply_stop()
+                for message in messages:
+                    self._console(message)
+            except RuntimeError as error:
+                self._resume_failed(error)
+                return
             cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
                 self.tracer.hardware_bp_ids)
             if not cloak_ok:
                 self.dbg.cancel_user_step()
                 self._console("[anti-analysis] " + cloak_error, error=True)
                 self._emit_state()
+                return
+            try:
+                if self.dbg.script_exec.find_hit() is not None:
+                    self.dbg.cancel_user_step()
+                    self._handle_anti_debug_hit()
+                    return
+            except RuntimeError as error:
+                self._resume_failed(error)
                 return
             if self.dbg.in_user_step():
                 if self.tracer.enabled:
@@ -402,6 +442,13 @@ class Engine:
                     return
                 self._console(self._describe_stop())
                 self._emit_state()
+                return
+            if timing_only or clock_only or payload_only:
+                try:
+                    self.dbg.cont()
+                    self._resuming = True
+                except RuntimeError as error:
+                    self._resume_failed(error)
                 return
             if self.dbg.in_fork_shield():
                 self.dbg.finish_fork_shield()
@@ -481,6 +528,7 @@ class Engine:
         p = self.dbg.process
         if not p or not p.IsValid():
             return False
+        script_bp = self.dbg.script_exec.find_hit()
         thread = p.GetSelectedThread()
         if not thread or not thread.IsValid():
             return False
@@ -488,9 +536,15 @@ class Engine:
         if trap_msg is not None:
             self._console("[anti-debug] " + trap_msg)
             return True
-        if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
+        if script_bp is not None and not self.dbg.exec_interactive:
+            self.dbg.cancel_user_step()
+            while script_bp is not None:
+                self._console('[exec sandbox] ' + self.dbg.handle_exec_hit(script_bp))
+                script_bp = self.dbg.script_exec.find_hit()
+            return True
+        if thread.GetStopReason() != lldb.eStopReasonBreakpoint and script_bp is None:
             return False
-        bp_ids = self._stop_bp_ids(thread)
+        bp_ids = [script_bp] if script_bp is not None else self._stop_bp_ids(thread)
         if not bp_ids:
             return False
         exec_bp = next((b for b in bp_ids if b in self.dbg.exec_bp_ids), None) \
@@ -503,9 +557,11 @@ class Engine:
                     name, cmd = peeked
                     caller = self._exec_caller_site()
                     self._pending_exec = (name, cmd, exec_bp)
+                    self._pending_exec_token = '{}:{}:{}:{}:{}'.format(
+                        p.GetProcessID(), p.GetStopID(), thread.GetThreadID(),
+                        thread.GetFrameAtIndex(0).GetPC(), exec_bp)
                     self._emit_state(disasm_center=caller)
-                    self._emit({"t": "prompt", "kind": "exec", "name": name,
-                                "cmd": cmd, "caller": caller})
+                    self._emit_exec_prompt(caller=caller)
                     return True
         if self.dbg.fork_interactive and self.dbg.fork_bp_ids:
             fork_bp = next((b for b in bp_ids if b in self.dbg.fork_bp_ids), None)
@@ -595,7 +651,10 @@ class Engine:
     def _hidden_bp_ids(self) -> set:
         ids = set(self.tracer._bp_to_name)
         d = self.dbg
+        ids.update(d.auto_clock.hidden_bp_ids())
+        ids.update(d.timing.hidden_bp_ids())
         ids.update(d.analysis_cloak.hidden_bp_ids())
+        ids.update(d.script_exec.payloads.hidden_ids())
         for attr in ("anti_ptrace_bp_id", "anti_sysctl_bp_id", "anti_csops_bp_id",
                      "anti_mach_bp_id"):
             v = getattr(d, attr, 0)
@@ -622,6 +681,16 @@ class Engine:
             return False
         p = self.dbg.process
         if not (p and p.IsValid() and p.GetState() == lldb.eStateStopped):
+            return False
+        clock_ok, clock_error = self.dbg.auto_clock.validate()
+        if not clock_ok:
+            self._console("[clock] " + clock_error, error=True)
+            self._emit_state()
+            return False
+        timing_ok, timing_error = self.dbg.timing.validate()
+        if not timing_ok:
+            self._console("[timing] " + timing_error, error=True)
+            self._emit_state()
             return False
         cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_resume()
         if not cloak_ok:
@@ -705,6 +774,8 @@ class Engine:
         if not self.dbg.target or not self.dbg.target.IsValid():
             self._console("[restart] no target loaded", error=True)
             return
+        self._pending_exec = self._pending_fork = None
+        self._pending_exec_token = None
         self._forget_stop_event_identity()
         p = self.dbg.process
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
@@ -713,7 +784,7 @@ class Engine:
         if self._interpose_thread is not None:
             self._interpose_thread.join(timeout=0.5)
             self._interpose_thread = None
-        hidden = self._hidden_bp_ids()
+        hidden = self._hidden_bp_ids() - self.dbg.script_exec.breakpoint_ids()
         for bid in hidden:
             self.dbg.set_bp_enabled(bid, False)
         try:
@@ -999,6 +1070,33 @@ class Engine:
         for m in msgs:
             self._console("[anti-debug] " + m)
 
+    def _t_anti_timing(self):
+        timing = self.dbg.timing
+        self._refresh_after_single_defense(timing.disable() if timing.enabled else timing.enable())
+
+    def _t_auto_clock(self):
+        clock = self.dbg.auto_clock
+        self._refresh_after_single_defense(clock.disable() if clock.enabled else clock.enable())
+
+    def _c_timing_rule_add(self, args):
+        try:
+            rule = self.dbg.timing.add(args)
+            self._console("[timing] configured " + rule["name"])
+        except (KeyError, ValueError, TypeError) as error:
+            if not self.dbg.timing.enabled:
+                self.dbg.timing.last_error = str(error)
+            self._console("[timing] " + str(error), error=True)
+        self._emit_state()
+
+    def _c_timing_rule_remove(self, args):
+        try:
+            self.dbg.timing.remove(args["name"])
+        except (KeyError, ValueError, TypeError) as error:
+            if not self.dbg.timing.enabled:
+                self.dbg.timing.last_error = str(error)
+            self._console("[timing] " + str(error), error=True)
+        self._emit_state()
+
     def _refresh_after_single_defense(self, result):
         ok, message = result
         self._console("[anti-debug] " + message, error=not ok)
@@ -1121,12 +1219,27 @@ class Engine:
 
     def _defense_states(self) -> dict:
         d = self.dbg
+        timing = d.timing.status()
+        automatic = d.auto_clock.status()
         cloak = d.analysis_cloak.status()
         cloak_safe, cloak_error = d.analysis_cloak.validate_resume()
         if cloak_safe:
             cloak_safe, cloak_error = d.analysis_cloak.validate_integrity(
                 self.tracer.hardware_bp_ids)
         return {
+            "auto_clock": automatic["enabled"],
+            "auto_clock_safe": automatic["safe"],
+            "auto_clock_error": automatic["error"],
+            "auto_clock_status": automatic,
+            "anti_timing": timing["enabled"],
+            "anti_timing_safe": timing["safe"],
+            "anti_timing_error": timing["error"],
+            "timing_rules": [
+                {**rule, **({"value": hex(int(rule["value"])), "mask": hex(int(rule["mask"]))}
+                           if "register" in rule else {})}
+                for rule in timing["rules"]
+            ],
+            "timing_hits": timing["hits"],
             "all_anti": bool(d.analysis_cloak.enabled
                              and d.anti_ptrace_bp_id and d.direct_syscall_bp_ids and d.anti_mach_bp_id
                              and d.anti_sysctl_bp_id and d.anti_csops_bp_id
@@ -1206,18 +1319,41 @@ class Engine:
         if self._pending_exec is None:
             return
         name, cmd, bp_id = self._pending_exec
+        if a.get('token') is not None and a['token'] != self._pending_exec_token:
+            self._emit_exec_prompt(dump_error='This request belongs to an earlier stop; the current call is still paused.')
+            return
         decision = a.get("decision", "block")
         if decision == "dump":
-            dumped = self.dbg.dump_exec_payload(bp_id)
-            if dumped:
-                self._console("[anti-debug] payload ({} B) → {}".format(dumped[1], dumped[0]))
-            self._emit({"t": "prompt", "kind": "exec", "name": name, "cmd": cmd})
+            try:
+                dumped = self.dbg.dump_exec_payload(bp_id)
+                if not dumped:
+                    raise RuntimeError('payload could not be captured')
+                message = 'Saved {} bytes to {}'.format(dumped[1], dumped[0])
+                if name.startswith('OSA'):
+                    content_path = self.dbg.script_exec.pending['dump'].get('content_path')
+                    if content_path:
+                        message = 'Readable content: {}. Original bytes: {}'.format(content_path, dumped[0])
+                self._console('[exec sandbox] ' + message)
+                self._emit_exec_prompt(dump_result=message, dump_path=dumped[0], dump_bytes=dumped[1])
+            except (RuntimeError, OSError) as error:
+                self._console('[exec sandbox] ' + str(error), error=True)
+                self._emit_exec_prompt(dump_error=str(error))
             return
         if decision not in ("allow", "fake", "block"):
             decision = "block"
+        try:
+            resumed = self.dbg.resolve_exec(decision, name)
+        except Exception as error:
+            self._console('[exec sandbox] ' + str(error), error=True)
+            self._emit_state()
+            self._emit_exec_prompt()
+            return
         self._pending_exec = None
-        self.dbg.resolve_exec(decision, name)
+        self._pending_exec_token = None
         self._console('[anti-debug] {} {}("{}")'.format(decision.upper(), name, cmd[:120]))
+        if resumed is False:
+            self._handle_anti_debug_hit()
+            return
         self._emit({"t": "running"})
 
     def _c_decide_fork(self, a):
@@ -1287,6 +1423,7 @@ class Engine:
         if self.tracer.enabled:
             self.tracer.disable(self.dbg.target)
         self._pending_exec = self._pending_fork = None
+        self._pending_exec_token = None
         self._resuming = False
         self._forget_stop_event_identity()
         self._prev_regs = {}
@@ -1458,6 +1595,8 @@ Engine._COMMANDS = {
     "watch_set": Engine._c_watch_set, "watch_clear": Engine._c_watch_clear,
     "search": Engine._c_search, "scan_strings": Engine._c_scan_strings,
     "defense": Engine._c_defense, "trace_toggle": Engine._c_trace_toggle,
+    "timing_rule_add": Engine._c_timing_rule_add,
+    "timing_rule_remove": Engine._c_timing_rule_remove,
     "trace_scope": Engine._c_trace_scope, "trace_clear": Engine._c_trace_clear,
     "fork_trace": Engine._c_fork_trace, "decide_exec": Engine._c_decide_exec,
     "decide_fork": Engine._c_decide_fork, "run_cmd": Engine._c_run_cmd,
@@ -1468,6 +1607,8 @@ Engine._COMMANDS = {
 }
 Engine._SYNC = {"complete", "list_processes"}
 Engine._DEFENSE_TOGGLES = {
+    "auto_clock": Engine._t_auto_clock,
+    "anti_timing": Engine._t_anti_timing,
     "all_anti": Engine._t_all_anti,
     "analysis_cloak": Engine._t_analysis_cloak,
     "deny_attach": Engine._t_deny_attach,

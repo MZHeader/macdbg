@@ -12,7 +12,8 @@ int sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
     int model = strcmp(name, "hw.model") == 0;
     int cpu = strcmp(name, "machdep.cpu.brand_string") == 0;
     int hv = strcmp(name, "kern.hv_vmm_present") == 0;
-    if (!model && !cpu && !hv) {
+    int hostuuid = strcmp(name, "kern.hostuuid") == 0;
+    if (!model && !cpu && !hv && !hostuuid) {
         int (*real_query)(const char *, void *, size_t *, void *, size_t) =
             dlsym(RTLD_NEXT, "sysctlbyname");
         return real_query(name, oldp, oldlenp, newp, newlen);
@@ -28,10 +29,10 @@ int sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
     }
 
     const char *scenario = getenv("MACDBG_TEST_SYSCTL_HOST");
-    size_t real_size = hv ? 4 : model ? 8 : 13;
+    size_t real_size = hv ? 4 : hostuuid ? 37 : model ? 8 : 13;
     if (!hv && scenario && strcmp(scenario, "shorter") == 0) real_size = 2;
     if (!hv && scenario && strcmp(scenario, "longer") == 0)
-        real_size = model ? 64 : 80;
+        real_size = model || hostuuid ? 64 : 80;
     unsigned char value[80];
     memset(value, 'H', real_size);
     value[real_size - 1] = 0;

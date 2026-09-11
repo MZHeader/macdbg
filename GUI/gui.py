@@ -38,7 +38,8 @@ except Exception as _e:  # pywebview/pyobjc unavailable -> browser fallback
     _HAVE_NATIVE = False
     sys.stderr.write("[gui] native toolkit unavailable at import: {!r}\n".format(_e))
 
-_APP_VERSION = "1.1.0"
+sys.path.insert(0, REPO)
+from macdbg import __version__ as _APP_VERSION
 _about_handler = None  # keep a strong ref: NSMenuItem doesn't retain its target
 
 _REPO_URL = "https://github.com/MZHeader/macdbg"
