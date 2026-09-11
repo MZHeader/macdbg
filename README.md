@@ -52,7 +52,7 @@ Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry
 
 * **Analysis cloak** hides debugger environment variables, parent details, VM/hardware identity, and instrumentation libraries while keeping the target’s code intact. Turn it on at the entry point.
 
-* **Hide debugger pauses (ARM64)** subtracts time spent paused from supported clock and counter reads, helping defeat timing checks that spot the delay from breakpoints or stepping. Turn it on at the entry point; normal execution and sleeps still count.
+* **Hide debugger pauses** subtracts time spent paused from supported clock and counter reads, helping defeat timing checks that spot the delay from breakpoints or stepping. Turn it on at the entry point; normal execution and sleeps still count.
 
 * **Defeat PT_DENY_ATTACH via libc** hooks `ptrace` and returns `0`, so the deny flag never reaches the kernel.
 
