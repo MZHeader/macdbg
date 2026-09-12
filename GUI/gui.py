@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -21,6 +22,9 @@ import urllib.request
 GUI = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(GUI)
 _URL = None  # backend base URL, set once the backend reports its port
+_TOKEN = ""
+_BACKEND = None
+_shutdown_lock = threading.Lock()
 
 # Import the native GUI toolkit (pywebview + pyobjc) eagerly, at module load,
 # while the interpreter is pristine — before we spawn the backend subprocess or
@@ -107,7 +111,9 @@ def _native_arch() -> str:
 
 
 def _start_backend(args):
+    global _TOKEN
     env = os.environ.copy()
+    env["MACDBG_WATCH_PARENT"] = "1"
     # The 3.9 backend needs only lldb + the repo — NOT the 3.13 pywebview vendor
     # dir that may be on our PYTHONPATH.
     env["PYTHONPATH"] = ":".join(p for p in (_lldb_pythonpath(), REPO) if p)
@@ -133,20 +139,32 @@ def _start_backend(args):
          "/usr/bin/python3", os.path.join(GUI, "serve.py")] + args,
         env=env, stdout=subprocess.PIPE, text=True)
     port = None
-    deadline = time.time() + 25
-    while time.time() < deadline:
-        line = be.stdout.readline()
-        if not line:
-            if be.poll() is not None:
-                break
-            continue
+    lines = queue.Queue()
+    boot_complete = threading.Event()
+    def read_lines():
+        for line in be.stdout:
+            if not boot_complete.is_set():
+                lines.put(line)
+        if not boot_complete.is_set():
+            lines.put(None)
+    threading.Thread(target=read_lines, daemon=True).start()
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        try:
+            line = lines.get(timeout=max(0.01, deadline - time.monotonic()))
+        except queue.Empty:
+            break
+        if line is None:
+            break
+        if line.startswith("TOKEN="):
+            _TOKEN = line.strip()[6:]
         if line.strip().startswith("PORT="):
             try:
                 port = int(line.strip()[5:])
             except ValueError:
                 pass
             break
-    threading.Thread(target=lambda: [None for _ in be.stdout], daemon=True).start()
+    boot_complete.set()
     return be, port
 
 
@@ -158,10 +176,27 @@ def post(name, args=None):
         req = urllib.request.Request(
             _URL + "cmd",
             data=json.dumps({"name": name, "args": args or {}}).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json", "X-Macdbg-Token": _TOKEN})
         urllib.request.urlopen(req, timeout=5).read()
     except Exception:
         pass
+
+
+def _shutdown_backend(*_args):
+    with _shutdown_lock:
+        be = _BACKEND
+        if be is None or be.poll() is not None:
+            return
+        post("shutdown")
+        try:
+            be.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            be.terminate()
+            try:
+                be.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                be.kill()
+                be.wait()
 
 
 def _set_app_name(name: str) -> None:
@@ -269,12 +304,23 @@ def _set_dock_icon() -> None:
 
 
 def _open_dialog():
+    path = _choose_target()
+    if path:
+        post("ui", {"action": "launch", "path": path})
+
+
+def _choose_target():
     if not _webview.windows:
         return
     paths = _webview.windows[0].create_file_dialog(_webview.OPEN_DIALOG,
                                                    allow_multiple=False)
     if paths:
-        post("open_target", {"path": paths[0], "args": []})
+        return paths[0]
+
+
+class _NativeAPI:
+    def choose_target(self):
+        return _choose_target()
 
 
 def _build_menu():
@@ -326,7 +372,7 @@ def _run_selftest(url: str, out_path: str) -> None:
     Writes PASS/FAIL to out_path. Enabled via MACDBG_SELFTEST=<path>."""
     res = "FAIL: no state"
     try:
-        r = urllib.request.urlopen(url + "events", timeout=10)
+        r = urllib.request.urlopen(urllib.request.Request(url + "events", headers={"X-Macdbg-Token": _TOKEN}), timeout=10)
         deadline = time.time() + 10
         buf = b""
         while time.time() < deadline:
@@ -378,9 +424,10 @@ def _try_native_window() -> bool:
             _webview.settings['SHOW_DEFAULT_MENUS'] = False
         except Exception:
             pass
-        win = _webview.create_window("macdbg", _URL, width=1680, height=1040,
-                                     min_size=(1100, 720), background_color="#1b1b1c")
+        win = _webview.create_window("macdbg", _URL + "#token=" + _TOKEN, width=1680, height=1040,
+                                     min_size=(1100, 720), background_color="#1b1b1c", js_api=_NativeAPI())
         try:
+            win.events.closing += _shutdown_backend
             win.events.shown += _after_start  # 2nd trigger; some pywebview builds
         except Exception:                     # ignore start()'s func argument
             pass
@@ -417,9 +464,10 @@ def _browser_open(url: str):
 
 
 def main() -> int:
-    global _URL
+    global _URL, _BACKEND
     args = [a for a in sys.argv[1:] if not a.startswith(("-psn_", "-NS", "-Apple"))]
     be, port = _start_backend(args)
+    _BACKEND = be
     if not port:
         sys.stderr.write("macdbg backend failed to start.\n")
         if be:
@@ -431,7 +479,7 @@ def main() -> int:
     selftest = os.environ.get("MACDBG_SELFTEST")
     if selftest:
         _run_selftest(_URL, selftest)
-        be.terminate()
+        _shutdown_backend()
         return 0
 
     try:
@@ -440,7 +488,7 @@ def main() -> int:
         # Native window unavailable/failed — fall back to a browser window so the
         # user still gets a working UI rather than nothing.
         sys.stderr.write("[gui] falling back to a browser window\n")
-        proc = _browser_open(_URL)
+        proc = _browser_open(_URL + "#token=" + _TOKEN)
         if proc is not None:
             proc.wait()
         else:
@@ -449,7 +497,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        be.terminate()
+        _shutdown_backend()
     return 0
 
 

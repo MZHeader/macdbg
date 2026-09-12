@@ -28,6 +28,8 @@ open macdbg.app --args /path/to/your/binary
 
 Prefer a terminal? `GUI/run.sh /path/to/your/binary` is the CLI equivalent - it's the same launcher the app runs for you.
 
+Opening a binary in the GUI lets you set arguments and stop before initializers, so you can arm defenses before startup code runs. From the terminal, use `GUI/run.sh --stop-at loader /path/to/binary` or `./agent.sh start --stop-at loader /path/to/binary`.
+
 ### Air-gapped machines
 
 macdbg opens its native window through pywebview. On a machine with no internet, grab the bundle for its Python version from the [native-deps release](https://github.com/MZHeader/macdbg/releases/tag/native-deps), copy it over, and install it locally:
@@ -41,6 +43,8 @@ After that `run.sh` finds it and runs offline. The release notes cover picking t
 ## Syscall and Network Tracer
 
 Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
+
+Filter calls, follow a caller back into code, or export the full trace as JSONL. API entry events include timestamps and process/thread context; the live view shows the latest 2,000 and the saved log keeps the whole session.
 
 <img src="docs/img/gui-trace.png" alt="Trace tab" width="780">
 
@@ -160,6 +164,8 @@ These mirror the shortcut bar along the bottom of the window. Modifier shortcuts
 Whatever you type in the console goes into `SBCommandInterpreter.HandleCommand`. If a command would trigger an interactive Y/N prompt (`run`, `br del`), the wrapper answers it for you before the command reaches lldb.
 
 ## Additional Features
+
+Developer checks and benign fixture recipes are in [Testing](docs/testing.md).
 
 - **Memory search.** Target-only scope by default (binary plus heap and stack). Prefix `all:` to widen to loaded libraries. ⌘F Enter cycles to the next hit.
 - **Per-binary persistence** at `~/.macdbg/<name>-<sha>/state.json`. Breakpoints with conditions and command scripts, comments, and bookmarks come back next time you open the same binary. The directory is named for the binary but suffixed with a slice of its sha256, so two samples that share a name never collide; dumps for the same sample sit alongside in `dumps/`. Old flat `~/.macdbg/<sha256>.json` files migrate here automatically on first open.

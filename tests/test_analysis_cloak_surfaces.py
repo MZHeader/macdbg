@@ -72,39 +72,26 @@ class DocumentationContractTests(unittest.TestCase):
         self.assertTrue(CLAUDE_SKILL.samefile(CANONICAL_SKILL))
 
     def test_readme_documents_analysis_cloak_contract(self):
-        for term in (
-            "analysis_cloak",
-            "kern.hv_vmm_present",
-            "IOPlatformUUID",
-            "hardware breakpoints",
-            "fork-tree",
-        ):
+        for term in ("Analysis cloak", "entry point", "Hardware breakpoints"):
             self.assertIn(term, README_SOURCE)
+        reference = (CANONICAL_SKILL.parent / "references/defenses.md").read_text()
+        for term in ("analysis_cloak", "hardware breakpoints", "fork-tree"):
+            self.assertIn(term, reference)
 
     def test_agent_skill_documents_analysis_cloak_command(self):
-        self.assertIn("`analysis_cloak`", AGENT_SKILL_SOURCE)
+        self.assertIn('"name":"analysis_cloak"', AGENT_SKILL_SOURCE)
 
     def test_dump_docs_state_capture_bounds(self):
-        for document in (README_SOURCE, AGENT_SKILL_SOURCE):
-            with self.subTest(document="README" if document is README_SOURCE
-                              else "agent skill"):
-                for term in ("1 MiB", "8,192", "unreadable", "shortened"):
-                    self.assertIn(term, document)
+        self.assertIn("references/exec-sandbox.md", AGENT_SKILL_SOURCE)
+        document = (CANONICAL_SKILL.parent / "references/exec-sandbox.md").read_text()
+        for term in ("1 MiB", "8,192", "4 MiB", "six-second"):
+            self.assertIn(term, document)
 
     def test_docs_publish_synthetic_fixture_verification_commands(self):
-        commands = (
-            "tests.test_anti_analysis_policy tests.test_analysis_cloak_surfaces",
-            "make -C tests/integration clean all",
-            "tests.integration.test_analysis_cloak",
-            "test_combined_checks_recover_exact_chacha20_payload",
-            "./agent.sh list",
-            "synthetic fixture plaintext",
-        )
-        for document in (README_SOURCE, AGENT_SKILL_SOURCE):
-            with self.subTest(document="README" if document is README_SOURCE
-                              else "agent skill"):
-                for term in commands:
-                    self.assertIn(term, document)
+        self.assertIn("docs/testing.md", README_SOURCE)
+        document = (ROOT / "docs/testing.md").read_text()
+        for term in ("make -C tests/integration", "unittest", "benign", "MACDBG_STATE_DIR"):
+            self.assertIn(term, document)
 
     def test_project_metadata_describes_current_frontends(self):
         self.assertIn("GUI and headless", PYPROJECT_SOURCE)

@@ -63,6 +63,10 @@ class Debugger:
         self.script_exec = ScriptExec(self)
         self.hardware_bp_ids: set[int] = set()
         self.extra_hardware_bp_ids = lambda: set()
+        self.pending_decision = lambda: None
+        self._decision_authorized = False
+        self.launch_stop = "entry"
+        self._loader_stop_id = None
         self._step_hardware_policy = None
         self._step_plan_active = False
         self._step_plan_depth = None
@@ -90,6 +94,7 @@ class Debugger:
 
     def _run_execution(self, action):
         """One accounting boundary for LLDB continue and thread-plan resumes."""
+        self.require_decision_resolved()
         self.script_exec.payloads.apply_stop()
         self.script_exec.require_ready()
         clock = self.auto_clock
@@ -106,6 +111,19 @@ class Debugger:
         except Exception:
             clock.pauses.rollback(token)
             raise
+
+    def require_decision_resolved(self):
+        kind = getattr(self, "pending_decision", lambda: None)()
+        if kind and not getattr(self, "_decision_authorized", False):
+            raise RuntimeError("A {} decision is pending; resolve it before continuing.".format(kind))
+
+    def _resolve_decision(self, action):
+        # Only explicit, validated decision methods may cross this boundary.
+        self._decision_authorized = True
+        try:
+            return action()
+        finally:
+            self._decision_authorized = False
 
     def create_target(self, path: str) -> lldb.SBTarget:
         self._dispose_target()
@@ -284,6 +302,7 @@ class Debugger:
         ]
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
+        self._loader_stop_id = None
         self.script_exec.reset(keep_hooks=True)
         self._retired_hardware_return = None
         self._hardware_continue = None
@@ -333,7 +352,10 @@ class Debugger:
             if not err.Success():
                 raise RuntimeError(f"Launch failed: {err.GetCString()}")
             self._attached = False
-            self._advance_to_entry_point()
+            if self.launch_stop == "entry":
+                self._advance_to_entry_point()
+            elif self.process.GetState() == lldb.eStateStopped:
+                self._loader_stop_id = (self.process.GetProcessID(), self.process.GetStopID())
         finally:
             self.dbg.SetAsync(was_async)
         self._hook_listener(self.process)
@@ -357,6 +379,11 @@ class Debugger:
             return False
         entry = self.entry_point_address()
         return entry is not None and self.pc() == entry
+
+    def is_stopped_before_initializers(self):
+        p = self.process
+        return bool(p and p.IsValid() and p.GetState() == lldb.eStateStopped
+                    and self._loader_stop_id == (p.GetProcessID(), p.GetStopID()))
 
     def enable_analysis_cloak(self) -> Tuple[bool, str]:
         return self.analysis_cloak.enable()
@@ -1603,9 +1630,11 @@ class Debugger:
             ids = []
             for sym in ("syscall", "__syscall"):
                 bp = self.target.BreakpointCreateByName(sym, "libsystem_kernel.dylib")
-                if not bp.IsValid() or bp.GetNumLocations() == 0:
+                if not bp.IsValid():
                     bp = self.target.BreakpointCreateByName(sym)
-                if bp.IsValid() and bp.GetNumLocations() > 0:
+                # Loader stops precede libSystem. Keep ownership of valid
+                # deferred hooks so they are handled and hidden once resolved.
+                if bp.IsValid():
                     ids.append(bp.GetID())
             self.syscall_bp_ids = ids or None
         elif not want and self.syscall_bp_ids:
@@ -1804,6 +1833,11 @@ class Debugger:
         return frame.GetFunctionName() or "fork"
 
     def resolve_fork(self, decision: str = "parent") -> None:
+        if decision not in ("parent", "child"):
+            raise ValueError("invalid fork decision")
+        return self._resolve_decision(lambda: self._resolve_fork(decision))
+
+    def _resolve_fork(self, decision):
         """parent: let the real fork happen (child runs untraced, we stay on the
         parent). child: fake the return as 0 so the current process walks the
         child code path in-process, where it stays traceable."""
@@ -1812,6 +1846,8 @@ class Debugger:
         if decision == "child":
             ret = lldb.SBCommandReturnObject()
             self.ci.HandleCommand("thread return 0", ret, False)
+            if not ret.Succeeded():
+                raise RuntimeError("could not enter child path: " + (ret.GetError() or "return failed"))
             self.cont()
             return
         # A real fork copies our breakpoints into the child, which then dies on
@@ -2078,6 +2114,9 @@ class Debugger:
     def resolve_exec(self, decision: str = "block", name: str = "") -> bool:
         if decision not in ('block', 'fake', 'allow'):
             raise ValueError('invalid exec decision')
+        return self._resolve_decision(lambda: self._resolve_exec(decision, name))
+
+    def _resolve_exec(self, decision, name):
         if not self.process or self.process.GetState() != lldb.eStateStopped:
             raise RuntimeError('exec decision requires a stopped process')
         if name in OSA_CALLS:
@@ -2291,7 +2330,7 @@ class Debugger:
     )
 
     def scan_live_strings(self, min_len: int = 8,
-                          budget_bytes: int = 512 * 1024 * 1024) -> List[Tuple[int, str]]:
+                          budget_bytes: int = 512 * 1024 * 1024, cancelled=None) -> List[Tuple[int, str]]:
         """Scan heap, stack, and private mmap regions for null-terminated ASCII
         runs that look like real strings. Skips libraries and the target's own
         static sections. Bounded by `budget_bytes`."""
@@ -2326,6 +2365,8 @@ class Debugger:
             chunk_size = 4 * 1024 * 1024
             off = 0
             while off < size:
+                if cancelled and cancelled():
+                    raise InterruptedError("memory scan cancelled")
                 if scanned >= budget_bytes:
                     return out
                 take = min(chunk_size, size - off)
@@ -2417,6 +2458,10 @@ class Debugger:
                 start = i + 1
 
     def handle_command(self, cmd: str) -> Tuple[bool, str, str]:
+        try:
+            self.require_decision_resolved()
+        except RuntimeError as error:
+            return False, "", str(error) + " Inspect using the debugger panes or structured commands."
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand(cmd, ret, False)
         return (ret.Succeeded(), ret.GetOutput() or "", ret.GetError() or "")
@@ -2441,7 +2486,7 @@ class Debugger:
 
     def memory_search(self, needle: bytes, max_hits: int = 32,
                       total_budget_bytes: int = 4 * 1024 * 1024 * 1024,
-                      scope: str = "target") -> Tuple[List[int], int]:
+                      scope: str = "target", cancelled=None) -> Tuple[List[int], int]:
         """Search process memory for `needle`. scope "target" covers the binary's
         own sections plus anonymous regions (heap, stack, mmaps); scope "all"
         covers every readable region. Returns (hits, bytes_scanned).
@@ -2475,6 +2520,8 @@ class Debugger:
             off = 0
             carry = b""
             while off < size:
+                if cancelled and cancelled():
+                    raise InterruptedError("memory scan cancelled")
                 if scanned >= total_budget_bytes:
                     return hits, scanned
                 take = min(chunk_size, size - off)

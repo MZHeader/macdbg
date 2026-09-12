@@ -12,15 +12,36 @@ from __future__ import annotations
 import json
 import os
 import queue
+import secrets
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web")
 
 
 class _Handler(BaseHTTPRequestHandler):
     engine = None  # set on the server
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
+    def _authorized(self, credential=False):
+        origin = "http://" + self.server.authority
+        if (self.headers.get("Host") != self.server.authority or
+                self.headers.get("Origin", origin) != origin):
+            self._send(403, b'{"ok":false,"error":"untrusted origin"}')
+            return False
+        if credential:
+            token = self.headers.get("X-Macdbg-Token", "")
+            if self.command == "GET":
+                token = token or parse_qs(urlsplit(self.path).query).get("token", [""])[0]
+            if not secrets.compare_digest(token.encode("utf-8"), self.server.token.encode("utf-8")):
+                self._send(403, b'{"ok":false,"error":"invalid session credential"}')
+                return False
+        return True
 
     def log_message(self, *a):  # silence default request logging
         pass
@@ -30,6 +51,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -37,10 +61,18 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
+        if not self._authorized():
+            return
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             return self._serve_file("index.html", "text/html; charset=utf-8")
+        if path == "/health":
+            if self._authorized(credential=True):
+                return self._send(200, b'{"ok":true}')
+            return
         if path == "/events":
+            if not self._authorized(credential=True):
+                return
             return self._serve_events()
         if path.startswith("/") and ".." not in path:
             fn = path.lstrip("/")
@@ -70,6 +102,8 @@ class _Handler(BaseHTTPRequestHandler):
             while True:
                 try:
                     obj = q.get(timeout=15)
+                    if obj.get("t") == "resync":
+                        break
                     payload = "data: {}\n\n".format(json.dumps(obj))
                 except queue.Empty:
                     payload = ": ping\n\n"  # keep the connection alive
@@ -81,16 +115,27 @@ class _Handler(BaseHTTPRequestHandler):
             self.engine.unsubscribe(q)
 
     def do_POST(self):
+        if not self._authorized(credential=True):
+            return
         if self.path.split("?", 1)[0] != "/cmd":
             return self._send(404, b'{"error":"not found"}')
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
+            return self._send(415, b'{"ok":false,"error":"application/json required"}')
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if not 0 < length <= 1024 * 1024:
+                return self._send(413, b'{"ok":false,"error":"invalid request size"}')
             body = self.rfile.read(length) if length else b"{}"
             msg = json.loads(body.decode("utf-8"))
             name = msg.get("name", "")
-            args = msg.get("args", {}) or {}
+            args = msg.get("args", {})
+            if not isinstance(name, str) or not isinstance(args, dict):
+                raise ValueError("expected a command name and argument object")
         except Exception as e:
             return self._send(400, json.dumps({"ok": False, "error": str(e)}).encode())
+        if name == "shutdown" and self.server.on_shutdown:
+            self.server.on_shutdown()
+            return self._send(200, b'{"ok":true}')
         result = self.engine.command(name, args)
         self._send(200, json.dumps(result).encode("utf-8"))
 
@@ -109,10 +154,13 @@ class _Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def serve(engine, host="127.0.0.1", port=0):
+def serve(engine, host="127.0.0.1", port=0, token=None, on_shutdown=None):
     """Start the server in a background thread; return (httpd, port)."""
     handler = type("Handler", (_Handler,), {"engine": engine})
     httpd = _Server((host, port), handler)
     actual_port = httpd.server_address[1]
+    httpd.token = token or secrets.token_urlsafe(32)
+    httpd.authority = "{}:{}".format(host, actual_port)
+    httpd.on_shutdown = on_shutdown
     threading.Thread(target=httpd.serve_forever, name="httpd", daemon=True).start()
     return httpd, actual_port

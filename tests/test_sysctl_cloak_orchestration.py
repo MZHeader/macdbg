@@ -54,6 +54,9 @@ class FakeProcess:
 
 
 class FakeDebugger:
+    def require_decision_resolved(self):
+        pass
+
     script_exec = types.SimpleNamespace(find_hit=lambda: None, breakpoint_ids=lambda: set(),
         payloads=types.SimpleNamespace(apply_stop=lambda: False, hidden_ids=lambda: set()))
     def __init__(self):
@@ -147,6 +150,8 @@ class GuiCloakFailureTests(unittest.TestCase):
 class GuiStopEventTests(unittest.TestCase):
     def test_raw_relaunch_forgets_stop_identity_even_when_command_fails(self):
         engine = Engine.__new__(Engine)
+        engine._pending_exec = engine._pending_fork = None
+        engine._save_session = mock.Mock()
         engine.dbg = mock.Mock()
         engine.dbg.script_exec.payloads.apply_stop.return_value = False
         engine.dbg.script_exec.payloads.hidden_ids.return_value = set()
@@ -186,6 +191,7 @@ class GuiStopEventTests(unittest.TestCase):
 
     def test_target_change_forgets_previous_stop_identity(self):
         engine = Engine.__new__(Engine)
+        engine._save_session = mock.Mock()
         engine.tracer = types.SimpleNamespace(enabled=False)
         engine._pending_exec = None
         engine._pending_fork = None

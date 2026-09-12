@@ -34,6 +34,7 @@ the lldb / Python-version constraint.
 GUI/run.sh                 # start screen (File → Open / Attach)
 GUI/run.sh test/hello      # launch a target
 GUI/run.sh --attach 12345  # attach to a running pid
+GUI/run.sh --stop-at loader test/hello  # stop before initializers
 ```
 
 Double-clickable app:
@@ -78,6 +79,12 @@ Right-click any pane for its context menu (follow, edit value/bytes, set PC,
 run-to-here, add comment, pin to a watch, edit breakpoint commands/condition,
 etc.). The **Defenses** button exposes every anti-anti-debug bypass as a live
 checkbox; fork/exec interception pops a decision dialog per call.
+
+Open Target lets you choose arguments, the first stop (before initializers or at main), and an optional ptrace/exec interception profile. Go To and Memory accept symbols, `$register` values, and numeric offsets such as `$sp + 0x20`; navigation never evaluates a function call. Memory scans have a Cancel control in the status bar.
+
+Trace keeps a bounded live window with text/category filters and caller navigation. Export JSONL reports the complete on-disk log path. API entry events include timestamp, PID/TID, caller and argument registers; entry events do not include the eventual return value.
+
+The HTTP bridge uses a fresh credential per session, plus Host/Origin and JSON request checks. The launcher passes the credential to the native window automatically. Shutdown saves state on the debugger worker and tears down its target; the backend also watches for its native parent exiting.
 
 ## Architecture
 

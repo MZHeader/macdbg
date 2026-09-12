@@ -25,6 +25,10 @@ it does not isolate filesystem or network access.
 sessions from old records. `logs` prints plain text. Other commands return JSON objects.
 Choose an unused session name. Start returns `session`, daemon `pid`, and `boot`;
 check `ok` and `boot.event` before proceeding. A normal launch stops at entry.
+For checks in constructors, use `start --stop-at loader --session inspect /path/to/program`.
+This stops before initializers; arm `anti_ptrace` or
+`exec_sandbox` before continuing. `status.before_initializers` confirms the
+initial loader stop. Cloak and automatic clocks still require the main entry stop.
 For an existing process, use `start --session inspect --attach 1234` without a
 program path. Put `--session`, `--attach`, and `--boot-timeout` before the program;
 anything after its path is a target argument. Use short session names made from

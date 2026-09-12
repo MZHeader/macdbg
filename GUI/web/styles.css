@@ -324,7 +324,7 @@ tr.sel-thread td { color: var(--note); font-weight: 700; }
 /* ---- trace ---- */
 .trace-wrap { display: flex; flex-direction: column; min-height: 0; }
 .trace-toolbar {
-  display: flex; align-items: center; gap: 10px; padding: 4px 9px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 4px 9px;
   border-bottom: 1px solid var(--border); background: var(--bg-elev); flex: none;
 }
 .tt-spacer { flex: 1; }
@@ -441,12 +441,16 @@ td.tcat-FILE { color: var(--cat-file); } td.tcat-NET { color: var(--cat-net); } 
 .modal-script .script-content { font-size: 12px; line-height: 1.5; tab-size: 4; }
 .modal-script .m-hint { white-space: pre-wrap; overflow-wrap: anywhere; }
 .modal .m-foot { padding: 11px 15px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; background: var(--bg-elev); }
-.modal input.m-input, .modal textarea.m-input {
+.modal input.m-input, .modal textarea.m-input, .modal select.m-input {
   width: 100%; background: #16171a; border: 1px solid var(--border); border-radius: 6px;
   color: var(--text); padding: 8px 10px; outline: none;
   font-family: "SF Mono", Menlo, monospace; font-size: 13px;
 }
-.modal input.m-input:focus, .modal textarea.m-input:focus { border-color: var(--primary); }
+.modal input.m-input:focus, .modal textarea.m-input:focus, .modal select.m-input:focus { border-color: var(--primary); }
+.modal.modal-launch { width: 660px; max-width: 92vw; }
+.modal-launch label { display: block; margin: 12px 0; }
+.modal-launch .m-input { display: block; margin-top: 5px; }
+.modal-launch p { overflow-wrap: anywhere; }
 .modal textarea.m-input { min-height: 240px; resize: vertical; white-space: pre; }
 .modal .m-hint { color: var(--text-dim); font-size: 11.5px; margin-top: 8px; }
 .btn {
@@ -482,3 +486,7 @@ td.tcat-FILE { color: var(--cat-file); } td.tcat-NET { color: var(--cat-net); } 
 .pick-row:hover, .pick-row.sel { background: var(--accent-dim); color: #fff; }
 .pick-row .pk-pid { color: var(--op-imm); width: 8ch; flex: none; }
 .pick-filter { margin-bottom: 10px; }
+button:disabled { opacity: .35; cursor: default; }
+.address-choice { display: block; width: 100%; text-align: left; margin: 6px 0; }
+#trace-search { min-width: 100px; width: 170px; background: transparent; border: 1px solid #363c47; color: inherit; padding: 3px 6px; }
+#trace-window { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

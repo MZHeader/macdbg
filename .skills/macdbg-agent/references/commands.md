@@ -61,8 +61,12 @@ Manage their owner with `defense_disable` / `tracer_disable` instead.
 ```
 
 Enable before the calls you want to observe; nothing is captured retroactively.
-Each hit has `n`, `category` (`FILE`, `NET`, `PROC`), and `call`. Reuse the highest
-`n` as the next `since` cursor. Hardware mode preserves code bytes but has finite
+Each hit has `n`, `category` (`FILE`, `NET`, `PROC`), `call`, timestamp, PID/TID,
+caller location and raw argument registers. These are API entry observations,
+not return-value or success reports. Reuse the highest `n` as the next `since`
+cursor. The response retains the latest 2,000 hits; check `first_available` for a
+gap and read `path` for the full JSONL log. `total` counts all recorded hits.
+Hardware mode preserves code bytes but has finite
 slots. A resume response's `console` also contains stop/defense diagnostics.
 
 ## Raw LLDB when the wrapper has no command

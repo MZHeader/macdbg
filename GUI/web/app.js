@@ -16,15 +16,23 @@
   const hx = n => (n == null ? '' : '0x' + Math.trunc(Number(n)).toString(16));
   const pad = (s, n) => { s = String(s == null ? '' : s); return s.length >= n ? s : s + ' '.repeat(n - s.length); };
   const near = el => el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const suppliedToken = new URLSearchParams(location.hash.slice(1)).get('token');
+  if (suppliedToken) {
+    sessionStorage.setItem('macdbg-token', suppliedToken);
+    history.replaceState(null, '', location.pathname);
+  }
+  const sessionToken = suppliedToken || sessionStorage.getItem('macdbg-token') || '';
 
   async function cmd(name, args) {
     try {
       const r = await fetch('/cmd', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Macdbg-Token': sessionToken },
         body: JSON.stringify({ name: name, args: args || {} })
       });
-      return await r.json();
-    } catch (e) { return { ok: false, error: String(e) }; }
+      const result = await r.json();
+      if (!result.ok) appendConsole(result.error || 'Command failed', true);
+      return result;
+    } catch (e) { appendConsole('Connection failed: ' + String(e), true); return { ok: false, error: String(e) }; }
   }
   async function cmdSync(name, args) { const r = await cmd(name, args); return r && r.ok ? r.result : null; }
 
@@ -37,16 +45,18 @@
   let lastState = null;
   let selDisasm = null;   // address of the single-clicked disassembly line
   let traceRows = [];
+  let traceEpoch = null, traceTotal = 0, traceRenderPending = false, traceViewEnd = null, traceFilteredCount = 0;
   const traceFilter = { FILE: true, NET: true, PROC: true };
   const cmdHistory = [];
   let histIdx = -1;
   const startTime = Date.now();
+  let consoleSequence = 0;
 
   // ===========================================================================
   //  SSE
   // ===========================================================================
   function connect() {
-    const es = new EventSource('/events');
+    const es = new EventSource('/events?token=' + encodeURIComponent(sessionToken));
     es.onmessage = ev => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } dispatch(m); };
     es.onerror = () => { /* EventSource auto-reconnects */ };
   }
@@ -54,13 +64,22 @@
   function dispatch(m) {
     switch (m.t) {
       case 'state': onState(m); break;
-      case 'console': appendConsole(m.text, m.error); break;
+      case 'console':
+        if (m.id && m.id <= consoleSequence) break;
+        consoleSequence = m.id || consoleSequence;
+        appendConsole(m.text, m.error); break;
+      case 'console_snapshot': m.rows.forEach(dispatch); break;
       case 'trace': addTrace(m); break;
+      case 'trace_snapshot':
+        traceEpoch = m.epoch; traceTotal = m.total;
+        traceRows = m.hits.map(row => ({ ...row, cat: row.category }));
+        scheduleTrace(); break;
+      case 'scan': $('#cancel-scan').classList.toggle('hidden', !m.active); break;
       case 'trace_clear': clearTrace(); break;
       case 'running': onRunning(); break;
       case 'meta': onMeta(m); break;
       case 'prompt': onPrompt(m); break;
-      case 'ui': handleUiAction(m.action); break;
+      case 'ui': handleUiAction(m.action, m); break;
     }
   }
 
@@ -85,10 +104,10 @@
     // follow / status
     const mem = st.memory;
     $('#mem-follow-info').textContent = mem ? (hx(mem.follow) + (mem.search ? '  · ' + mem.search : '')) : '';
-    let kind = 'none';
-    if (st.has_process) kind = st.running ? 'running' : 'paused';
-    if (st.has_process && !st.pc && !st.running) kind = 'paused';
+    const kind = st.process_state === 'stopped' ? 'paused' : (st.process_state || 'none');
     setStatus(kind, st.pc, st.modules);
+    if (st.before_initializers) $('#st-msg').textContent = 'paused before initializers — configure defenses, then Continue';
+    if (kind === 'exited') $('#st-msg').textContent = 'process exited · code ' + st.exit_code + ' · ⌘R to restart';
     // Snapshots identify the live target, including after Open/Attach changes.
     const mt = $('#menu-target');
     if (st.modules && st.modules.length)
@@ -103,11 +122,19 @@
     const pill = $('#state-pill'), bar = $('.statusbar'), msg = $('#st-msg');
     pill.className = 'pill pill-' + kind;
     bar.className = 'statusbar s-' + kind;
-    pill.textContent = { none: 'No process', paused: 'Paused', running: 'Running', exited: 'Exited' }[kind] || kind;
+    pill.textContent = { none: 'No process', paused: 'Paused', running: 'Running', exited: 'Exited', crashed: 'Crashed', detached: 'Detached' }[kind] || kind;
     msg.textContent = { none: 'no process — open a target or attach', paused: 'paused', running: 'running…', exited: 'process exited' }[kind] || kind;
     $('#st-addr').textContent = pc ? 'PC ' + hx(pc) : '';
     const triple = (modules && modules[0] && modules[0][3]) || '';
     $('#st-triple').textContent = triple;
+    const pending = lastState && lastState.pending_decision;
+    for (const action of ['cont', 'step_in', 'step_over', 'step_out']) {
+      const button = $(`.tb[data-act="${action}"]`);
+      if (button) button.disabled = kind !== 'paused' || !!pending;
+    }
+    $('.tb[data-act="interrupt"]').disabled = kind !== 'running';
+    $('.tb[data-act="stop"]').disabled = !['running', 'paused', 'crashed'].includes(kind);
+    $('.tb[data-act="restart"]').disabled = !(lastState && lastState.can_restart);
   }
 
   // ---- disassembly ---------------------------------------------------------
@@ -289,29 +316,50 @@
     $('#tracer-state').textContent = ts.on ? 'ON' : 'off';
     $('#tb-tracer').classList.toggle('active', !!ts.on);
     $('#scope-label').textContent = ts.scope || '';
-    $('#trace-info').textContent = `tracer ${ts.on ? 'ON' : 'off'} · scope: ${ts.scope}`;
+    $('#trace-info').textContent = `API entries ${ts.on ? 'ON' : 'off'} · ${ts.scope}`;
   }
   function addTrace(m) {
+    if (traceEpoch !== m.epoch) { traceRows = []; traceEpoch = m.epoch; }
+    if (traceRows.length && traceRows[traceRows.length - 1].n >= m.n) return;
     traceRows.push(m);
+    if (traceRows.length > 2000) traceRows.splice(0, traceRows.length - 2000);
+    traceTotal = m.n;
     $('#trace-badge').textContent = String(m.n);
-    if (traceFilter[m.cat] !== false) appendTraceRow(m, near($('#trace-scroll')));
+    scheduleTrace();
+  }
+  function scheduleTrace() {
+    if (traceRenderPending) return;
+    traceRenderPending = true;
+    requestAnimationFrame(() => { traceRenderPending = false; rebuildTrace(); });
   }
   function appendTraceRow(m, stick) {
     const tb = $('#trace-table');
-    if (!tb.querySelector('thead')) tb.innerHTML = '<thead><tr><th>#</th><th>cat</th><th>call</th></tr></thead><tbody></tbody>';
+    if (!tb.querySelector('thead')) tb.innerHTML = '<thead><tr><th>#</th><th>time UTC</th><th>PID / TID</th><th>cat</th><th>call</th></tr></thead><tbody></tbody>';
     const body = tb.querySelector('tbody');
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="c-dim">${m.n}</td><td class="tcat-${esc(m.cat)}">${esc(m.cat)}</td><td>${esc(m.call)}</td>`;
+    tr.innerHTML = `<td class="c-dim">${m.n}</td><td class="c-dim">${esc((m.timestamp || '').slice(11, 23))}</td><td class="c-dim">${esc(m.pid || '')} / ${esc(m.tid || '')}</td><td class="tcat-${esc(m.cat)}">${esc(m.cat)}</td><td>${esc(m.call)}</td>`;
     tr.dataset.call = m.call;
+    if (m.caller) { tr.dataset.caller = m.caller; tr.title = (m.caller_module || '') + ' · caller ' + m.caller; }
     body.appendChild(tr);
     if (stick) $('#trace-scroll').scrollTop = $('#trace-scroll').scrollHeight;
   }
   function rebuildTrace() {
+    const query = ($('#trace-search').value || '').toLowerCase();
+    const filtered = traceRows.filter(m => traceFilter[m.cat] !== false &&
+      [m.call, m.caller, m.caller_module, m.pid, m.tid].join(' ').toLowerCase().includes(query));
+    traceFilteredCount = filtered.length;
+    const end = Math.min(traceViewEnd || filtered.length, filtered.length);
+    const visible = filtered.slice(Math.max(0, end - 500), end);
+    const stick = near($('#trace-scroll'));
     $('#trace-table').innerHTML = '';
-    for (const m of traceRows) if (traceFilter[m.cat] !== false) appendTraceRow(m, false);
-    $('#trace-scroll').scrollTop = $('#trace-scroll').scrollHeight;
+    for (const m of visible) appendTraceRow(m, false);
+    $('#trace-badge').textContent = String(traceTotal);
+    $('#trace-window').textContent = `${visible.length ? end - visible.length + 1 : 0}–${end} of ${filtered.length} · ${traceTotal} total`;
+    $('#trace-older').disabled = end <= 500;
+    $('#trace-newer').disabled = traceViewEnd == null || end >= filtered.length;
+    if (stick && traceViewEnd == null) $('#trace-scroll').scrollTop = $('#trace-scroll').scrollHeight;
   }
-  function clearTrace() { traceRows = []; $('#trace-table').innerHTML = ''; $('#trace-badge').textContent = '0'; }
+  function clearTrace() { traceRows = []; traceEpoch = null; traceTotal = 0; traceViewEnd = null; rebuildTrace(); }
 
   // ---- console -------------------------------------------------------------
   function appendConsole(text, error) {
@@ -321,6 +369,7 @@
     div.className = 'cl' + (error ? ' cl-err' : '');
     div.textContent = text.replace(/\n$/, '');
     el.appendChild(div);
+    while (el.childElementCount > 1000) el.firstElementChild.remove();
     if (stick) el.scrollTop = el.scrollHeight;
   }
   function echoConsole(text) {
@@ -335,9 +384,11 @@
   //  actions
   // ===========================================================================
   function doAct(act) {
-    if (act === 'open') return cmd('pick_file');
+    const button = $(`.tb[data-act="${act}"]`);
+    if (button && button.disabled) return;
+    if (act === 'open') return chooseTarget();
     if (act === 'attach') return openAttach();
-    if (act === 'stop') return cmd('run_cmd', { cmd: 'process kill' });
+    if (act === 'stop') return cmd('kill');
     if (act === 'defenses') return openDefenses();
     // breakpoint / origin actions honour the selected disasm line, else the PC
     if (act === 'toggle_bp') return cmd('toggle_bp', selDisasm != null ? { addr: selDisasm } : {});
@@ -356,6 +407,53 @@
     return m ? m[0] : fallback;
   }
   function focusGoto() { $('#goto').focus(); $('#goto').select(); }
+  async function navigate(input, pane) {
+    const matches = await cmdSync('resolve_address', { expression: input.value.trim() });
+    if (!matches) { input.focus(); return; }
+    const follow = match => {
+      if (pane === 'memory') followMem(match.addr);
+      else cmd('follow_disasm', { addr: match.addr });
+      input.blur();
+    };
+    if (matches.length === 1) return follow(matches[0]);
+    const modal = el('div', 'modal');
+    modal.appendChild(el('div', 'm-head', 'Choose an address'));
+    const body = el('div', 'm-body');
+    matches.forEach(match => {
+      const button = el('button', 'btn address-choice');
+      button.textContent = match.addr + ' · ' + match.label;
+      button.onclick = () => { closeModal(); follow(match); };
+      body.appendChild(button);
+    });
+    modal.appendChild(body);
+    openModal(modal, e => { if (e.key === 'Escape') closeModal(); });
+  }
+
+  async function chooseTarget() {
+    if (window.pywebview && window.pywebview.api) {
+      const path = await window.pywebview.api.choose_target();
+      if (path) openLaunch(path);
+    } else cmd('pick_file');
+  }
+
+  function openLaunch(path) {
+    const modal = el('div', 'modal modal-launch');
+    modal.innerHTML = '<div class="m-head">Launch target</div><div class="m-body">'
+      + '<p class="mono">' + esc(path) + '</p>'
+      + '<label>Arguments<input class="m-input" id="launch-args" placeholder="Arguments, with quotes for spaces" /></label>'
+      + '<label>First stop<select class="m-input" id="launch-stop"><option value="loader">Before initializers</option><option value="entry">Main entry point</option></select></label>'
+      + '<label>Initial defenses<select class="m-input" id="launch-profile"><option value="manual">Choose manually at the first stop</option><option value="intercept">Defeat ptrace and prompt on execution</option></select></label>'
+      + '<p class="m-hint">Before initializers lets you arm early hooks before startup code runs. Main entry runs initializers first. Analysis cloak and automatic clocks require the main entry stop.</p></div>';
+    const foot = el('div', 'm-foot');
+    const cancel = el('button', 'btn', 'Cancel'); cancel.onclick = closeModal;
+    const launch = el('button', 'btn primary', 'Launch');
+    launch.onclick = () => {
+      const args = { path, args_text: $('#launch-args').value, stop_at: $('#launch-stop').value, profile: $('#launch-profile').value };
+      closeModal(); cmd('open_target', args);
+    };
+    foot.append(cancel, launch); modal.appendChild(foot);
+    openModal(modal, e => { if (e.key === 'Escape') closeModal(); });
+  }
   async function findInMemory() {
     const v = await promptDialog({ title: 'Find in Memory', placeholder: 'ASCII text, 0x… hex, or "all:" to scan libraries', hint: 'Empty + ⌘F cycles to the next hit.' });
     if (v !== null) cmd('search', { text: v });
@@ -374,21 +472,27 @@
     $('#goto').addEventListener('keydown', e => {
       if (e.key !== 'Enter') return;
       const v = e.target.value.trim(); if (!v) return;
-      if (/^(0x[0-9a-f]+|\d+)$/i.test(v)) cmd('follow_disasm', { addr: v });
-      else cmd('run_cmd', { cmd: 'image lookup -rn ' + v });
-      e.target.blur();
+      navigate(e.target, 'disasm');
     });
     // memory follow address bar
     $('#mem-addr').addEventListener('keydown', e => {
       if (e.key !== 'Enter') return;
       const v = e.target.value.trim(); if (!v) return;
-      cmd('follow_mem', { addr: v }); e.target.value = '';
+      navigate(e.target, 'memory');
     });
     // trace category filters
     $$('.tt-filter input').forEach(cb => cb.onchange = () => {
-      traceFilter[cb.closest('.tt-filter').dataset.cat] = cb.checked; rebuildTrace();
+      traceFilter[cb.closest('.tt-filter').dataset.cat] = cb.checked; traceViewEnd = null; rebuildTrace();
     });
     $$('.trace-toolbar .mini[data-act]').forEach(b => b.onclick = () => cmd(b.dataset.act));
+    $('#trace-search').oninput = () => { traceViewEnd = null; scheduleTrace(); };
+    $('#trace-older').onclick = () => { traceViewEnd = Math.max(500, (traceViewEnd || traceFilteredCount) - 500); rebuildTrace(); };
+    $('#trace-newer').onclick = () => { traceViewEnd = traceViewEnd + 500 >= traceFilteredCount ? null : traceViewEnd + 500; rebuildTrace(); };
+    $('#cancel-scan').onclick = () => cmd('cancel_scan');
+    $('#trace-export').onclick = async () => {
+      const result = await cmdSync('trace_export');
+      if (result) { $('#trace-window').textContent = 'Saved: ' + result.path; $('#trace-window').title = result.path; }
+    };
 
     // watch pin buttons (delegated)
     document.addEventListener('click', e => {
@@ -663,6 +767,7 @@
       const tr = e.target.closest('tr');
       return [
         tr && tr.dataset.call ? { label: 'Copy this call', fn: () => copy(tr.dataset.call) } : null,
+        tr && tr.dataset.caller ? { label: 'Follow caller in Disassembly', fn: () => cmd('follow_disasm', { addr: tr.dataset.caller }) } : null,
         { label: 'Copy all trace rows', fn: () => copy(traceRows.map(r => `${r.n}\t${r.cat}\t${r.call}`).join('\n')) },
         { label: 'Clear trace', fn: () => cmd('trace_clear') }
       ].filter(Boolean);
@@ -776,12 +881,14 @@
   // ===========================================================================
   const backdrop = $('#modal-backdrop');
   let modalKeyHandler = null;
-  function openModal(node, onKey) {
+  let modalDecision = false;
+  function openModal(node, onKey, decision = false) {
     backdrop.innerHTML = ''; backdrop.appendChild(node); backdrop.classList.remove('hidden');
     modalKeyHandler = onKey || null;
+    modalDecision = decision;
   }
-  function closeModal() { backdrop.classList.add('hidden'); backdrop.innerHTML = ''; modalKeyHandler = null; }
-  backdrop.addEventListener('mousedown', e => { if (e.target === backdrop) closeModal(); });
+  function closeModal() { backdrop.classList.add('hidden'); backdrop.innerHTML = ''; modalKeyHandler = null; modalDecision = false; }
+  backdrop.addEventListener('mousedown', e => { if (e.target === backdrop && !modalDecision) closeModal(); });
 
   function el(tag, cls, html) { const n = document.createElement(tag); if (cls) n.className = cls; if (html != null) n.innerHTML = html; return n; }
 
@@ -969,7 +1076,7 @@
       foot.appendChild(mk(osa ? 'Fake success (empty result)' : 'Fake success', 'fake'));
       foot.appendChild(mk('Allow (run)', 'allow', 'primary'));
       dlg.appendChild(foot);
-      openModal(dlg, e => { if (e.key === 'Escape') { cmd('decide_exec', { decision: 'block', token: m.token }); closeModal(); } });
+      openModal(dlg, e => { if (e.key === 'Escape') { cmd('decide_exec', { decision: 'block', token: m.token }); closeModal(); } }, true);
     } else if (m.kind === 'fork') {
       const dlg = el('div', 'modal');
       dlg.innerHTML = `<div class="m-head">fork intercepted <span class="m-sub">${esc(m.name)}</span></div>`
@@ -980,7 +1087,7 @@
       foot.appendChild(mk('Stay in parent', 'parent'));
       foot.appendChild(mk('Enter child', 'child', 'primary'));
       dlg.appendChild(foot);
-      openModal(dlg, e => { if (e.key === 'Escape') { cmd('decide_fork', { decision: 'parent' }); closeModal(); } });
+      openModal(dlg, e => { if (e.key === 'Escape') e.preventDefault(); }, true);
     }
   }
 
@@ -1087,7 +1194,9 @@
   // ===========================================================================
   //  ui action relay (native menu → dialog)
   // ===========================================================================
-  function handleUiAction(action) {
+  function handleUiAction(action, message = {}) {
+    if (action === 'launch') return openLaunch(message.path);
+    if (action === 'open') return chooseTarget();
     ({ attach: openAttach, defenses: openDefenses, palette: openPalette, find: findInMemory,
       goto: focusGoto, trace_filter: () => selectBottomTab('trace') }[action] || (() => { }))();
   }

@@ -40,12 +40,12 @@ _CONN_TIMEOUT = 5.0
 
 
 class Daemon:
-    def __init__(self, session_dir: str, program, program_args, attach_pid) -> None:
+    def __init__(self, session_dir: str, program, program_args, attach_pid, stop_at="entry") -> None:
         self.session_dir = session_dir
         self.socket_path = os.path.join(session_dir, "ctl.sock")
         self.meta_path = os.path.join(session_dir, "meta.json")
         self.session = AgentSession(program=program, program_args=program_args,
-                                     attach_pid=attach_pid)
+                                     attach_pid=attach_pid, stop_at=stop_at)
         self._shutdown = False
         self._srv: socket.socket | None = None
 
@@ -178,12 +178,13 @@ def main(argv=None) -> int:
     p.add_argument("--session-dir", required=True)
     p.add_argument("--program", default=None)
     p.add_argument("--attach", type=int, default=None)
+    p.add_argument("--stop-at", choices=("entry", "loader"), default="entry")
     p.add_argument("args", nargs=argparse.REMAINDER)
     ns = p.parse_args(argv)
     prog_args = ns.args
     if prog_args and prog_args[0] == "--":
         prog_args = prog_args[1:]
-    d = Daemon(ns.session_dir, ns.program, prog_args, ns.attach)
+    d = Daemon(ns.session_dir, ns.program, prog_args, ns.attach, ns.stop_at)
     return d.run()
 
 

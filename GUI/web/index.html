@@ -109,12 +109,14 @@
             <div class="trace-wrap hidden" id="tb-trace" data-pane="trace">
               <div class="trace-toolbar">
                 <span class="mono head-sub" id="trace-info">tracer off</span>
+                <input id="trace-search" class="mono" spellcheck="false" autocomplete="off" placeholder="Filter calls / caller / PID" />
                 <span class="tt-spacer"></span>
                 <label class="tt-filter" data-cat="FILE"><input type="checkbox" checked> <b class="cat-FILE">FILE</b></label>
                 <label class="tt-filter" data-cat="NET"><input type="checkbox" checked> <b class="cat-NET">NET</b></label>
                 <label class="tt-filter" data-cat="PROC"><input type="checkbox" checked> <b class="cat-PROC">PROC</b></label>
                 <button class="mini" data-act="trace_clear">Clear</button>
               </div>
+              <div class="trace-toolbar"><button class="mini" id="trace-older">Earlier</button><button class="mini" id="trace-newer">Later</button><button class="mini" id="trace-export">Export JSONL</button><span id="trace-window" class="mono head-sub">API entry events · latest 2,000 in view; export keeps the full trace</span></div>
               <div class="table-wrap scroll" id="trace-scroll"><table class="grid" id="trace-table"></table></div>
             </div>
           </div>
@@ -139,6 +141,7 @@
 
     <!-- Status bar -->
     <div class="statusbar">
+      <button id="cancel-scan" class="mini hidden">Cancel memory scan</button>
       <div class="st st-state"><span class="st-dot"></span><span id="st-msg">starting…</span></div>
       <div class="st-spacer"></div>
       <div class="st mono" id="st-addr"></div>

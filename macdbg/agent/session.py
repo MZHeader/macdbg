@@ -32,6 +32,7 @@ from ..core.debugger import Debugger
 from ..core.disasm import disasm_around
 from ..core.registers import collect as collect_regs
 from ..core.tracer import Tracer
+from ..core.trace_log import TraceLog
 from .client import _RESUME_COMMANDS  # noqa: F401 -- re-exported for server.py
 
 # SBListener.WaitForEvent takes a whole-second uint32_t timeout (see
@@ -87,17 +88,19 @@ class SessionError(Exception):
 class AgentSession:
     def __init__(self, program: Optional[str] = None,
                  program_args: Optional[List[str]] = None,
-                 attach_pid: Optional[int] = None) -> None:
+                 attach_pid: Optional[int] = None, stop_at: str = "entry") -> None:
         self.program = program
         self.program_args = program_args or []
         self.attach_pid = attach_pid
         self.dbg = Debugger()
+        self.dbg.launch_stop = stop_at
         self.tracer = Tracer()
         self.dbg.extra_hardware_bp_ids = lambda: self.tracer.hardware_bp_ids
-        self._trace_hits: List[dict] = []
+        self.trace_log = TraceLog(lambda: self.dbg._dumps_dir())
         self._trace_count = 0
         self._console: List[str] = []
         self._pending: Optional[dict] = None
+        self.dbg.pending_decision = lambda: self._pending and self._pending["kind"]
         self._last_handled_stop = None
 
     # -- lifecycle -----------------------------------------------------
@@ -380,7 +383,7 @@ class AgentSession:
             return {"ok": True, "caller_depth": self.tracer.caller_depth}
         if cmd == "trace_hits":
             since = _int_arg(args.get("since", 0))
-            return {"ok": True, "hits": [h for h in self._trace_hits if h["n"] > since]}
+            return {"ok": True, **self.trace_log.snapshot(since)}
         if cmd == "raw":
             ok, out, err = self.dbg.handle_command(args["command"])
             return {"ok": ok, "output": out, "error_output": err}
@@ -397,25 +400,21 @@ class AgentSession:
     def _decide_fork(self, decision: str, timeout, poll_cb) -> dict:
         if not self._pending or self._pending.get("kind") != "fork":
             return {"ok": False, "error": "no pending fork decision"}
-        # core Debugger.resolve_fork treats anything other than the literal
-        # string "child" as "parent" -- an unrecognized token would otherwise
-        # silently take the most permissive (real, unshielded) branch. Reject
-        # it here instead and leave the decision pending so the caller can
-        # retry with a valid one.
+        # Reject malformed choices before changing the pending decision.
         if decision not in self._FORK_DECISIONS:
             return {"ok": False, "error": "invalid fork decision {!r}; choose one of {}".format(
                 decision, self._FORK_DECISIONS)}
-        self._pending = None
-        return self._pump(resume=lambda: self.dbg.resolve_fork(decision),
+        def resume():
+            result = self.dbg.resolve_fork(decision)
+            self._pending = None
+            return result
+        return self._pump(resume=resume,
                            max_wait=timeout, poll_cb=poll_cb)
 
     def _decide_exec(self, decision: str, timeout, poll_cb) -> dict:
         if not self._pending or self._pending.get("kind") != "exec":
             return {"ok": False, "error": "no pending exec decision"}
-        # Same reasoning as _decide_fork: core Debugger.resolve_exec only
-        # special-cases "block" and "fake" -- anything else (a typo, an empty
-        # string) falls through to "allow" and actually runs the intercepted
-        # call. Validate here so a bad decision can't silently fail open.
+        # A malformed choice leaves the intercepted call pending.
         if decision not in self._EXEC_DECISIONS:
             return {"ok": False, "error": "invalid exec decision {!r}; choose one of {}".format(
                 decision, self._EXEC_DECISIONS)}
@@ -429,9 +428,12 @@ class AgentSession:
                 return {'ok': True, 'event': 'pending_decision',
                         'decision': self._pending, 'console': self._drain_console()}
             return self._pump(resume=None, max_wait=timeout, poll_cb=poll_cb)
-        self._pending = None
+        def resume():
+            result = self.dbg.resolve_exec(decision, name=pending.get("symbol", ""))
+            self._pending = None
+            return result
         return self._pump(
-            resume=lambda: self.dbg.resolve_exec(decision, name=pending.get("symbol", "")),
+            resume=resume,
             max_wait=timeout, poll_cb=poll_cb)
 
     def cmd_dump_exec(self) -> dict:
@@ -474,6 +476,8 @@ class AgentSession:
             "program": self.program,
             "attach_pid": self.attach_pid,
             "process_state": state,
+            "stop_at": d.launch_stop,
+            "before_initializers": d.is_stopped_before_initializers(),
             "pc": self.dbg.pc(),
             "pending_decision": self._pending,
             "tracer_enabled": self.tracer.enabled,
@@ -998,8 +1002,7 @@ class AgentSession:
         frame = thread.GetFrameAtIndex(0)
         hit = self.tracer.hit_from(frame, self.dbg.process)
         if hit is not None:
-            self._trace_count += 1
-            self._trace_hits.append({"n": self._trace_count, "category": hit.category, "call": hit.call})
+            self._trace_count = self.trace_log.append(hit.category, hit.call, **hit.details)["n"]
 
     def _try_auto_anti_debug(self) -> bool:
         process = self.dbg.process
@@ -1063,8 +1066,7 @@ class AgentSession:
         frame = thread.GetFrameAtIndex(0)
         hit = self.tracer.hit_from(frame, process, bp_id=bp_id)
         if hit is not None:
-            self._trace_count += 1
-            self._trace_hits.append({"n": self._trace_count, "category": hit.category, "call": hit.call})
+            self._trace_count = self.trace_log.append(hit.category, hit.call, **hit.details)["n"]
         return True
 
     def _try_trace_hit(self) -> bool:

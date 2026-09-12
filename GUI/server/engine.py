@@ -12,6 +12,8 @@ import queue
 import threading
 import time
 import traceback
+from concurrent.futures import Future, TimeoutError as FutureTimeout
+from collections import deque
 from typing import Dict, List, Optional
 
 import lldb
@@ -22,6 +24,7 @@ from macdbg.core.events import EventPump, OutputEvent, StopEvent
 from macdbg.core.registers import collect as collect_regs, flag_layout_for, snapshot as reg_snapshot
 from macdbg.core.state import Watch
 from macdbg.core.tracer import Tracer
+from macdbg.core.trace_log import TraceLog
 
 from . import snapshot
 
@@ -65,6 +68,7 @@ class Engine:
         self._disasm_follow: Optional[int] = None
         self._trace_count = 0
         self._trace_lock = threading.Lock()
+        self.trace_log = TraceLog(lambda: self.dbg._dumps_dir())
         self._strings_bin: List = []
         self._strings_live: List = []
         self._search_last: Optional[bytes] = None
@@ -75,11 +79,19 @@ class Engine:
         self._pending_exec = None   # (name, cmd, bp_id)
         self._pending_exec_token = None
         self._pending_fork = None   # (name,)
+        self.dbg.pending_decision = lambda: ("exec" if self._pending_exec else
+                                            "fork" if self._pending_fork else None)
 
         self._q: "queue.Queue" = queue.Queue()
         self._subs: set = set()
         self._subs_lock = threading.Lock()
         self._alive = True
+        self._closing = False
+        self._worker = None
+        self._scan_cancel = threading.Event()
+        self._console_history = deque(maxlen=1000)
+        self._console_lock = threading.Lock()
+        self._console_sequence = 0
 
         self._output_stop = threading.Event()
         self._interpose_stop = threading.Event()
@@ -88,12 +100,12 @@ class Engine:
 
     # ---- lifecycle -----------------------------------------------------------
     def start(self) -> None:
-        threading.Thread(target=self._worker_loop, name="engine", daemon=True).start()
+        self._worker = threading.Thread(target=self._worker_loop, name="engine", daemon=True)
+        self._worker.start()
         self.pump = EventPump(
             self.dbg.listener,
             on_stop=lambda e: self.submit(self._on_stop_event, e),
-            on_output=lambda e: self._emit({"t": "console", "text": e.text,
-                                            "error": e.is_error}),
+            on_output=lambda e: self._console(e.text, error=e.is_error),
         )
         self.pump.start()
         threading.Thread(target=self._pump_output, name="lldb-output",
@@ -101,19 +113,29 @@ class Engine:
         self.submit(self._start_session)
 
     def shutdown(self) -> None:
-        self._alive = False
+        if self._closing:
+            return
+        self._closing = True
+        self._scan_cancel.set()
+        if self._worker and self._worker.is_alive():
+            self._run_sync(self._shutdown_worker, timeout=20)
+            self._worker.join(timeout=2)
+        else:
+            self._shutdown_worker()
+
+    def _shutdown_worker(self):
         self._output_stop.set()
-        self._interpose_stop.set()
+        self._stop_interpose_reader()
         if self.pump:
             self.pump.stop()
         try:
-            self.dbg.save_state(self._hidden_bp_ids())
+            self._save_session()
         except Exception:
             pass
         try:
             self.dbg.destroy()
-        except Exception:
-            pass
+        finally:
+            self._alive = False
 
     def _worker_loop(self) -> None:
         while self._alive:
@@ -132,22 +154,27 @@ class Engine:
 
     def _run_sync(self, fn, *args, timeout: float = 10.0):
         """Run fn on the worker thread and wait for its return value."""
-        box = {}
-        done = threading.Event()
+        result = Future()
 
         def wrap():
+            if not result.set_running_or_notify_cancel():
+                return
             try:
-                box["v"] = fn(*args)
+                result.set_result(fn(*args))
             except Exception as e:
-                box["e"] = e
-            finally:
-                done.set()
+                result.set_exception(e)
 
         self.submit(wrap)
-        done.wait(timeout)
-        if "e" in box:
-            raise box["e"]
-        return box.get("v")
+        try:
+            return result.result(timeout=timeout)
+        except FutureTimeout:
+            cancelled = result.cancel()
+            raise TimeoutError("Command timed out; {}.".format(
+                "cancelled before execution" if cancelled else "still executing; inspect state before retrying"))
+
+    def _save_session(self):
+        if self.dbg.state and self.dbg.save_state(self._hidden_bp_ids()) is None:
+            raise RuntimeError("Could not save debugger state; check the state directory permissions.")
 
     def _ensure_host_platform(self) -> None:
         # "the platform is not connected" on Launch/Attach can happen when the
@@ -182,8 +209,8 @@ class Engine:
             self._ensure_host_platform()
             self._prepare_target_change()
             self.dbg.create_target(program)
-            restored = self.dbg.restore_stored_breakpoints()
             self.dbg.launch(list(args))
+            restored = self.dbg.restore_stored_breakpoints()
             self._console("launched {}".format(program))
             if self.dbg.state:
                 self._console("[state] sha={}… ({} bp, {} comment, {} bookmark, "
@@ -196,7 +223,8 @@ class Engine:
             if p and p.IsValid():
                 st = p.GetState()
                 if st == lldb.eStateStopped:
-                    self._console("[entry] stopped at entry {:#x}".format(self.dbg.pc() or 0))
+                    stage = "[loader] stopped before initializers" if self.dbg.is_stopped_before_initializers() else "[entry] stopped at entry"
+                    self._console("{} {:#x}".format(stage, self.dbg.pc() or 0))
                     self._emit_state()
                     # Scanning the whole binary's string sections can take a beat
                     # on a large target; defer it so it never gates the first
@@ -218,15 +246,21 @@ class Engine:
 
     # ---- event fan-out -------------------------------------------------------
     def subscribe(self) -> "queue.Queue":
-        q: "queue.Queue" = queue.Queue()
+        q: "queue.Queue" = queue.Queue(maxsize=256)
         with self._subs_lock:
             self._subs.add(q)
         # a fresh subscriber gets the current state immediately
-        self.submit(self._emit_subscriber_state)
+        self.submit(self._emit_subscriber_state, q)
         return q
 
-    def _emit_subscriber_state(self):
-        self._emit_state()
+    def _emit_subscriber_state(self, subscriber=None):
+        if subscriber is None:
+            self._emit_state()
+        else:
+            subscriber.put_nowait(self._build_state())
+            subscriber.put_nowait({"t": "trace_snapshot", **self.trace_log.snapshot()})
+            with self._console_lock:
+                subscriber.put_nowait({"t": "console_snapshot", "rows": list(self._console_history)})
         if self._pending_exec is not None:
             self._emit_exec_prompt()
         elif self._pending_fork is not None:
@@ -250,17 +284,31 @@ class Engine:
         for q in subs:
             try:
                 q.put_nowait(obj)
-            except Exception:
-                pass
+            except queue.Full:
+                # Disconnect slow readers and let them reconnect to a fresh
+                # state + bounded trace replay. Never accumulate unbounded SSE.
+                self.unsubscribe(q)
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+                q.put_nowait({"t": "resync"})
 
     def _console(self, text: str, error: bool = False) -> None:
-        self._emit({"t": "console", "text": text, "error": error})
+        if len(text) > 65536:
+            text = text[:65536] + "\n[console output shortened; use LLDB file output for a full dump]"
+        with self._console_lock:
+            self._console_sequence += 1
+            row = {"t": "console", "id": self._console_sequence, "text": text, "error": error}
+            self._console_history.append(row)
+            self._emit(row)
 
     def _pump_output(self) -> None:
         while not self._output_stop.is_set():
             text = self.dbg.read_output()
             if text:
-                self._emit({"t": "console", "text": text, "error": False})
+                self._console(text)
             else:
                 time.sleep(0.05)
 
@@ -277,6 +325,14 @@ class Engine:
                        and dbg.process.GetState() == lldb.eStateRunning)
         state = {"t": "state", "pc": pc, "sp": sp, "running": running,
                  "has_process": bool(dbg.process and dbg.process.IsValid())}
+        state["process_state"] = (lldb.SBDebugger.StateAsCString(dbg.process.GetState())
+                                  if state["has_process"] else "none")
+        state["before_initializers"] = dbg.is_stopped_before_initializers()
+        state["can_restart"] = bool(self.program and not self.attach_pid)
+        state["pending_decision"] = ("exec" if self._pending_exec else
+                                      "fork" if self._pending_fork else None)
+        if state["process_state"] == "exited":
+            state["exit_code"] = dbg.process.GetExitStatus()
 
         center = disasm_center if disasm_center is not None else self._disasm_follow
         if dbg.target and pc:
@@ -377,6 +433,9 @@ class Engine:
         self._last_stop_event_key = None
 
     def _on_stop_event(self, e: StopEvent) -> None:
+        if e.process_id and self.dbg.process and self.dbg.process.IsValid():
+            if e.process_id != self.dbg.process.GetProcessID():
+                return
         if e.state == lldb.eStateStopped and e.stop_id:
             process = self.dbg.process
             if not process or not process.IsValid():
@@ -462,7 +521,16 @@ class Engine:
             self._emit_state()
         elif e.state == lldb.eStateExited:
             self.dbg.cancel_user_step()
+            self._pending_exec = self._pending_fork = self._pending_exec_token = None
             self._console(self._describe_exit())
+            self._emit_state()
+        elif e.state == lldb.eStateRunning:
+            if self.dbg.process and self.dbg.process.GetState() == lldb.eStateRunning:
+                self._emit({"t": "running"})
+        elif e.state in (lldb.eStateCrashed, lldb.eStateDetached, lldb.eStateInvalid):
+            self._pending_exec = self._pending_fork = self._pending_exec_token = None
+            self.dbg.cancel_user_step()
+            self._console("process " + e.description)
             self._emit_state()
 
     def _describe_exit(self) -> str:
@@ -603,7 +671,7 @@ class Engine:
             return
         hit = self.tracer.hit_from(thread.GetFrameAtIndex(0), self.dbg.process)
         if hit is not None:
-            self._add_trace(hit.category, hit.call)
+            self._add_trace(hit.category, hit.call, hit.details)
 
     def _log_trace_hit(self) -> bool:
         p = self.dbg.process
@@ -620,7 +688,7 @@ class Engine:
             return False
         hit = self.tracer.hit_from(thread.GetFrameAtIndex(0), p, bp_id=bp_id)
         if hit is not None:
-            self._add_trace(hit.category, hit.call)
+            self._add_trace(hit.category, hit.call, hit.details)
         return True
 
     def _handle_possible_trace_hit(self) -> bool:
@@ -633,11 +701,10 @@ class Engine:
         self.dbg.cont()
         return True
 
-    def _add_trace(self, category: str, call: str) -> None:
-        with self._trace_lock:
-            self._trace_count += 1
-            n = self._trace_count
-        self._emit({"t": "trace", "n": n, "cat": category, "call": call})
+    def _add_trace(self, category: str, call: str, details=None) -> None:
+        row = self.trace_log.append(category, call, **(details or {}))
+        self._trace_count = row["n"]
+        self._emit({"t": "trace", **row, "cat": category})
 
     # ---- hidden bp / user bp maps --------------------------------------------
     def _user_bp_addrs(self) -> Dict[int, bool]:
@@ -673,6 +740,12 @@ class Engine:
 
     # ---- resume gate ---------------------------------------------------------
     def _begin_resume(self) -> bool:
+        try:
+            self.dbg.require_decision_resolved()
+        except RuntimeError as error:
+            self._console(str(error), error=True)
+            self._emit_subscriber_state()
+            return False
         # Refuse a new step/continue while one is already resolving. `_resuming`
         # is briefly cleared at the top of each stop event; also gate on an
         # in-flight user step so a second step command arriving in that window
@@ -711,6 +784,11 @@ class Engine:
 
     # ===== command dispatch (called from HTTP thread) =========================
     def command(self, name: str, args: dict) -> dict:
+        if name == "cancel_scan":
+            self._scan_cancel.set()
+            return {"ok": True}
+        if self._closing:
+            return {"ok": False, "error": "debugger is shutting down"}
         handler = self._COMMANDS.get(name)
         if handler is None:
             return {"ok": False, "error": "unknown command {!r}".format(name)}
@@ -767,6 +845,13 @@ class Engine:
         else:
             self._console("[wrapper] nothing to interrupt")
 
+    def _c_kill(self, a):
+        if self.dbg.process and self.dbg.process.IsValid():
+            error = self.dbg.process.Kill()
+            if error.Fail():
+                raise RuntimeError(error.GetCString())
+            self._pending_exec = self._pending_fork = self._pending_exec_token = None
+
     def _c_restart(self, a):
         if self.attach_pid:
             self._console("[restart] not available for an attached process", error=True)
@@ -780,10 +865,7 @@ class Engine:
         p = self.dbg.process
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
-        self._interpose_stop.set()
-        if self._interpose_thread is not None:
-            self._interpose_thread.join(timeout=0.5)
-            self._interpose_thread = None
+        self._stop_interpose_reader()
         hidden = self._hidden_bp_ids() - self.dbg.script_exec.breakpoint_ids()
         for bid in hidden:
             self.dbg.set_bp_enabled(bid, False)
@@ -821,6 +903,7 @@ class Engine:
                     return
         op, bp_id = self.dbg.toggle_breakpoint_at(addr)
         self._console("breakpoint {} #{} @ {:#x}".format(op, bp_id, addr))
+        self._save_session()
         self._emit_state()
 
     def _c_run_to(self, a):
@@ -853,6 +936,10 @@ class Engine:
         self._mem_follow = addr
         self._mem_follow_len = int(a.get("len", 1) or 1)
         self._emit_state()
+
+    def _c_resolve_address(self, a):
+        from macdbg.core.address import resolve
+        return resolve(self.dbg, a.get("expression", ""))
 
     def _c_follow_disasm(self, a):
         addr = self._addr(a)
@@ -936,6 +1023,7 @@ class Engine:
         rows = self.dbg.breakpoints(exclude_ids=self._hidden_bp_ids())
         cur = next((en for i, _addr, _s, _n, en, _c in rows if i == bid), True)
         self.dbg.set_bp_enabled(bid, not cur)
+        self._save_session()
         self._emit_state()
 
     def _c_bp_delete(self, a):
@@ -943,6 +1031,7 @@ class Engine:
         if self._guard_hidden_bp(bid):
             return
         self.dbg.delete_breakpoint(bid)
+        self._save_session()
         self._emit_state()
 
     def _c_bp_condition(self, a):
@@ -950,6 +1039,7 @@ class Engine:
         if self._guard_hidden_bp(bid):
             return
         self.dbg.set_bp_condition(bid, (a.get("cond") or "").strip())
+        self._save_session()
         self._emit_state()
 
     def _c_bp_commands(self, a):
@@ -958,6 +1048,7 @@ class Engine:
             return
         cmds = a.get("commands") or []
         self.dbg.set_bp_commands(bid, list(cmds))
+        self._save_session()
         self._emit_state()
 
     # -- watches
@@ -982,6 +1073,19 @@ class Engine:
         self._emit_state()
 
     # -- search
+    def _run_scan(self, function, *args, **kwargs):
+        if self._closing:
+            return None
+        self._scan_cancel.clear()
+        self._emit({"t": "scan", "active": True})
+        try:
+            return function(*args, cancelled=self._scan_cancel.is_set, **kwargs)
+        except InterruptedError:
+            self._console("[scan] cancelled")
+            return None
+        finally:
+            self._emit({"t": "scan", "active": False})
+
     def _c_search(self, a):
         p = self.dbg.process
         if not p or not p.IsValid() or p.GetState() != lldb.eStateStopped:
@@ -1008,9 +1112,12 @@ class Engine:
             self._console("[search] could not parse {!r}".format(v), error=True)
             return
         self._console("[search] scope={} scanning {} byte(s)…".format(scope, len(needle)))
-        hits, scanned = self.dbg.memory_search(needle, max_hits=64,
+        found = self._run_scan(self.dbg.memory_search, needle, max_hits=64,
                                                total_budget_bytes=1024 * 1024 * 1024,
                                                scope=scope)
+        if found is None:
+            return
+        hits, scanned = found
         if not hits:
             self._console("[search] no hits (scanned {} MB). Try 'all:'.".format(
                 scanned // (1024 * 1024)), error=True)
@@ -1049,7 +1156,10 @@ class Engine:
             return
         self._console("[strings] scanning live memory…")
         try:
-            self._strings_live = self.dbg.scan_live_strings(min_len=8)
+            found = self._run_scan(self.dbg.scan_live_strings, min_len=8)
+            if found is None:
+                return
+            self._strings_live = found
         except Exception as e:
             self._console("[strings] scan failed: {}".format(e), error=True)
             return
@@ -1293,10 +1403,18 @@ class Engine:
         self._emit_state()
 
     def _c_trace_clear(self, a):
+        self.trace_log.reset()
         with self._trace_lock:
             self._trace_count = 0
         self._emit({"t": "trace_clear"})
         self._console("[trace] cleared")
+
+    def _c_trace_export(self, a):
+        saved = self.trace_log.snapshot()
+        if not saved["path"]:
+            raise ValueError("No trace events to export.")
+        self._console("[trace] Full JSONL trace: " + saved["path"])
+        return {"path": saved["path"], "count": saved["total"]}
 
     def _c_fork_trace(self, a):
         if self.dbg.analysis_cloak.enabled:
@@ -1362,9 +1480,16 @@ class Engine:
         (name,) = self._pending_fork
         decision = a.get("decision", "parent")
         if decision not in ("parent", "child"):
-            decision = "parent"
+            self._console("Invalid fork decision; choose parent or child.", error=True)
+            self._emit_subscriber_state()
+            return
+        try:
+            self.dbg.resolve_fork(decision)
+        except Exception as error:
+            self._console(str(error), error=True)
+            self._emit_subscriber_state()
+            return
         self._pending_fork = None
-        self.dbg.resolve_fork(decision)
         self._console("[anti-debug] {}() → {}".format(name, decision))
         self._emit({"t": "running"})
 
@@ -1373,6 +1498,10 @@ class Engine:
     _DELALL = ("br del", "breakpoint delete")
 
     def _c_run_cmd(self, a):
+        if self._pending_exec or self._pending_fork:
+            self._console("Resolve the pending execution decision before running console commands.", error=True)
+            self._emit_subscriber_state()
+            return
         cmd = (a.get("cmd") or "").strip()
         if not cmd:
             return
@@ -1392,6 +1521,7 @@ class Engine:
         if self.dbg.ensure_listening():
             self._prev_regs = {}
             self._mem_follow = None
+        self._save_session()
         if self.dbg.process and self.dbg.process.GetState() == lldb.eStateStopped:
             self._emit_state()
 
@@ -1415,11 +1545,35 @@ class Engine:
         path = (a.get("path") or "").strip()
         if not path:
             return
-        args = a.get("args") or []
+        import os
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            self._console("[open] select an executable file", error=True)
+            return
+        stop_at = a.get("stop_at", "entry")
+        if stop_at not in ("entry", "loader"):
+            raise ValueError("stop_at must be entry or loader")
+        self.dbg.launch_stop = stop_at
+        import shlex
+        args = shlex.split(a["args_text"]) if "args_text" in a else a.get("args") or []
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError("target arguments must be a list of strings")
+        profile = a.get("profile", "manual")
+        if profile not in ("manual", "intercept"):
+            raise ValueError("unknown launch profile")
         self.program, self.program_args, self.attach_pid = path, args, None
         self._launch(path, args)
+        if profile == "intercept" and self.dbg.process and self.dbg.process.GetState() == lldb.eStateStopped:
+            self.dbg.exec_interactive = True
+            for enable in (self.dbg.enable_anti_ptrace, self.dbg.enable_exec_sandbox):
+                ok, message = enable()
+                self._console("[launch] " + message, error=not ok)
+                if not ok:
+                    break
+            self._emit_state()
 
     def _prepare_target_change(self):
+        self._save_session()
+        self._stop_interpose_reader()
         if self.tracer.enabled:
             self.tracer.disable(self.dbg.target)
         self._pending_exec = self._pending_fork = None
@@ -1430,6 +1584,8 @@ class Engine:
         self._annot_cache = {}
         self._strings_bin = self._strings_live = []
         self._mem_follow = self._disasm_follow = None
+        if hasattr(self, "trace_log"):
+            self._c_trace_clear({})
 
     def _c_attach(self, a):
         try:
@@ -1461,10 +1617,13 @@ class Engine:
     def _c_ui(self, a):
         # relay a UI action (from the native menu bar) to the frontend, which
         # owns the corresponding dialog/modal
-        self._emit({"t": "ui", "action": a.get("action", "")})
+        self._emit({"t": "ui", **a})
 
     def _c_pick_file(self, a):
-        """Show a native macOS open panel and launch the chosen binary."""
+        """Keep a browser fallback's native picker off the LLDB worker."""
+        threading.Thread(target=self._pick_file, name="file-picker", daemon=True).start()
+
+    def _pick_file(self):
         import subprocess
         try:
             out = subprocess.run(
@@ -1477,7 +1636,7 @@ class Engine:
         path = (out.stdout or "").strip()
         if not path:
             return  # cancelled
-        self._c_open_target({"path": path, "args": []})
+        self._emit({"t": "ui", "action": "launch", "path": path})
 
     def _c_list_processes(self, a):
         """Return running processes for the Attach picker (sync command)."""
@@ -1507,6 +1666,17 @@ class Engine:
     # ---- interpose reader ----------------------------------------------------
     _INTERPOSE_CAT = {"read": "FILE", "write": "FILE", "open": "FILE",
                       "send": "NET", "recv": "NET", "connect": "NET"}
+
+    def _stop_interpose_reader(self):
+        stop = getattr(self, "_interpose_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_interpose_thread", None)
+        if thread is not None:
+            thread.join(timeout=2)
+            if thread.is_alive():
+                raise RuntimeError("Trace reader is still stopping; retry after it finishes.")
+            self._interpose_thread = None
 
     def _maybe_start_interpose_reader(self) -> None:
         path = self.dbg.interpose_trace_path
@@ -1562,7 +1732,7 @@ class Engine:
             try:
                 with open(path, "r") as fh:
                     fh.seek(pos)
-                    chunk = fh.read()
+                    chunk = fh.read(65536)
                     pos = fh.tell()
             except OSError:
                 chunk = ""
@@ -1572,12 +1742,16 @@ class Engine:
             buf += chunk
             lines = buf.split("\n")
             buf = lines.pop()
+            if len(buf) > 8192:
+                buf = ""
             for line in lines:
+                if self._interpose_stop.is_set():
+                    return
                 if not line:
                     continue
                 parsed = self._format_interpose(line.split("\t"))
                 if parsed:
-                    self._add_trace(parsed[0], parsed[1])
+                    self._add_trace(parsed[0], parsed[1], {"source": "interpose", "pid": int(line.split("\t", 1)[0])})
 
 
 # ---- command + toggle tables (bound after class body) ------------------------
@@ -1604,8 +1778,11 @@ Engine._COMMANDS = {
     "attach": Engine._c_attach, "save_state": Engine._c_save_state,
     "refresh": Engine._c_refresh, "pick_file": Engine._c_pick_file,
     "list_processes": Engine._c_list_processes, "ui": Engine._c_ui,
+    "resolve_address": Engine._c_resolve_address,
+    "trace_export": Engine._c_trace_export,
+    "kill": Engine._c_kill,
 }
-Engine._SYNC = {"complete", "list_processes"}
+Engine._SYNC = {"complete", "list_processes", "resolve_address", "trace_export"}
 Engine._DEFENSE_TOGGLES = {
     "auto_clock": Engine._t_auto_clock,
     "anti_timing": Engine._t_anti_timing,

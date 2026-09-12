@@ -42,6 +42,8 @@ class EventPump:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
 
     def _run(self) -> None:
         event = lldb.SBEvent()

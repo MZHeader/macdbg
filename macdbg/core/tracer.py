@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 import lldb
@@ -21,6 +21,19 @@ _FD_CALLS = {"read", "write", "pread", "pwrite", "close",
 class TraceHit:
     category: str
     call: str
+    details: dict = field(default_factory=dict)
+
+
+def _hit(category, call, frame, process):
+    thread = frame.GetThread()
+    caller = thread.GetFrameAtIndex(1)
+    details = {"phase": "entry", "pid": process.GetProcessID(), "tid": thread.GetThreadID(),
+               "symbol": frame.GetFunctionName() or "",
+               "argument_registers": {"x{}".format(i): hex(_reg(frame, "x{}".format(i))) for i in range(8)}}
+    if caller and caller.IsValid():
+        details.update(caller=hex(caller.GetPC()),
+                       caller_module=caller.GetModule().GetFileSpec().GetFilename() or "")
+    return TraceHit(category, call, details)
 
 
 def _read_cstr(process: lldb.SBProcess, addr: int, cap: int = 256) -> str:
@@ -209,6 +222,10 @@ def _f_recvfrom(frame, p):
 
 def _f_stat(frame, p):
     return 'stat("{}")'.format(_read_cstr(p, _reg(frame, "x0")))
+
+
+def _f_fstat(frame, p):
+    return "fstat(fd={}, buf={:#x})".format(_reg(frame, "x0"), _reg(frame, "x1"))
 
 
 def _f_access(frame, p):
@@ -447,7 +464,8 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "stat$INODE64":       (FILE, _f_stat),
     "lstat":              (FILE, _f_stat),
     "lstat$INODE64":      (FILE, _f_stat),
-    "fstat":              (FILE, _f_stat),
+    "fstat":              (FILE, _f_fstat),
+    "fstat$INODE64":      (FILE, _f_fstat),
     "access":             (FILE, _f_access),
     "unlink":             (FILE, _f_unlink),
     "rename":             (FILE, _f_rename),
@@ -609,7 +627,7 @@ class Tracer:
                 call = fmt(frame, process)
             except Exception as e:
                 call = "regex hook [formatter error: {}]".format(e)
-            return TraceHit(category=cat, call=call) if call is not None else None
+            return _hit(cat, call, frame, process) if call is not None else None
         name = frame.GetFunctionName() or ""
         for candidate in (name, name.lstrip("_")):
             if candidate in SIGS:
@@ -622,7 +640,7 @@ class Tracer:
                     call = "{}(...) [formatter error: {}]".format(candidate, e)
                 if call is None:
                     return None
-                return TraceHit(category=cat, call=call)
+                return _hit(cat, call, frame, process)
         return None
 
     def _caller_is_noise(self, frame: lldb.SBFrame) -> bool:

@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
-import time
+import threading
 
 
 def _ensure_paths() -> None:
@@ -34,6 +35,7 @@ def main() -> int:
     p.add_argument("program", nargs="?")
     p.add_argument("args", nargs=argparse.REMAINDER)
     p.add_argument("--attach", type=int, default=None)
+    p.add_argument("--stop-at", choices=("entry", "loader"), default="entry")
     argv = [a for a in sys.argv[1:]
             if not a.startswith(("-psn_", "-NS", "-Apple"))]
     ns = p.parse_args(argv)
@@ -42,17 +44,26 @@ def main() -> int:
     from server import httpd
 
     engine = Engine(program=ns.program, program_args=ns.args or [], attach_pid=ns.attach)
+    engine.dbg.launch_stop = ns.stop_at
+    done = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: done.set())
+    parent = os.getppid() if os.environ.pop("MACDBG_WATCH_PARENT", None) == "1" else None
     engine.start()
-    _httpd, port = httpd.serve(engine, port=0)
+    _httpd, port = httpd.serve(engine, port=0, on_shutdown=done.set)
+    sys.stdout.write("TOKEN={}\n".format(_httpd.token))
     sys.stdout.write("PORT={}\n".format(port))
     sys.stdout.flush()
     try:
-        while True:
-            time.sleep(3600)
+        while not done.wait(0.25):
+            if parent is not None and os.getppid() != parent:
+                break
     except KeyboardInterrupt:
         pass
     finally:
+        _httpd.shutdown()
         engine.shutdown()
+        _httpd.server_close()
     return 0
 
 

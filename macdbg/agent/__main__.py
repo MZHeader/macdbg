@@ -158,6 +158,7 @@ def _cmd_start_locked(ns, name: str, sdir: str) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.dirname(os.path.dirname(here))
     argv = [sys.executable, "-m", "macdbg.agent.server", "--session-dir", sdir]
+    argv += ["--stop-at", getattr(ns, "stop_at", "entry")]
     if ns.attach is not None:
         argv += ["--attach", str(ns.attach)]
     elif ns.program:
@@ -358,6 +359,8 @@ def main() -> int:
     sp.add_argument("--attach", type=int, default=None)
     sp.add_argument("--session", default=None, help="session name (default: auto-generated)")
     sp.add_argument("--boot-timeout", type=float, default=30.0)
+    sp.add_argument("--stop-at", choices=("entry", "loader"), default="entry",
+                    help="loader stops before initializers; entry advances to main")
     sp.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("cmd", help="send one command to a running session")

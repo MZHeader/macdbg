@@ -10,6 +10,11 @@ CFLAGS := -arch arm64 -O0 -g -Wall -Wextra
 FRAMEWORKS := -framework CoreFoundation -framework IOKit
 
 .PHONY: all clean
+all: $(BUILD)/workflow_fixture
+
+$(BUILD)/workflow_fixture: workflow_fixture.c | $(BUILD)
+	clang $(CFLAGS) -Wno-deprecated-declarations $< -o $@
+
 all: $(FIXTURE) $(STRIPPED_FIXTURE) $(OPTIMIZED_FIXTURE) $(LATE_IOKIT_FIXTURE) $(FRIDA_FIXTURE) $(CONTROLLED_SYSCTL_FIXTURE) $(BUILD)/timing_fixture $(BUILD)/timing_fixture_optimized $(BUILD)/framework_fixture $(BUILD)/clock_contention_fixture $(BUILD)/ClockWorker.dylib $(BUILD)/constant.scpt $(BUILD)/self_trap_fixture $(BUILD)/script_exec_fixture $(BUILD)/script_exec_late_fixture
 
 $(BUILD)/script_exec_late_fixture: script_exec_late_fixture.c | $(BUILD)

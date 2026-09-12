@@ -10,14 +10,16 @@ default browser if no Chromium-based browser is installed.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
 import sys
 import time
+import threading
 import urllib.request
 
-LOCK = os.path.expanduser("~/.macdbg/gui.lock")
+LOCK = os.path.join(os.path.expanduser(os.environ.get("MACDBG_STATE_DIR", "~/.macdbg")), "gui.lock")
 
 
 def _ensure_paths() -> None:
@@ -68,15 +70,17 @@ def _running_instance_url():
     a window that isn't there."""
     try:
         with open(LOCK) as f:
-            port = int(f.read().strip())
-    except (OSError, ValueError):
+            record = json.load(f)
+            port, token = int(record["port"]), record["token"]
+    except (OSError, ValueError, TypeError, KeyError):
         return None
     url = "http://127.0.0.1:{}/".format(port)
     try:
         # Verify it's actually us (index.html is titled 'macdbg'), not just any
         # process that happens to hold the port.
-        if b"macdbg" in urllib.request.urlopen(url, timeout=0.5).read(4096):
-            return url
+        req = urllib.request.Request(url + "health", headers={"X-Macdbg-Token": token})
+        if json.load(urllib.request.urlopen(req, timeout=0.5)).get("ok"):
+            return url + "#token=" + token
     except Exception:
         pass
     try:
@@ -113,6 +117,7 @@ def main() -> int:
     p.add_argument("args", nargs=argparse.REMAINDER)
     p.add_argument("--attach", type=int, default=None)
     p.add_argument("--port", type=int, default=0)
+    p.add_argument("--stop-at", choices=("entry", "loader"), default="entry")
     argv = [a for a in sys.argv[1:]
             if not a.startswith("-psn_") and not a.startswith("-NS")
             and not a.startswith("-Apple")]
@@ -132,14 +137,18 @@ def main() -> int:
     from server import httpd
 
     engine = Engine(program=ns.program, program_args=ns.args or [], attach_pid=ns.attach)
+    engine.dbg.launch_stop = ns.stop_at
+    done = threading.Event()
     engine.start()
-    _httpd, port = httpd.serve(engine, port=ns.port)
-    url = "http://127.0.0.1:{}/".format(port)
-    sys.stderr.write("macdbg GUI serving at {}\n".format(url))
+    _httpd, port = httpd.serve(engine, port=ns.port, on_shutdown=done.set)
+    base_url = "http://127.0.0.1:{}/".format(port)
+    url = base_url + "#token=" + _httpd.token
+    sys.stderr.write("macdbg GUI serving at {}\n".format(base_url))
     try:
         os.makedirs(os.path.dirname(LOCK), exist_ok=True)
-        with open(LOCK, "w") as f:
-            f.write(str(port))
+        with os.fdopen(os.open(LOCK, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump({"port": port, "token": _httpd.token}, f)
     except OSError:
         pass
 
@@ -148,25 +157,27 @@ def main() -> int:
     # a killed instance leaves an orphaned backend and a stale lock that makes the
     # next launch think it's "already running".
     try:
-        signal.signal(signal.SIGTERM, lambda *_a: sys.exit(0))
+        signal.signal(signal.SIGTERM, lambda *_a: done.set())
     except Exception:
         pass
 
     proc = _open_app_window(url)
     try:
         if proc is not None:
-            proc.wait()  # chromeless Chromium window: block until it's closed
+            while not done.wait(0.25) and proc.poll() is None:
+                pass
         else:
             # No Chromium browser installed — fall back to Safari.
             _open_fallback(url)
             sys.stderr.write("No Chromium browser found — opened in Safari. "
                              "Press Ctrl+C here to quit macdbg.\n")
-            while True:
-                time.sleep(1)
+            done.wait()
     except KeyboardInterrupt:
         pass
     finally:
+        _httpd.shutdown()
         engine.shutdown()
+        _httpd.server_close()
         try:
             os.remove(LOCK)
         except OSError:
