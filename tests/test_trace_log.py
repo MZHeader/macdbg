@@ -7,6 +7,19 @@ from macdbg.core.trace_log import TraceLog
 
 
 class TraceLogTests(unittest.TestCase):
+    def test_large_payloads_bound_live_bytes_without_losing_disk_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = TraceLog(lambda: directory, capacity=2000, capacity_bytes=2000)
+            for n in range(10):
+                log.append("NET", "POST /", payload={"text": "x" * 800})
+            replay = log.snapshot()
+            self.assertLess(len(replay["hits"]), 3)
+            self.assertEqual(replay["hits"][-1]["n"], 10)
+            self.assertLessEqual(log.live_bytes, 2000)
+            self.assertEqual(len(Path(replay["path"]).read_text().splitlines()), 10)
+            log.reset()
+            self.assertEqual(log.live_bytes, 0)
+
     def test_live_window_is_bounded_and_full_export_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             log = TraceLog(lambda: directory, capacity=3)

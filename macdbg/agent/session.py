@@ -160,6 +160,10 @@ class AgentSession:
             except Exception:
                 pass
         try:
+            self._flush_network_trace()
+        except Exception:
+            pass
+        try:
             self.dbg.destroy()
         except Exception:
             pass
@@ -376,6 +380,7 @@ class AgentSession:
             total, resolved = self.tracer.enable(self.dbg.target, ci=self.dbg.ci)
             return {"ok": True, "total": total, "resolved": resolved, "already_enabled": was_enabled}
         if cmd == "tracer_disable":
+            self._flush_network_trace()
             self.tracer.disable(self.dbg.target)
             return {"ok": True}
         if cmd == "tracer_depth":
@@ -718,6 +723,8 @@ class AgentSession:
         # act on the wrong (or a nonexistent) stop. Restart makes it moot.
         self._pending = None
         p = self.dbg.process
+        self._flush_network_trace()
+        self.tracer.network.reset()
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
         hidden = self._hidden_bp_ids() - self.dbg.script_exec.breakpoint_ids()
@@ -939,11 +946,13 @@ class AgentSession:
                 return {"ok": True, "event": "stop", "stop": self._describe_stop(),
                         "console": self._drain_console()}
             if state == lldb.eStateExited:
+                self._flush_network_trace()
                 self.dbg.cancel_user_step()
                 self._pending = None
                 return {"ok": True, "event": "exited", "exit": self._describe_exit(),
                         "console": self._drain_console()}
             if state in (lldb.eStateCrashed, lldb.eStateDetached, lldb.eStateInvalid):
+                self._flush_network_trace()
                 self.dbg.cancel_user_step()
                 self._pending = None
                 return {"ok": True, "event": "terminated",
@@ -955,6 +964,10 @@ class AgentSession:
             continue
 
     # -- ported orchestration (WrapperApp._handle_anti_debug_hit et al.) --
+
+    def _flush_network_trace(self):
+        for hit in self.tracer.flush_network(self.dbg.process):
+            self._trace_count = self.trace_log.append(hit.category, hit.call, **hit.details)["n"]
 
     @staticmethod
     def _stop_bp_ids(thread) -> List[int]:

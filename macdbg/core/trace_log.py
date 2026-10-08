@@ -8,15 +8,18 @@ import uuid
 
 
 class TraceLog:
-    def __init__(self, directory, capacity=2000):
+    def __init__(self, directory, capacity=2000, capacity_bytes=16 * 1024 * 1024):
         self.directory = directory
         self.capacity = capacity
+        self.capacity_bytes = capacity_bytes
         self.lock = threading.Lock()
         self.reset()
 
     def reset(self):
         with self.lock:
             self.rows = deque(maxlen=self.capacity)
+            self.row_sizes = deque(maxlen=self.capacity)
+            self.live_bytes = 0
             self.count = 0
             self.epoch = uuid.uuid4().hex
             self.path = None
@@ -33,10 +36,18 @@ class TraceLog:
                    "category": category, "call": call}
             # Close after each complete record: a crash or GUI reload cannot
             # strand the only copy in a Python buffer or browser table.
+            serialized = json.dumps(row)
             with os.fdopen(os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a") as file:
-                file.write(json.dumps(row) + "\n")
+                file.write(serialized + "\n")
             self.count += 1
+            size = len(serialized)
+            while self.rows and (len(self.rows) >= self.capacity
+                                 or self.live_bytes + size > self.capacity_bytes):
+                self.rows.popleft()
+                self.live_bytes -= self.row_sizes.popleft()
             self.rows.append(row)
+            self.row_sizes.append(size)
+            self.live_bytes += size
             return row
 
     def snapshot(self, since=0):

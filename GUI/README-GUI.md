@@ -84,6 +84,8 @@ Open Target lets you choose arguments, the first stop (before initializers or at
 
 Trace keeps a bounded live window with text/category filters and caller navigation. Export JSONL reports the complete on-disk log path. API entry events include timestamp, PID/TID, caller and argument registers; entry events do not include the eventual return value.
 
+Click **Details** on a network row (or double-click it) to inspect captured headers, body text, form fields, JSON, multipart parts and raw base64 bytes. Search also matches captured request contents. Foundation request creation/resume and supported TLS/socket writes retain structured `http_requests` and `payload` fields in JSONL; the headless `trace_hits` command returns the same fields. Bodies/write buffers are capped at 256 KiB and headers at 64 KiB; the viewer labels missing or truncated content. A complete capture describes the observed API input, not confirmed delivery. Request creation and resume may produce separate snapshots, and Foundation headers can differ from transport-generated headers.
+
 The HTTP bridge uses a fresh credential per session, plus Host/Origin and JSON request checks. The launcher passes the credential to the native window automatically. Shutdown saves state on the debugger worker and tears down its target; the backend also watches for its native parent exiting.
 
 ## Architecture

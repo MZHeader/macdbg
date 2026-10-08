@@ -19,6 +19,8 @@ export PYTHONDONTWRITEBYTECODE=1
 
 Integration tests start and stop their own LLDB sessions. The workflow tests cover classic exec decisions, early initializers, process states, persistence, navigation, HTTP credentials, and interposer semantics. Existing integration modules cover cloak identity and integrity, automatic clocks, timing rules, OSA execution, and framework interactions.
 
+`tests.test_http_capture` and `tests.test_network_capture` cover HTTP framing, payload limits, binary/form/JSON/multipart bodies, missing memory, socket/TLS lifecycle, and nested write observations. `tests.integration.test_http_capture` uses the ARM64 `http_fixture` and a loopback server to verify POST headers/body bytes through Foundation, separate upload data, unchanged body streams, split socket writes, and HTTPS. The HTTPS case creates a temporary test certificate; only that fixture's loopback HTTPS mode accepts its self-signed certificate. All server, certificate and session resources are cleaned by the tests.
+
 After the run, `MACDBG_STATE_DIR=/private/tmp/macdbg-tests ./agent.sh list` should have no live sessions. The fixture build in `tests/integration/build/` and the temporary session directory are disposable. `make -C tests/integration clean` removes the fixture build.
 
 For a native GUI check, launch `GUI/run.sh tests/integration/build/workflow_fixture`. Add a breakpoint, quit with Cmd+Q, and reopen the same target: the breakpoint should return and the old backend should have exited. Repeat using the window close button. Confirm Go To accepts `workflow_marker` and `$pc + 4`, and a finished target shows Exited with Restart available.

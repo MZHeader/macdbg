@@ -133,9 +133,12 @@ class Engine:
         except Exception:
             pass
         try:
-            self.dbg.destroy()
+            self._flush_network()
         finally:
-            self._alive = False
+            try:
+                self.dbg.destroy()
+            finally:
+                self._alive = False
 
     def _worker_loop(self) -> None:
         while self._alive:
@@ -520,6 +523,7 @@ class Engine:
             self._console(self._describe_stop())
             self._emit_state()
         elif e.state == lldb.eStateExited:
+            self._flush_network()
             self.dbg.cancel_user_step()
             self._pending_exec = self._pending_fork = self._pending_exec_token = None
             self._console(self._describe_exit())
@@ -528,6 +532,7 @@ class Engine:
             if self.dbg.process and self.dbg.process.GetState() == lldb.eStateRunning:
                 self._emit({"t": "running"})
         elif e.state in (lldb.eStateCrashed, lldb.eStateDetached, lldb.eStateInvalid):
+            self._flush_network()
             self._pending_exec = self._pending_fork = self._pending_exec_token = None
             self.dbg.cancel_user_step()
             self._console("process " + e.description)
@@ -706,6 +711,12 @@ class Engine:
         self._trace_count = row["n"]
         self._emit({"t": "trace", **row, "cat": category})
 
+    def _flush_network(self) -> None:
+        if not hasattr(self, "trace_log"):
+            return
+        for hit in self.tracer.flush_network(self.dbg.process):
+            self._add_trace(hit.category, hit.call, hit.details)
+
     # ---- hidden bp / user bp maps --------------------------------------------
     def _user_bp_addrs(self) -> Dict[int, bool]:
         out: Dict[int, bool] = {}
@@ -850,6 +861,7 @@ class Engine:
             error = self.dbg.process.Kill()
             if error.Fail():
                 raise RuntimeError(error.GetCString())
+            self._flush_network()
             self._pending_exec = self._pending_fork = self._pending_exec_token = None
 
     def _c_restart(self, a):
@@ -862,6 +874,7 @@ class Engine:
         self._pending_exec = self._pending_fork = None
         self._pending_exec_token = None
         self._forget_stop_event_identity()
+        self._flush_network()
         p = self.dbg.process
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
@@ -1384,6 +1397,7 @@ class Engine:
 
     def _c_trace_toggle(self, a):
         if self.tracer.enabled:
+            self._flush_network()
             self.tracer.disable(self.dbg.target)
             self._console("[trace] disabled")
         else:
@@ -1403,6 +1417,7 @@ class Engine:
         self._emit_state()
 
     def _c_trace_clear(self, a):
+        self._flush_network()
         self.trace_log.reset()
         with self._trace_lock:
             self._trace_count = 0
@@ -1508,6 +1523,7 @@ class Engine:
         cl = cmd.lower()
         if any(cl == x or cl.startswith(x + " ") for x in self._RELAUNCH):
             self._forget_stop_event_identity()
+            self._flush_network()
             p = self.dbg.process
             if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
                 p.Kill()
@@ -1574,6 +1590,7 @@ class Engine:
     def _prepare_target_change(self):
         self._save_session()
         self._stop_interpose_reader()
+        self._flush_network()
         if self.tracer.enabled:
             self.tracer.disable(self.dbg.target)
         self._pending_exec = self._pending_fork = None

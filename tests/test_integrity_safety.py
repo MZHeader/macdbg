@@ -190,7 +190,7 @@ class IntegritySafetyTests(unittest.TestCase):
                 mock.patch.object(tracer_module, "REGEX_SIGS", [("regex", "PROC", None)]), \
                 mock.patch.object(hardware, "create_hardware_breakpoint", side_effect=[bp1, bp2]) as create:
             self.assertEqual(tracer.enable(target, ci=object()), (2, 2))
-            self.assertIn("-r regex", create.call_args.args)
+            self.assertIn("-r regex --skip-prologue false", create.call_args.args)
             copied = tracer.hardware_bp_ids
             copied.clear()
             self.assertEqual(tracer.hardware_bp_ids, {1, 2})

@@ -44,7 +44,11 @@ After that `run.sh` finds it and runs offline. The release notes cover picking t
 
 Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
 
-Filter calls, follow a caller back into code, or export the full trace as JSONL. API entry events include timestamps and process/thread context; the live view shows the latest 2,000 and the saved log keeps the whole session.
+Filter calls, follow a caller back into code, or export the full trace as JSONL. API entry events include timestamps and process/thread context; the live view holds up to 2,000 events within a payload memory budget and the saved log keeps the whole session.
+
+Network rows have a **Details** view for request headers, POST bodies, decoded form fields, JSON, multipart parts, and raw bytes. Enable tracing before the request is created. `NSURLSession` requests are observed before encryption, including upload data supplied separately from `HTTPBody`; supported TLS write hooks retain plaintext buffers too. HTTP/1 headers and bodies are assembled across socket/TLS writes. Search includes captured headers and body text, and JSONL export preserves binary data as base64.
+
+Capture is bounded to 256 KiB per body or write buffer and 64 KiB of request headers, with explicit incomplete/truncated states. These are API-entry observations, not confirmation that a server received the request: failed, partial, and retried writes are not reconciled. Foundation captures application headers before transport changes; file and stream uploads can lack a body at that layer. Custom/stripped TLS stacks, HTTP/2 or HTTP/3 framing, compression, and application-level encryption may require further analysis. Fork-tree interposer events retain their existing summaries; rich capture applies to the process traced by LLDB.
 
 <img src="docs/img/gui-trace.png" alt="Trace tab" width="780">
 

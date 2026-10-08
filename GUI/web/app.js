@@ -45,6 +45,8 @@
   let lastState = null;
   let selDisasm = null;   // address of the single-clicked disassembly line
   let traceRows = [];
+  let traceBytes = 0;
+  const traceByteLimit = 16 * 1024 * 1024, traceRowSizes = new WeakMap();
   let traceEpoch = null, traceTotal = 0, traceRenderPending = false, traceViewEnd = null, traceFilteredCount = 0;
   const traceFilter = { FILE: true, NET: true, PROC: true };
   const cmdHistory = [];
@@ -73,6 +75,8 @@
       case 'trace_snapshot':
         traceEpoch = m.epoch; traceTotal = m.total;
         traceRows = m.hits.map(row => ({ ...row, cat: row.category }));
+        traceBytes = traceRows.reduce((total, row) => total + traceRowSize(row), 0);
+        trimTraceRows();
         scheduleTrace(); break;
       case 'scan': $('#cancel-scan').classList.toggle('hidden', !m.active); break;
       case 'trace_clear': clearTrace(); break;
@@ -319,18 +323,147 @@
     $('#trace-info').textContent = `API entries ${ts.on ? 'ON' : 'off'} · ${ts.scope}`;
   }
   function addTrace(m) {
-    if (traceEpoch !== m.epoch) { traceRows = []; traceEpoch = m.epoch; }
+    if (traceEpoch !== m.epoch) { traceRows = []; traceBytes = 0; traceEpoch = m.epoch; }
     if (traceRows.length && traceRows[traceRows.length - 1].n >= m.n) return;
     traceRows.push(m);
-    if (traceRows.length > 2000) traceRows.splice(0, traceRows.length - 2000);
+    traceBytes += traceRowSize(m);
+    trimTraceRows();
     traceTotal = m.n;
     $('#trace-badge').textContent = String(m.n);
     scheduleTrace();
+  }
+  function traceRowSize(row) {
+    if (!traceRowSizes.has(row)) {
+      // Conservatively count two bytes per serialized character. The live
+      // view is bounded independently of the complete on-disk JSONL trace.
+      traceRowSizes.set(row, JSON.stringify(row).length * 2);
+    }
+    return traceRowSizes.get(row);
+  }
+  function trimTraceRows() {
+    let remove = 0;
+    while (traceRows.length - remove > 1 &&
+      (traceRows.length - remove > 2000 || traceBytes > traceByteLimit)) {
+      traceBytes -= traceRowSize(traceRows[remove++]);
+    }
+    if (remove) traceRows.splice(0, remove);
   }
   function scheduleTrace() {
     if (traceRenderPending) return;
     traceRenderPending = true;
     requestAnimationFrame(() => { traceRenderPending = false; rebuildTrace(); });
+  }
+  function hasNetworkDetails(m) {
+    return !!(m.payload || m.capture_error || (m.http_requests && m.http_requests.length));
+  }
+  const traceSearchCache = new WeakMap();
+  function traceSearchText(m) {
+    if (traceSearchCache.has(m)) return traceSearchCache.get(m);
+    const bodyText = b => b ? [b.text, JSON.stringify(b.fields), JSON.stringify(b.json), JSON.stringify(b.parts)].join(' ') : '';
+    const requests = (m.http_requests || []).map(r => [r.method, r.url,
+      (r.headers || []).map(h => h.name + ': ' + h.value).join(' '), bodyText(r.body)].join(' '));
+    const value = [m.call, m.caller, m.caller_module, m.pid, m.tid,
+      m.capture_source, m.capture_error, bodyText(m.payload), ...requests].join(' ').toLowerCase();
+    traceSearchCache.set(m, value);
+    return value;
+  }
+  function traceText(tag, cls, value) {
+    const node = el(tag, cls);
+    node.textContent = value == null ? '' : String(value);
+    return node;
+  }
+  function traceSection(parent, title, open) {
+    const section = el('details', 'trace-section');
+    section.open = !!open;
+    section.appendChild(traceText('summary', '', title));
+    parent.appendChild(section);
+    return section;
+  }
+  function tracePairs(parent, rows, labels) {
+    const table = el('table', 'grid trace-fields');
+    const head = el('thead'), header = el('tr');
+    labels.forEach(label => header.appendChild(traceText('th', '', label)));
+    head.appendChild(header); table.appendChild(head);
+    const body = el('tbody');
+    rows.forEach(row => {
+      const tr = el('tr');
+      tr.appendChild(traceText('td', '', row.name));
+      tr.appendChild(traceText('td', '', typeof row.value === 'object' ? JSON.stringify(row.value) : row.value));
+      body.appendChild(tr);
+    });
+    table.appendChild(body); parent.appendChild(table);
+  }
+  function traceBody(parent, body, title) {
+    const section = traceSection(parent, title, true);
+    if (!body) { section.appendChild(traceText('p', 'm-hint', 'Body was not captured.')); return; }
+    const size = body.captured_bytes == null ? 'Captured size unknown' : body.captured_bytes + ' bytes captured';
+    const total = body.total_bytes == null ? '' : ' / ' + body.total_bytes + ' bytes total';
+    section.appendChild(traceText('p', body.truncated ? 'trace-capture c-red' : 'trace-capture',
+      size + total + (body.status ? ' · ' + body.status : '')
+      + (body.truncated && body.status !== 'truncated' ? ' · truncated' : '')));
+    if (body.fields && body.fields.length) {
+      const fields = traceSection(section, 'Form fields', true);
+      tracePairs(fields, body.fields, ['Field', 'Value']);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'json')) {
+      const json = traceSection(section, 'JSON', true);
+      json.appendChild(traceText('pre', 'mono trace-content', JSON.stringify(body.json, null, 2)));
+    }
+    if (body.parts && body.parts.length) {
+      const parts = traceSection(section, 'Multipart parts', true);
+      parts.appendChild(traceText('pre', 'mono trace-content', JSON.stringify(body.parts, null, 2)));
+    }
+    if (typeof body.text === 'string') {
+      const text = traceSection(section, 'Raw text', true);
+      text.appendChild(traceText('pre', 'mono trace-content', body.text || '(empty)'));
+      const button = traceText('button', 'mini', 'Copy text');
+      button.onclick = () => copy(body.text); text.appendChild(button);
+    }
+    if (body.data != null) {
+      const raw = traceSection(section, 'Captured bytes (' + (body.encoding || 'encoded') + ')', false);
+      raw.appendChild(traceText('pre', 'mono trace-content', body.data || '(empty)'));
+      const button = traceText('button', 'mini', 'Copy ' + (body.encoding || 'encoded bytes'));
+      button.onclick = () => copy(String(body.data)); raw.appendChild(button);
+    }
+  }
+  function openTraceDetails(m) {
+    // Network contents are untrusted; construct their text with textContent.
+    const modal = el('div', 'modal modal-trace');
+    modal.appendChild(traceText('div', 'm-head', 'Network capture · #' + m.n));
+    const body = el('div', 'm-body');
+    body.appendChild(traceText('p', 'mono trace-content', m.call));
+    body.appendChild(traceText('p', 'm-hint', [m.timestamp, m.capture_source,
+      m.pid == null ? '' : 'PID ' + m.pid, m.tid == null ? '' : 'TID ' + m.tid].filter(Boolean).join(' · ')));
+    body.appendChild(traceText('p', 'm-hint', 'API entry captures record submitted data; delivery is not confirmed.'));
+    if (m.capture_error) body.appendChild(traceText('p', 'm-hint c-red', 'Capture unavailable: ' + m.capture_error));
+    if (m.assembly_skipped) body.appendChild(traceText('p', 'm-hint', 'HTTP assembly: ' + m.assembly_skipped));
+    (m.http_requests || []).forEach((request, i) => {
+      const section = traceSection(body, (m.http_requests.length > 1 ? (i + 1) + '. ' : '')
+        + [request.method, request.url, request.version].filter(Boolean).join(' '), true);
+      section.appendChild(traceText('p', request.complete === false ? 'trace-capture c-red' : 'trace-capture',
+        [request.source, request.stage, request.complete === false ? 'Request capture incomplete'
+          : request.complete === true ? 'Request capture complete' : ''].filter(Boolean).join(' · ')));
+      if (request.body_source) section.appendChild(traceText('p', 'm-hint', 'Body source: ' + request.body_source));
+      (request.warnings || []).forEach(warning => section.appendChild(traceText('p', 'm-hint c-red', warning)));
+      const headers = traceSection(section, 'Headers', true);
+      if (request.headers && request.headers.length) tracePairs(headers, request.headers, ['Header', 'Value']);
+      else headers.appendChild(traceText('p', 'm-hint', 'No headers captured.'));
+      if (request.trailers && request.trailers.length) {
+        tracePairs(traceSection(section, 'Trailers', true), request.trailers, ['Header', 'Value']);
+      }
+      traceBody(section, request.body, 'Request body');
+    });
+    if (m.payload) traceBody(body, m.payload, 'Raw API buffer');
+    const raw = traceSection(body, 'Complete event JSON', false);
+    raw.appendChild(traceText('pre', 'mono trace-content', JSON.stringify(m, null, 2)));
+    modal.appendChild(body);
+    const foot = el('div', 'm-foot');
+    const copyButton = traceText('button', 'btn', 'Copy complete event JSON');
+    copyButton.onclick = () => copy(JSON.stringify(m, null, 2));
+    const close = traceText('button', 'btn primary', 'Close'); close.onclick = closeModal;
+    foot.append(copyButton, close); modal.appendChild(foot);
+    openModal(modal, e => { if (e.key === 'Escape') closeModal(); });
+    close.focus();
   }
   function appendTraceRow(m, stick) {
     const tb = $('#trace-table');
@@ -339,6 +472,14 @@
     const tr = document.createElement('tr');
     tr.innerHTML = `<td class="c-dim">${m.n}</td><td class="c-dim">${esc((m.timestamp || '').slice(11, 23))}</td><td class="c-dim">${esc(m.pid || '')} / ${esc(m.tid || '')}</td><td class="tcat-${esc(m.cat)}">${esc(m.cat)}</td><td>${esc(m.call)}</td>`;
     tr.dataset.call = m.call;
+    tr.dataset.traceN = m.n;
+    if (hasNetworkDetails(m)) {
+      const button = traceText('button', 'mini trace-inspect', 'Details');
+      button.setAttribute('aria-label', 'Inspect network capture #' + m.n);
+      button.onclick = () => openTraceDetails(m);
+      tr.lastElementChild.appendChild(button);
+      tr.ondblclick = () => openTraceDetails(m);
+    }
     if (m.caller) { tr.dataset.caller = m.caller; tr.title = (m.caller_module || '') + ' · caller ' + m.caller; }
     body.appendChild(tr);
     if (stick) $('#trace-scroll').scrollTop = $('#trace-scroll').scrollHeight;
@@ -346,7 +487,7 @@
   function rebuildTrace() {
     const query = ($('#trace-search').value || '').toLowerCase();
     const filtered = traceRows.filter(m => traceFilter[m.cat] !== false &&
-      [m.call, m.caller, m.caller_module, m.pid, m.tid].join(' ').toLowerCase().includes(query));
+      (!query || traceSearchText(m).includes(query)));
     traceFilteredCount = filtered.length;
     const end = Math.min(traceViewEnd || filtered.length, filtered.length);
     const visible = filtered.slice(Math.max(0, end - 500), end);
@@ -359,7 +500,7 @@
     $('#trace-newer').disabled = traceViewEnd == null || end >= filtered.length;
     if (stick && traceViewEnd == null) $('#trace-scroll').scrollTop = $('#trace-scroll').scrollHeight;
   }
-  function clearTrace() { traceRows = []; traceEpoch = null; traceTotal = 0; traceViewEnd = null; rebuildTrace(); }
+  function clearTrace() { traceRows = []; traceBytes = 0; traceEpoch = null; traceTotal = 0; traceViewEnd = null; rebuildTrace(); }
 
   // ---- console -------------------------------------------------------------
   function appendConsole(text, error) {
@@ -485,6 +626,7 @@
       traceFilter[cb.closest('.tt-filter').dataset.cat] = cb.checked; traceViewEnd = null; rebuildTrace();
     });
     $$('.trace-toolbar .mini[data-act]').forEach(b => b.onclick = () => cmd(b.dataset.act));
+    $('#trace-search').placeholder = 'Filter calls / headers / bodies / PID';
     $('#trace-search').oninput = () => { traceViewEnd = null; scheduleTrace(); };
     $('#trace-older').onclick = () => { traceViewEnd = Math.max(500, (traceViewEnd || traceFilteredCount) - 500); rebuildTrace(); };
     $('#trace-newer').onclick = () => { traceViewEnd = traceViewEnd + 500 >= traceFilteredCount ? null : traceViewEnd + 500; rebuildTrace(); };
@@ -765,8 +907,11 @@
     });
     on('#trace-table', e => {
       const tr = e.target.closest('tr');
+      const row = tr && traceRows.find(m => String(m.n) === tr.dataset.traceN);
       return [
+        row && hasNetworkDetails(row) ? { label: 'Inspect network capture', fn: () => openTraceDetails(row) } : null,
         tr && tr.dataset.call ? { label: 'Copy this call', fn: () => copy(tr.dataset.call) } : null,
+        row ? { label: 'Copy complete event JSON', fn: () => copy(JSON.stringify(row, null, 2)) } : null,
         tr && tr.dataset.caller ? { label: 'Follow caller in Disassembly', fn: () => cmd('follow_disasm', { addr: tr.dataset.caller }) } : null,
         { label: 'Copy all trace rows', fn: () => copy(traceRows.map(r => `${r.n}\t${r.cat}\t${r.call}`).join('\n')) },
         { label: 'Clear trace', fn: () => cmd('trace_clear') }

@@ -283,7 +283,7 @@ class AgentStopDeliveryTests(unittest.TestCase):
         debugger.in_user_step.return_value = False
         session = AgentSession.__new__(AgentSession)
         session.dbg = debugger
-        session.tracer = types.SimpleNamespace(hardware_bp_ids=set())
+        session.tracer = types.SimpleNamespace(hardware_bp_ids=set(), flush_network=lambda _process: [])
         session._drain_lldb_pipe = mock.Mock()
         session._drain_console = lambda: ''
         session._describe_exit = lambda: {'code': 0}

@@ -12,6 +12,11 @@ FRAMEWORKS := -framework CoreFoundation -framework IOKit
 .PHONY: all clean
 all: $(BUILD)/workflow_fixture
 
+all: $(BUILD)/http_fixture
+
+$(BUILD)/http_fixture: http_fixture.m | $(BUILD)
+	clang $(CFLAGS) -fobjc-arc -framework Foundation $< -o $@
+
 $(BUILD)/workflow_fixture: workflow_fixture.c | $(BUILD)
 	clang $(CFLAGS) -Wno-deprecated-declarations $< -o $@
 

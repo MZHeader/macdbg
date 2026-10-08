@@ -336,6 +336,7 @@ td.tcat-FILE { color: var(--cat-file); } td.tcat-NET { color: var(--cat-net); } 
   border: 1px solid var(--border); border-radius: 5px; color: var(--text); cursor: pointer;
 }
 .mini:hover { background: #303338; border-color: var(--accent); }
+.trace-inspect { margin-left: 10px; padding: 0 7px; }
 
 /* ---- console ---- */
 .console-log {
@@ -440,6 +441,20 @@ td.tcat-FILE { color: var(--cat-file); } td.tcat-NET { color: var(--cat-net); } 
 .modal.modal-script { width: 960px; max-width: 94vw; }
 .modal-script .script-content { font-size: 12px; line-height: 1.5; tab-size: 4; }
 .modal-script .m-hint { white-space: pre-wrap; overflow-wrap: anywhere; }
+.modal.modal-trace { width: 1000px; min-width: 0; max-width: 94vw; max-height: 90vh; }
+.modal-trace .m-body { min-height: 0; }
+.modal-trace .m-hint, .trace-content, .trace-section summary { overflow-wrap: anywhere; white-space: pre-wrap; }
+.trace-section { margin: 12px 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 5px; }
+.trace-section summary { cursor: pointer; color: var(--text); font-weight: 600; }
+.trace-section .trace-section { margin-bottom: 0; }
+.trace-content { font-size: 12px; line-height: 1.5; tab-size: 4; margin: 8px 0; }
+.trace-section pre.trace-content { max-height: 340px; overflow: auto; }
+.trace-capture { font-size: 11.5px; margin: 8px 0; }
+table.trace-fields { table-layout: fixed; margin-top: 8px; }
+table.trace-fields th { position: static; }
+table.trace-fields th:first-child { width: 30%; }
+table.trace-fields td { white-space: pre-wrap; overflow-wrap: anywhere; vertical-align: top; }
+.modal-trace .m-foot { flex-wrap: wrap; }
 .modal .m-foot { padding: 11px 15px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; background: var(--bg-elev); }
 .modal input.m-input, .modal textarea.m-input, .modal select.m-input {
   width: 100%; background: #16171a; border: 1px solid var(--border); border-radius: 6px;

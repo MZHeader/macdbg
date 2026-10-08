@@ -6,6 +6,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import lldb
 
+from .network_capture import NetworkCapture, FOUNDATION_PATTERN, RESUME_PATTERN, TLS_CLOSES, TLS_WRITES
+
 
 FILE = "FILE"
 NET = "NET"
@@ -14,7 +16,7 @@ PROC = "PROC"
 # Calls whose first arg is a file descriptor, used to skip hits on the interpose
 # trace fd so its writes aren't double-traced.
 _FD_CALLS = {"read", "write", "pread", "pwrite", "close",
-             "send", "recv", "sendto", "recvfrom"}
+             "send", "recv", "sendto", "recvfrom", "sendmsg", "writev"}
 
 
 @dataclass
@@ -345,6 +347,11 @@ def _f_sendmsg(frame, p):
     return "sendmsg(fd={}, msg={:#x})".format(_reg(frame, "x0"), _reg(frame, "x1"))
 
 
+def _f_writev(frame, p):
+    return "writev(fd={}, iov={:#x}, count={})".format(
+        _reg(frame, "x0"), _reg(frame, "x1"), _reg(frame, "x2"))
+
+
 def _looks_like_port(s: str) -> bool:
     return bool(s) and len(s) <= 5 and s.isdigit()
 
@@ -369,30 +376,9 @@ def _f_nw_connection_receive(frame, p):
     return "nw_connection_receive()"
 
 
-def _eval_str(frame, expr: str) -> Optional[str]:
-    try:
-        v = frame.EvaluateExpression(expr)
-    except Exception:
-        return None
-    if not v or not v.IsValid() or not v.GetError().Success():
-        return None
-    s = v.GetObjectDescription()
-    if not s or s in ("<nil>", "nil", "<null>", "(null)"):
-        return None
-    return s
-
-
 def _f_task_resume(frame, p):
-    # resume fires once per request, so it catches the default GET too. Read the
-    # method and URL off the request via the runtime; None on eval failure.
-    task = _reg(frame, "x0")
-    if not task:
-        return None
-    method = _eval_str(frame, "(id)[(id)[(id)%d currentRequest] HTTPMethod]" % task)
-    if not method:
-        return None
-    url = _eval_str(frame, "(id)[[(id)[(id)%d currentRequest] URL] absoluteString]" % task)
-    return "{} {}".format(method, url[:200]) if url else 'HTTP method "{}"'.format(method)
+    # Structured inspection happens once in NetworkCapture.observe.
+    return frame.GetFunctionName() or "NSURLSession request"
 
 
 def _f_cfurl_bytes(frame, p):
@@ -415,6 +401,10 @@ def _f_tls_write(frame, p):
     n = _reg(frame, "x2")
     data = _read_mem(p, buf, n, 1024)
     return "{}({} B) {}".format(name, n, _fmt_text(data))
+
+
+def _f_tls_close(frame, p):
+    return "{}({:#x})".format(frame.GetFunctionName(), _reg(frame, "x0"))
 
 
 def _f_aead_seal(frame, p):
@@ -441,10 +431,13 @@ def _f_rustls_write(frame, p):
 # collides; "::write::h" matches write, not flush/write_all/write_vectored.
 REGEX_SIGS: List[Tuple[str, str, Callable]] = [
     (r"rustls..conn.*Writer.*::write::h", NET, _f_rustls_write),
+    (FOUNDATION_PATTERN, NET, _f_task_resume),
+    (RESUME_PATTERN, NET, _f_task_resume),
 ]
 
 
 SIGS: Dict[str, Tuple[str, Callable]] = {
+    **{name: (NET, _f_tls_close) for name in TLS_CLOSES},
     "open":               (FILE, _f_open),
     "open$NOCANCEL":      (FILE, _f_open),
     "openat":             (FILE, _f_openat),
@@ -454,6 +447,8 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "read$NOCANCEL":      (FILE, _f_read),
     "write":              (FILE, _f_write),
     "write$NOCANCEL":     (FILE, _f_write),
+    "writev":             (FILE, _f_writev),
+    "writev$NOCANCEL":    (FILE, _f_writev),
     "pread":              (FILE, _f_pread),
     "pwrite":             (FILE, _f_pwrite),
     "fopen":              (FILE, _f_fopen),
@@ -512,7 +507,6 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
     "nw_connection_send":      (NET, _f_nw_connection_send),
     "nw_connection_receive":   (NET, _f_nw_connection_receive),
     "CFURLCreateWithBytes":    (NET, _f_cfurl_bytes),
-    "-[NSURLSessionTask resume]": (NET, _f_task_resume),
     "SSL_write":          (NET,  _f_tls_write),
     "SSL_write_ex":       (NET,  _f_tls_write),
     "SSLWrite":           (NET,  _f_tls_write),
@@ -542,20 +536,41 @@ class Tracer:
         self.caller_depth: int = 5
         self.hardware: bool = False
         self.skip_fd: int = -1
+        self.network = NetworkCapture()
 
     @property
     def hardware_bp_ids(self) -> set[int]:
         return set(self._hardware_bp_ids)
 
     def _create_breakpoint(self, target, ci, name, regex=False):
+        # Reading argument registers after a prologue is not reliable. Use the
+        # command API for payload hooks because the SB name/regex overloads do
+        # not expose skip-prologue on the supported LLDB Python bindings.
+        entry = regex or name in TLS_WRITES or name in TLS_CLOSES or name.split("$", 1)[0] in {
+            "send", "sendto", "sendmsg", "write", "writev", "connect", "connectx",
+            "close", "shutdown", "EVP_AEAD_CTX_seal"}
         if not self.hardware:
+            if ci is not None and entry:
+                import shlex
+                before = {bp.GetID() for bp in target.breakpoint_iter()}
+                result = lldb.SBCommandReturnObject()
+                ci.HandleCommand("breakpoint set --skip-prologue false {} {}".format(
+                    "-r" if regex else "-n", shlex.quote(name)), result, False)
+                created = [bp for bp in target.breakpoint_iter() if bp.GetID() not in before]
+                if not result.Succeeded() or len(created) != 1:
+                    for bp in created:
+                        target.BreakpointDelete(bp.GetID())
+                    self.disable(target)
+                    raise RuntimeError("cannot arm network trace hook " + name)
+                return created[0]
             return (target.BreakpointCreateByRegex(name) if regex
                     else target.BreakpointCreateByName(name))
         from .breakpoints import create_hardware_breakpoint
         import shlex
         try:
             bp = create_hardware_breakpoint(
-                target, ci, ("-r " if regex else "-n ") + shlex.quote(name),
+                target, ci, ("-r " if regex else "-n ") + shlex.quote(name)
+                + (" --skip-prologue false" if entry else ""),
                 require_location=False)
         except RuntimeError:
             self.disable(target)
@@ -589,6 +604,7 @@ class Tracer:
         return (len(self._bp_ids), resolved_now)
 
     def disable(self, target: lldb.SBTarget) -> None:
+        self.network.reset()
         self._hardware_bp_ids.clear()
         if not target or not target.IsValid():
             self._bp_ids.clear()
@@ -606,6 +622,15 @@ class Tracer:
     def is_trace_bp(self, bp_id: int) -> bool:
         return bp_id in self._bp_to_name
 
+    def flush_network(self, process=None):
+        requests = self.network.http.flush()
+        if not requests:
+            return []
+        details = {"phase": "capture-end", "http_requests": requests}
+        if process and process.IsValid():
+            details["pid"] = process.GetProcessID()
+        return [TraceHit(NET, "Incomplete HTTP requests at end of capture", details)]
+
     def hit_from(
         self,
         frame: lldb.SBFrame,
@@ -621,27 +646,39 @@ class Tracer:
                 return None
         if bp_id is not None and bp_id in self._regex_bps:
             cat, fmt = self._regex_bps[bp_id]
-            if user_only and cat != NET and self._caller_is_noise(frame):
-                return None
-            try:
-                call = fmt(frame, process)
-            except Exception as e:
-                call = "regex hook [formatter error: {}]".format(e)
-            return _hit(cat, call, frame, process) if call is not None else None
+            return self._format_hit(cat, fmt, frame, process, user_only)
         name = frame.GetFunctionName() or ""
         for candidate in (name, name.lstrip("_")):
             if candidate in SIGS:
                 cat, fmt = SIGS[candidate]
-                if user_only and cat != NET and self._caller_is_noise(frame):
-                    return None
-                try:
-                    call = fmt(frame, process)
-                except Exception as e:
-                    call = "{}(...) [formatter error: {}]".format(candidate, e)
-                if call is None:
-                    return None
-                return _hit(cat, call, frame, process)
+                return self._format_hit(cat, fmt, frame, process, user_only)
         return None
+
+    def _format_hit(self, category, formatter, frame, process, user_only):
+        name = frame.GetFunctionName() or ""
+        try:
+            details = self.network.observe(frame, process, name)
+        except Exception as error:
+            details = {"capture_source": name, "capture_error": str(error)}
+        if details.get("payload") or details.get("http_requests"):
+            category = NET
+        if user_only and category != NET and self._caller_is_noise(frame):
+            return None
+        try:
+            call = formatter(frame, process)
+        except Exception as error:
+            call = "{}(...) [formatter error: {}]".format(name, error)
+        if call is None:
+            return None
+        requests = details.get("http_requests", [])
+        if requests:
+            request = requests[-1]
+            call = "{} {} [{}; body {} B, {}]".format(
+                request.get("method", "HTTP"), request.get("url", "")[:200],
+                name, request["body"]["captured_bytes"], request["body"]["status"])
+        hit = _hit(category, call, frame, process)
+        hit.details.update(details)
+        return hit
 
     def _caller_is_noise(self, frame: lldb.SBFrame) -> bool:
         if not self._exec_name or self.caller_depth <= 0:
