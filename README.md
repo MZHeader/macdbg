@@ -42,13 +42,9 @@ After that `run.sh` finds it and runs offline. The release notes cover picking t
 
 ## Syscall and Network Tracer
 
-Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process keeps running.
+Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process keeps running. Filter calls, follow a caller back into code, or export the trace as JSONL.
 
-Filter calls, follow a caller back into code, or export the trace as JSONL. The live view shows up to the last 2,000 events and the saved log keeps the whole session.
-
-Network rows have a **Details** view with request headers and bodies, including decoded form fields, JSON, and multipart. Requests are read from `NSURLSession`, plain sockets, and supported TLS libraries before encryption, so HTTPS shows up in plaintext. Turn tracing on before the request is made.
-
-Bodies are capped at 256 KiB and headers at 64 KiB, and anything cut short is marked. A captured request means the app tried to send it, not that it arrived. File and stream uploads through `NSURLSession` can show up without a body. Raw HTTP/2 and HTTP/3, compressed bodies, custom TLS stacks, and app-level encryption still need manual work. Children traced with **Trace the whole fork tree** only get the basic summary.
+Network rows have a **Details** view with request headers and bodies, read from `NSURLSession`, sockets, and supported TLS libraries before encryption. Turn tracing on before the request is made. Bodies are capped at 256 KiB, and HTTP/2, custom TLS stacks, and app-level encryption aren't decoded.
 
 <img src="docs/img/gui-trace.png" alt="Trace tab" width="780">
 
