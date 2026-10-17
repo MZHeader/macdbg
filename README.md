@@ -42,13 +42,13 @@ After that `run.sh` finds it and runs offline. The release notes cover picking t
 
 ## Syscall and Network Tracer
 
-Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process auto-continues, so tracing does not stop execution.
+Feeling lazy? `⌘T` arms breakpoints on common file, process, and network entry points in libSystem. Each hit logs the call with parsed arguments and the process keeps running.
 
-Filter calls, follow a caller back into code, or export the full trace as JSONL. API entry events include timestamps and process/thread context; the live view holds up to 2,000 events within a payload memory budget and the saved log keeps the whole session.
+Filter calls, follow a caller back into code, or export the trace as JSONL. The live view shows up to the last 2,000 events and the saved log keeps the whole session.
 
-Network rows have a **Details** view for request headers, POST bodies, decoded form fields, JSON, multipart parts, and raw bytes. Enable tracing before the request is created. `NSURLSession` requests are observed before encryption, including upload data supplied separately from `HTTPBody`; supported TLS write hooks retain plaintext buffers too. HTTP/1 headers and bodies are assembled across socket/TLS writes. Search includes captured headers and body text, and JSONL export preserves binary data as base64.
+Network rows have a **Details** view with request headers and bodies, including decoded form fields, JSON, and multipart. Requests are read from `NSURLSession`, plain sockets, and supported TLS libraries before encryption, so HTTPS shows up in plaintext. Turn tracing on before the request is made.
 
-Capture is bounded to 256 KiB per body or write buffer and 64 KiB of request headers, with explicit incomplete/truncated states. These are API-entry observations, not confirmation that a server received the request: failed, partial, and retried writes are not reconciled. Foundation captures application headers before transport changes; file and stream uploads can lack a body at that layer. Custom/stripped TLS stacks, HTTP/2 or HTTP/3 framing, compression, and application-level encryption may require further analysis. Fork-tree interposer events retain their existing summaries; rich capture applies to the process traced by LLDB.
+Bodies are capped at 256 KiB and headers at 64 KiB, and anything cut short is marked. A captured request means the app tried to send it, not that it arrived. File and stream uploads through `NSURLSession` can show up without a body. Raw HTTP/2 and HTTP/3, compressed bodies, custom TLS stacks, and app-level encryption still need manual work. Children traced with **Trace the whole fork tree** only get the basic summary.
 
 <img src="docs/img/gui-trace.png" alt="Trace tab" width="780">
 
