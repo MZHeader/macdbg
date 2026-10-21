@@ -58,7 +58,8 @@ class Engine:
 
         self.dbg = Debugger()
         self.tracer = Tracer()
-        self.dbg.extra_hardware_bp_ids = lambda: self.tracer.hardware_bp_ids
+        self.tracer.debugger = self.dbg
+        self.dbg.extra_hardware_bp_ids = lambda: self.tracer.hardware_bp_ids | self.dbg.memory_analysis.returns.ids()
         self.pump: Optional[EventPump] = None
 
         self._prev_regs: Dict[str, str] = {}
@@ -92,6 +93,11 @@ class Engine:
         self._console_history = deque(maxlen=1000)
         self._console_lock = threading.Lock()
         self._console_sequence = 0
+        self._memory_width = 16
+        self._nav_history = []
+        self._nav_index = -1
+        self._defense_failures = {}
+        self._active_defense_key = None
 
         self._output_stop = threading.Event()
         self._interpose_stop = threading.Event()
@@ -330,7 +336,15 @@ class Engine:
                  "has_process": bool(dbg.process and dbg.process.IsValid())}
         state["process_state"] = (lldb.SBDebugger.StateAsCString(dbg.process.GetState())
                                   if state["has_process"] else "none")
+        from macdbg.core.session_controller import describe_stop
+        dbg.record_visible_stop()
+        state['stop'] = describe_stop(dbg) if state['process_state'] == 'stopped' else None
+        state['analysis_events'] = dbg.analysis_events.snapshot()
+        state['queued_defenses'] = sorted(dbg.entry_plan.queued)
+        state['memory_analysis'] = dbg.memory_analysis.status()
+        state['identity_profile'] = dict(dbg.analysis_cloak.identity_profile)
         state["before_initializers"] = dbg.is_stopped_before_initializers()
+        state['at_entry'] = dbg.is_stopped_at_entry_point()
         state["can_restart"] = bool(self.program and not self.attach_pid)
         state["pending_decision"] = ("exec" if self._pending_exec else
                                       "fork" if self._pending_fork else None)
@@ -364,7 +378,7 @@ class Engine:
 
         if sp:
             base, data = self._centered_read(sp, 8)
-            state["stack"] = snapshot.hex_json(base, data, width=10, focus_addr=sp)
+            state["stack"] = snapshot.hex_json(base, data, width=self._memory_width, focus_addr=sp)
         else:
             state["stack"] = None
 
@@ -372,7 +386,7 @@ class Engine:
         if follow:
             base, data = self._centered_read(follow, 32)
             flen = self._mem_follow_len if self._mem_follow is not None else 1
-            mem = snapshot.hex_json(base, data, width=10, focus_addr=follow, focus_len=flen)
+            mem = snapshot.hex_json(base, data, width=self._memory_width, focus_addr=follow, focus_len=flen)
             mem["follow"] = follow
             if self._search_hits and follow in self._search_hits:
                 mem["search"] = "hit {}/{}".format(
@@ -404,6 +418,8 @@ class Engine:
                              for a, s in self._strings_bin[:4000]]
                             + [["live", "{:#x}".format(a), len(s), s]
                                for a, s in self._strings_live[:4000]])
+        state['memory_width'] = self._memory_width
+        state['navigation'] = {'back':self._nav_index > 0, 'forward':self._nav_index < len(self._nav_history)-1}
         state["trace_status"] = self._trace_status()
         return state
 
@@ -417,7 +433,7 @@ class Engine:
             addr, length, label = b
             data = self.dbg.read_memory(addr, length)
             out.append({"slot": slot, "addr": addr, "len": length, "label": label,
-                        **snapshot.hex_json(addr, data or b"", width=10)})
+                        **snapshot.hex_json(addr, data or b"", width=self._memory_width)})
         return out
 
     def _watch(self, slot: int):
@@ -459,18 +475,16 @@ class Engine:
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
             try:
-                self.dbg.auto_clock.observe_stop(e.observed_ns or None)
-                from macdbg.core.breakpoints import consume_hardware_debugger_duplicate
-                if consume_hardware_debugger_duplicate(self.dbg):
-                    self._console('[debugger] retried duplicate hardware debugger stop')
+                from macdbg.core.session_controller import prepare_stop
+                preparation = prepare_stop(self.dbg, e.observed_ns or None, self._console)
+                if preparation == 'retry':
                     self.dbg.cont()
                     self._resuming = True
                     return
-                payload_only = self.dbg.script_exec.payloads.apply_stop()
-                clock_only = self.dbg.auto_clock.apply_stop()
-                messages, timing_only = self.dbg.timing.apply_stop()
-                for message in messages:
-                    self._console(message)
+                if preparation == 'visible':
+                    self._console(self._describe_stop())
+                    self._emit_state()
+                    return
             except RuntimeError as error:
                 self._resume_failed(error)
                 return
@@ -505,7 +519,7 @@ class Engine:
                 self._console(self._describe_stop())
                 self._emit_state()
                 return
-            if timing_only or clock_only or payload_only:
+            if preparation == 'internal':
                 try:
                     self.dbg.cont()
                     self._resuming = True
@@ -516,9 +530,13 @@ class Engine:
                 self.dbg.finish_fork_shield()
                 self.dbg.cont()
                 return
-            if self._handle_anti_debug_hit():
-                return
-            if self.tracer.enabled and self._handle_possible_trace_hit():
+            try:
+                if self._handle_anti_debug_hit():
+                    return
+                if self.tracer.enabled and self._handle_possible_trace_hit():
+                    return
+            except RuntimeError as error:
+                self._resume_failed(error)
                 return
             self._console(self._describe_stop())
             self._emit_state()
@@ -547,32 +565,8 @@ class Engine:
             p.GetExitStatus(), " ({})".format(desc) if desc else "")
 
     def _describe_stop(self) -> str:
-        p = self.dbg.process
-        if not p or not p.IsValid():
-            return "[stopped]"
-        thread = p.GetSelectedThread()
-        if not thread or not thread.IsValid():
-            return "[stopped]"
-        reason = thread.GetStopReason()
-        pc = self.dbg.pc() or 0
-        frame = thread.GetFrameAtIndex(0)
-        sym = ""
-        if frame and frame.IsValid():
-            sym = frame.GetFunctionName() or (
-                frame.GetSymbol().GetName() if frame.GetSymbol().IsValid() else "") or ""
-        where = " in {}".format(sym) if sym else ""
-        if reason == lldb.eStopReasonBreakpoint and thread.GetStopReasonDataCount() >= 1:
-            bp_id = thread.GetStopReasonDataAtIndex(0)
-            return "[stop] breakpoint #{} at {:#x}{}".format(bp_id, pc, where)
-        if reason == lldb.eStopReasonPlanComplete:
-            return "[stop] step complete at {:#x}{}".format(pc, where)
-        if reason == lldb.eStopReasonException:
-            return "[stop] exception at {:#x}{}: {}".format(
-                pc, where, thread.GetStopDescription(256))
-        if reason == lldb.eStopReasonSignal and thread.GetStopReasonDataCount() >= 1:
-            return "[stop] signal {} at {:#x}{}".format(
-                thread.GetStopReasonDataAtIndex(0), pc, where)
-        return "[stop] at {:#x}{}".format(pc, where)
+        from macdbg.core.session_controller import describe_stop
+        return describe_stop(self.dbg)['text']
 
     @staticmethod
     def _stop_bp_ids(thread) -> List[int]:
@@ -647,29 +641,11 @@ class Engine:
                     self._emit({"t": "prompt", "kind": "fork", "name": name,
                                 "caller": caller})
                     return True
-        for bp_id in bp_ids:
-            msg = self.dbg.handle_analysis_cloak_hit(bp_id)
-            if msg is not None:
-                cloak_ok, _cloak_error = (
-                    self.dbg.analysis_cloak.validate_resume())
-                if msg:
-                    self._console("[anti-analysis] " + msg,
-                                  error=not cloak_ok)
-                if not cloak_ok:
-                    self._emit_state()
-                return True
-        for handler in (self.dbg.handle_anti_ptrace_hit, self.dbg.handle_flag_scrub_hit,
-                        self.dbg.handle_syscall_hit,
-                        self.dbg.handle_anti_mach_hit, self.dbg.handle_direct_syscall_hit,
-                        self.dbg.handle_fork_hit, self.dbg.handle_setsid_hit,
-                        self.dbg.handle_exec_hit):
-            for bp_id in bp_ids:
-                msg = handler(bp_id)
-                if msg is not None:
-                    if msg:
-                        self._console("[anti-debug] " + msg)
-                    return True
-        return False
+        from macdbg.core.session_controller import handle_defenses
+        outcome = handle_defenses(self.dbg, self._console)
+        if outcome == 'blocked':
+            self._emit_state()
+        return outcome is not None
 
     def _log_exec_trace(self, thread) -> None:
         if not self.tracer.enabled:
@@ -679,22 +655,8 @@ class Engine:
             self._add_trace(hit.category, hit.call, hit.details)
 
     def _log_trace_hit(self) -> bool:
-        p = self.dbg.process
-        if not p or not p.IsValid():
-            return False
-        thread = p.GetSelectedThread()
-        if not thread or not thread.IsValid():
-            return False
-        if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
-            return False
-        bp_id = next((b for b in self._stop_bp_ids(thread)
-                      if self.tracer.is_trace_bp(b)), None)
-        if bp_id is None:
-            return False
-        hit = self.tracer.hit_from(thread.GetFrameAtIndex(0), p, bp_id=bp_id)
-        if hit is not None:
-            self._add_trace(hit.category, hit.call, hit.details)
-        return True
+        from macdbg.core.session_controller import log_trace_stop
+        return log_trace_stop(self.dbg, self.tracer, self._add_trace)
 
     def _handle_possible_trace_hit(self) -> bool:
         if not self._log_trace_hit():
@@ -727,8 +689,12 @@ class Engine:
         return out
 
     def _hidden_bp_ids(self) -> set:
-        ids = set(self.tracer._bp_to_name)
+        ids = self.tracer.hidden_ids()
+        ids.update(self.dbg.memory_analysis.hidden_ids())
+        if getattr(self.dbg, 'entry_plan', None) and self.dbg.entry_plan.bp:
+            ids.add(self.dbg.entry_plan.bp)
         d = self.dbg
+        ids.update(d.self_trap.hidden_ids())
         ids.update(d.auto_clock.hidden_bp_ids())
         ids.update(d.timing.hidden_bp_ids())
         ids.update(d.analysis_cloak.hidden_bp_ids())
@@ -879,6 +845,8 @@ class Engine:
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
         self._stop_interpose_reader()
+        if self.tracer.returns:
+            self.tracer.returns.clear()
         hidden = self._hidden_bp_ids() - self.dbg.script_exec.breakpoint_ids()
         for bid in hidden:
             self.dbg.set_bp_enabled(bid, False)
@@ -958,12 +926,45 @@ class Engine:
         addr = self._addr(a)
         if addr is None:
             return
+        if self._nav_index < 0:
+            self._nav_history = [self._disasm_follow or self.dbg.pc()]
+            self._nav_index = 0
+        if self._nav_history[self._nav_index] != addr:
+            self._nav_history = self._nav_history[:self._nav_index+1] + [addr]
+            self._nav_history = self._nav_history[-100:]
+            self._nav_index = len(self._nav_history)-1
         self._disasm_follow = addr
         self._console("[disasm] browsing {:#x} (Snap to return to pc)".format(addr))
         self._emit_state()
 
     def _c_snap_pc(self, a):
+        if self.dbg.pc():
+            self._c_follow_disasm({'addr':self.dbg.pc()})
         self._disasm_follow = None
+        self._emit_state()
+
+    def _c_navigate_history(self, a):
+        position = self._nav_index + (-1 if a.get('direction') == 'back' else 1)
+        if 0 <= position < len(self._nav_history):
+            self._nav_index = position
+            self._disasm_follow = self._nav_history[position]
+            self._emit_state()
+
+    def _c_analysis(self, a):
+        from macdbg.core.session_controller import analysis_command
+        action = a.get('action')
+        result = analysis_command(self.dbg,self.tracer,action,{k:v for k,v in a.items() if k != 'action'})
+        self._emit_state()
+        return result
+
+    def _c_continue_entry(self, a):
+        self._resume_action(self.dbg.continue_to_entry)
+
+    def _c_view_options(self, a):
+        width = int(a.get('memory_width',16))
+        if width not in (8,16):
+            raise ValueError('memory width must be 8 or 16')
+        self._memory_width = width
         self._emit_state()
 
     # -- edits
@@ -1182,6 +1183,14 @@ class Engine:
     # -- defenses
     def _c_defense(self, a):
         key = a.get("key", "")
+        self._active_defense_key = key
+        if not hasattr(self, '_defense_failures'):
+            self._defense_failures = {}
+        self._defense_failures.pop(key,None)
+        if key in ('analysis_cloak','auto_clock') and self.dbg.is_stopped_before_initializers():
+            self.dbg.entry_plan.queue(key,key not in self.dbg.entry_plan.queued)
+            self._emit_state()
+            return
         fn = self._DEFENSE_TOGGLES.get(key)
         if fn is None:
             self._console("[anti-debug] unknown toggle {!r}".format(key), error=True)
@@ -1191,7 +1200,10 @@ class Engine:
 
     def _refresh_after_defense(self, msgs):
         for m in msgs:
-            self._console("[anti-debug] " + m)
+            if isinstance(m,tuple):
+                self._refresh_after_single_defense(m)
+            else:
+                self._console("[anti-debug] " + m)
 
     def _t_anti_timing(self):
         timing = self.dbg.timing
@@ -1222,11 +1234,15 @@ class Engine:
 
     def _refresh_after_single_defense(self, result):
         ok, message = result
+        if not ok and getattr(self,'_active_defense_key',None):
+            self._defense_failures[self._active_defense_key] = message
         self._console("[anti-debug] " + message, error=not ok)
         return ok
 
     def _refresh_after_analysis_cloak(self, result):
         ok, message = result
+        if not ok and getattr(self,'_active_defense_key',None):
+            self._defense_failures[self._active_defense_key] = message
         self._console(
             "[anti-analysis] " + message if ok else message,
             error=not ok,
@@ -1235,11 +1251,12 @@ class Engine:
 
     def _t_all_anti(self):
         d = self.dbg
-        on = bool(d.analysis_cloak.enabled
-                  and d.anti_ptrace_bp_id and d.direct_syscall_bp_ids and d.anti_mach_bp_id
+        on = getattr(self,'_all_anti_requested',False) or bool(d.analysis_cloak.enabled
+                  and d.anti_ptrace_bp_id and (getattr(d, "direct_syscall_requested", False) or d.direct_syscall_bp_ids) and d.anti_mach_bp_id
                   and d.anti_sysctl_bp_id and d.anti_csops_bp_id
                   and d._scrub_parent and d.anti_sigtrap_on)
         if on:
+            self._all_anti_requested = False
             # Reverse the enable order: remove target-text hardware sites while
             # integrity mode is still active, then release the cloak, followed
             # by its independently owned constituent defenses.
@@ -1250,12 +1267,13 @@ class Engine:
                    d.disable_anti_csops,
                    d.disable_anti_sysctl, d.disable_anti_mach_ports,
                    d.disable_anti_ptrace]
-            self._refresh_after_defense([f()[1] for f in seq])
+            self._refresh_after_defense([f() for f in seq])
             return
 
         # A scan armed before integrity mode uses software breakpoints in the
         # executable's __text. Remove it now and recreate it only after the
         # cloak is active so core selects hardware breakpoints.
+        self._all_anti_requested = True
         had_direct_scan = bool(d.direct_syscall_bp_ids)
         if had_direct_scan and not self._refresh_after_single_defense(
                 d.disable_direct_syscall_scan()):
@@ -1263,7 +1281,7 @@ class Engine:
         seq = [d.enable_anti_ptrace, d.enable_anti_mach_ports, d.enable_anti_sysctl,
                d.enable_anti_csops,
                d.enable_anti_parent, d.enable_anti_sigtrap]
-        self._refresh_after_defense([f()[1] for f in seq])
+        self._refresh_after_defense([f() for f in seq])
         # Arm the composite after its constituents so it observes them as
         # independently owned. Direct-syscall sites are the exception: they
         # must be created after integrity mode is active to become hardware.
@@ -1282,29 +1300,29 @@ class Engine:
 
     def _t_deny_attach(self):
         d = self.dbg
-        if d.anti_ptrace_bp_id or d.direct_syscall_bp_ids:
-            self._refresh_after_defense([d.disable_anti_ptrace()[1], d.disable_direct_syscall_scan()[1]])
+        if d.anti_ptrace_bp_id or getattr(d,'direct_syscall_requested',False) or d.direct_syscall_bp_ids:
+            self._refresh_after_defense([d.disable_anti_ptrace(), d.disable_direct_syscall_scan()])
         else:
-            self._refresh_after_defense([d.enable_anti_ptrace()[1], d.enable_direct_syscall_scan()[1]])
+            self._refresh_after_defense([d.enable_anti_ptrace(), d.enable_direct_syscall_scan()])
 
     def _t_flag_scrubs(self):
         d = self.dbg
         if d.anti_sysctl_bp_id or d.anti_csops_bp_id:
-            self._refresh_after_defense([d.disable_anti_sysctl()[1], d.disable_anti_csops()[1]])
+            self._refresh_after_defense([d.disable_anti_sysctl(), d.disable_anti_csops()])
         else:
-            self._refresh_after_defense([d.enable_anti_sysctl()[1], d.enable_anti_csops()[1]])
+            self._refresh_after_defense([d.enable_anti_sysctl(), d.enable_anti_csops()])
 
     def _t_parent(self):
         d = self.dbg
-        self._refresh_after_defense([(d.disable_anti_parent if d._scrub_parent else d.enable_anti_parent)()[1]])
+        self._refresh_after_defense([(d.disable_anti_parent if d._scrub_parent else d.enable_anti_parent)()])
 
     def _t_sigtrap(self):
         d = self.dbg
-        self._refresh_after_defense([(d.disable_anti_sigtrap if d.anti_sigtrap_on else d.enable_anti_sigtrap)()[1]])
+        self._refresh_after_defense([(d.disable_anti_sigtrap if d.anti_sigtrap_on else d.enable_anti_sigtrap)()])
 
     def _t_mach(self):
         d = self.dbg
-        self._refresh_after_defense([(d.disable_anti_mach_ports if d.anti_mach_bp_id else d.enable_anti_mach_ports)()[1]])
+        self._refresh_after_defense([(d.disable_anti_mach_ports if d.anti_mach_bp_id else d.enable_anti_mach_ports)()])
 
     def _t_hw_bps(self):
         self.dbg.hw_breakpoints = not self.dbg.hw_breakpoints
@@ -1321,19 +1339,19 @@ class Engine:
 
     def _t_fork_identity(self):
         d = self.dbg
-        self._refresh_after_defense([(d.disable_fork_identity if d.fork_mode == "identity" else d.enable_fork_identity)()[1]])
+        self._refresh_after_defense([(d.disable_fork_identity if d.fork_mode == "identity" else d.enable_fork_identity)()])
 
     def _t_fork_interactive(self):
         d = self.dbg
         d.fork_interactive = not d.fork_interactive
         if d.fork_interactive and d.fork_mode != "identity":
-            self._refresh_after_defense([d.enable_fork_identity()[1]])
+            self._refresh_after_defense([d.enable_fork_identity()])
         self._console("[anti-debug] fork intercept prompt: {}".format(
             "ON" if d.fork_interactive else "OFF"))
 
     def _t_exec_sandbox(self):
         d = self.dbg
-        self._refresh_after_defense([(d.disable_exec_sandbox if d.exec_bp_ids else d.enable_exec_sandbox)()[1]])
+        self._refresh_after_defense([(d.disable_exec_sandbox if d.exec_bp_ids else d.enable_exec_sandbox)()])
 
     def _t_exec_interactive(self):
         self.dbg.exec_interactive = not self.dbg.exec_interactive
@@ -1351,6 +1369,10 @@ class Engine:
                 self.tracer.hardware_bp_ids)
         return {
             "auto_clock": automatic["enabled"],
+            'failures':dict(getattr(self,'_defense_failures',{})),
+            'hits':dict(getattr(d,'defense_hits',{})),
+            'coverage':self._defense_coverage(),
+            'all_anti_requested':getattr(self,'_all_anti_requested',False),
             "auto_clock_safe": automatic["safe"],
             "auto_clock_error": automatic["error"],
             "auto_clock_status": automatic,
@@ -1364,7 +1386,7 @@ class Engine:
             ],
             "timing_hits": timing["hits"],
             "all_anti": bool(d.analysis_cloak.enabled
-                             and d.anti_ptrace_bp_id and d.direct_syscall_bp_ids and d.anti_mach_bp_id
+                             and d.anti_ptrace_bp_id and (getattr(d, "direct_syscall_requested", False) or d.direct_syscall_bp_ids) and d.anti_mach_bp_id
                              and d.anti_sysctl_bp_id and d.anti_csops_bp_id
                              and d._scrub_parent and d.anti_sigtrap_on),
             "analysis_cloak": cloak["enabled"],
@@ -1372,7 +1394,7 @@ class Engine:
             "analysis_cloak_resolved": cloak["resolved"],
             "analysis_cloak_deferred": cloak["deferred"],
             "analysis_cloak_error": None if cloak_safe else cloak_error,
-            "deny_attach": bool(d.anti_ptrace_bp_id) or bool(d.direct_syscall_bp_ids),
+            "deny_attach": bool(d.anti_ptrace_bp_id) or bool(getattr(d,'direct_syscall_requested',False)) or bool(d.direct_syscall_bp_ids),
             "mach": bool(d.anti_mach_bp_id),
             "flag_scrubs": bool(d.anti_sysctl_bp_id) or bool(d.anti_csops_bp_id),
             "parent": bool(d._scrub_parent),
@@ -1386,11 +1408,37 @@ class Engine:
             "exec_interactive": bool(d.exec_interactive),
         }
 
+    def _defense_coverage(self):
+        d = self.dbg
+        target = getattr(d,'target',None)
+        if not target or not target.IsValid():
+            return {}
+        groups = {
+            'deny_attach':([d.anti_ptrace_bp_id] + list(d.direct_syscall_bp_ids or [])),
+            'mach':[d.anti_mach_bp_id], 'flag_scrubs':[d.anti_sysctl_bp_id,d.anti_csops_bp_id],
+            'parent':[d.anti_sysctl_bp_id] if d._scrub_parent else [],
+            'exec_sandbox':list(d.exec_bp_ids or {}),
+        }
+        out = {}
+        for name, ids in groups.items():
+            ids = [bid for bid in ids if bid]
+            if not ids:
+                continue
+            resolved = 0
+            failed = False
+            for bid in ids:
+                bp = target.FindBreakpointByID(bid)
+                failed |= not bp.IsValid() or not bp.IsEnabled()
+                resolved += int(bp.IsValid() and bp.GetNumResolvedLocations() > 0)
+            out[name] = {'state':'failed' if failed else 'ready' if resolved==len(ids) else 'partial',
+                         'resolved':resolved,'requested':len(ids)}
+        return out
+
     # -- tracer
     _SCOPE_LABELS = {1: "strict", 5: "balanced", 32: "wide", 0: "off"}
 
     def _trace_status(self) -> dict:
-        return {"on": bool(self.tracer.enabled),
+        return {"config": self.tracer.configuration(), "on": bool(self.tracer.enabled),
                 "scope": self._SCOPE_LABELS.get(self.tracer.caller_depth,
                                                 str(self.tracer.caller_depth)),
                 "defenses": self._defense_states()}
@@ -1601,6 +1649,9 @@ class Engine:
         self._annot_cache = {}
         self._strings_bin = self._strings_live = []
         self._mem_follow = self._disasm_follow = None
+        self._nav_history, self._nav_index = [], -1
+        self._all_anti_requested = False
+        self._defense_failures = {}
         if hasattr(self, "trace_log"):
             self._c_trace_clear({})
 
@@ -1773,6 +1824,8 @@ class Engine:
 
 # ---- command + toggle tables (bound after class body) ------------------------
 Engine._COMMANDS = {
+    'analysis':Engine._c_analysis, 'continue_entry':Engine._c_continue_entry,
+    'navigate_history':Engine._c_navigate_history, 'view_options':Engine._c_view_options,
     "step_in": Engine._c_step_in, "step_over": Engine._c_step_over,
     "step_out": Engine._c_step_out, "cont": Engine._c_cont,
     "interrupt": Engine._c_interrupt, "restart": Engine._c_restart,
@@ -1799,7 +1852,7 @@ Engine._COMMANDS = {
     "trace_export": Engine._c_trace_export,
     "kill": Engine._c_kill,
 }
-Engine._SYNC = {"complete", "list_processes", "resolve_address", "trace_export"}
+Engine._SYNC = {"complete", "list_processes", "resolve_address", "trace_export", 'analysis', 'defense', 'view_options'}
 Engine._DEFENSE_TOGGLES = {
     "auto_clock": Engine._t_auto_clock,
     "anti_timing": Engine._t_anti_timing,

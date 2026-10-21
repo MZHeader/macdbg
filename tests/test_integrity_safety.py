@@ -57,6 +57,9 @@ class Breakpoint:
 
 
 class Target:
+    def IsValid(self):
+        return True
+
     def __init__(self, bps, start=0x1000, size=0x100):
         self.bps = list(bps)
         self.text = mock.Mock()
@@ -176,7 +179,7 @@ class IntegritySafetyTests(unittest.TestCase):
                 hardware.create_hardware_breakpoint(target, ci, "-a 0x1000")
         self.assertEqual(target.bps, [existing])
 
-    def test_tracer_tracks_regex_hardware_and_cleans_up_after_failure(self):
+    def test_selected_tracer_hardware_is_tracked_and_failure_rolls_back(self):
         with mock.patch.dict(sys.modules, {"lldb": types.SimpleNamespace()}):
             from macdbg.core import tracer as tracer_module
         target = Target([])
@@ -186,17 +189,20 @@ class IntegritySafetyTests(unittest.TestCase):
         bp2 = Breakpoint(2, [Location(0x1020)], hardware=True)
         tracer = tracer_module.Tracer()
         tracer.hardware = True
+        tracer.hooks = ['name']
         with mock.patch.object(tracer_module, "SIGS", {"name": None}), \
                 mock.patch.object(tracer_module, "REGEX_SIGS", [("regex", "PROC", None)]), \
-                mock.patch.object(hardware, "create_hardware_breakpoint", side_effect=[bp1, bp2]) as create:
-            self.assertEqual(tracer.enable(target, ci=object()), (2, 2))
-            self.assertIn("-r regex --skip-prologue false", create.call_args.args)
+                mock.patch.object(hardware, "create_hardware_breakpoint", side_effect=[bp1]) as create:
+            self.assertEqual(tracer.enable(target, ci=object()), (1, 1))
+            self.assertIn('-F name --skip-prologue false', create.call_args.args)
+            self.assertEqual(create.call_args.kwargs['reserve'], 2)
             copied = tracer.hardware_bp_ids
             copied.clear()
-            self.assertEqual(tracer.hardware_bp_ids, {1, 2})
+            self.assertEqual(tracer.hardware_bp_ids, {1})
         tracer.disable(target)
         self.assertEqual(tracer.hardware_bp_ids, set())
         target.bps = [bp1]
+        tracer.hooks = ['name','other']
         with mock.patch.object(tracer_module, "SIGS", {"name": None, "other": None}), \
                 mock.patch.object(hardware, "create_hardware_breakpoint", side_effect=[bp1, RuntimeError("slots")]):
             with self.assertRaisesRegex(RuntimeError, "slots"):

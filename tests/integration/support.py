@@ -9,7 +9,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "agent.sh"
-FIXTURE_DIR = ROOT / "tests" / "integration" / "build"
+FIXTURE_DIR = Path(os.environ.get("MACDBG_FIXTURE_DIR", ROOT / "tests" / "integration" / "build"))
 FIXTURE = FIXTURE_DIR / "analysis_fixture"
 STRIPPED_FIXTURE = FIXTURE_DIR / "analysis_fixture_stripped"
 OPTIMIZED_FIXTURE = FIXTURE_DIR / "analysis_fixture_optimized"

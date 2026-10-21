@@ -93,7 +93,7 @@ class HeadlessCloakFailureTests(unittest.TestCase):
         auto_continued = session._try_auto_anti_debug()
 
         self.assertFalse(auto_continued)
-        self.assertIn("[anti-analysis] " + CRITICAL, session._console)
+        self.assertIn("! [anti-analysis] " + CRITICAL, session._console)
 
     def test_dispatch_rejects_next_resume_without_entering_event_pump(self):
         session = AgentSession.__new__(AgentSession)
@@ -185,6 +185,7 @@ class GuiStopEventTests(unittest.TestCase):
         engine._last_stop_event_key = (2079, 42)
         engine._console = mock.Mock()
 
+        engine.tracer = types.SimpleNamespace(returns=None)
         engine._c_restart({})
 
         self.assertIsNone(engine._last_stop_event_key)

@@ -30,6 +30,8 @@ class StoredBP:
     condition: str
     commands: List[str]
     enabled: bool
+    hardware: bool = False
+    specification: Optional[dict] = None
 
 
 @dataclass
@@ -57,6 +59,7 @@ class BinaryState:
     patches: List[Patch] = field(default_factory=list)
     watches: List[Watch] = field(default_factory=list)
     timing_rules: List[dict] = field(default_factory=list)
+    identity_profile: dict = field(default_factory=dict)
 
     def dir(self) -> str:
         return sample_dir(self.binary_path, self.sha256)
@@ -74,6 +77,7 @@ class BinaryState:
                 "sha256": self.sha256,
                 "binary_path": self.binary_path,
                 "timing_rules": self.timing_rules,
+                "identity_profile": self.identity_profile,
                 "comments": {"{:#x}".format(k): v for k, v in self.comments.items()},
                 "bookmarks": {"{:#x}".format(k): v for k, v in self.bookmarks.items()},
                 "breakpoints": [
@@ -83,6 +87,8 @@ class BinaryState:
                         "condition": bp.condition,
                         "commands": list(bp.commands),
                         "enabled": bp.enabled,
+                        "hardware": bp.hardware,
+                        "specification": bp.specification,
                     }
                     for bp in self.breakpoints
                 ],
@@ -158,6 +164,7 @@ def load_for(binary_path: str) -> BinaryState:
     except (OSError, json.JSONDecodeError):
         return state
     state.timing_rules = d.get("timing_rules", [])
+    state.identity_profile = d.get('identity_profile', {})
     for k, v in (d.get("comments") or {}).items():
         try:
             state.comments[int(k, 16)] = v
@@ -176,6 +183,8 @@ def load_for(binary_path: str) -> BinaryState:
                 condition=bp.get("condition", "") or "",
                 commands=list(bp.get("commands") or []),
                 enabled=bool(bp.get("enabled", True)),
+                hardware=bool(bp.get("hardware", False)),
+                specification=bp.get("specification") if isinstance(bp.get("specification"), dict) else None,
             ))
         except (KeyError, ValueError):
             continue

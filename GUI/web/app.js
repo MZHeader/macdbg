@@ -53,6 +53,8 @@
   let histIdx = -1;
   const startTime = Date.now();
   let consoleSequence = 0;
+  let pinnedRegisters = ['pc','sp','lr','x16'];
+  try { pinnedRegisters = JSON.parse(localStorage.getItem('macdbg-pinned-registers')) || pinnedRegisters; } catch (_) {}
 
   // ===========================================================================
   //  SSE
@@ -104,6 +106,7 @@
     renderStrings(st.strings || []);
     renderPatches(st.patches || []);
     renderTraceStatus(st.trace_status);
+    renderAnalysis(st);
 
     // follow / status
     const mem = st.memory;
@@ -119,7 +122,7 @@
     if (defensesOpen) rebuildDefenses();
   }
 
-  function onRunning() { setStatus('running', lastState && lastState.pc, lastState && lastState.modules); }
+  function onRunning() { $('#stop-explanation').textContent = 'Running — displayed registers are from the last stop'; setStatus('running', lastState && lastState.pc, lastState && lastState.modules); }
   function onMeta(m) { $('#menu-target').textContent = m.target ? m.target.split('/').pop() : (m.attach ? 'pid ' + m.attach : '—'); }
 
   function setStatus(kind, pc, modules) {
@@ -177,12 +180,14 @@
 
   // ---- registers + flags ---------------------------------------------------
   function renderRegs(st) {
-    const el = $('#regs');
-    el.innerHTML = (st.registers || []).map(r => {
+    const row = r => {
       const annot = r.annot ? ` <span class="r-annot">${esc(r.annot)}</span>` : '';
-      return `<div class="rrow${r.changed ? ' changed' : ''}" data-reg="${esc(r.name)}" data-val="${esc(r.value)}" data-annot="${esc(r.annot || '')}">`
+      return `<div class="rrow${r.changed ? ' changed' : ''}" title="${esc(r.name + ' ' + r.value + ' ' + (r.annot || ''))}" data-reg="${esc(r.name)}" data-val="${esc(r.value)}" data-annot="${esc(r.annot || '')}">`
         + `<span class="r-name">${esc(r.name)}</span><span class="r-val">${esc(r.value)}</span>${annot}</div>`;
-    }).join('') || '<div class="empty-note">no registers</div>';
+    };
+    const registers = st.registers || [];
+    $('#pinned-regs').innerHTML = pinnedRegisters.flatMap(name => registers.filter(r => r.name === name)).map(row).join('');
+    $('#regs').innerHTML = registers.filter(r => !pinnedRegisters.includes(r.name)).map(row).join('') || '<div class="empty-note">no registers</div>';
     renderFlags(st);
   }
 
@@ -320,7 +325,7 @@
     $('#tracer-state').textContent = ts.on ? 'ON' : 'off';
     $('#tb-tracer').classList.toggle('active', !!ts.on);
     $('#scope-label').textContent = ts.scope || '';
-    $('#trace-info').textContent = `API entries ${ts.on ? 'ON' : 'off'} · ${ts.scope}`;
+    $('#trace-info').textContent = `API events ${ts.on ? 'ON' : 'off'} · ${ts.scope}`;
   }
   function addTrace(m) {
     if (traceEpoch !== m.epoch) { traceRows = []; traceBytes = 0; traceEpoch = m.epoch; }
@@ -354,7 +359,7 @@
     requestAnimationFrame(() => { traceRenderPending = false; rebuildTrace(); });
   }
   function hasNetworkDetails(m) {
-    return !!(m.payload || m.capture_error || (m.http_requests && m.http_requests.length));
+    return !!(m.phase === 'return' || m.return_error || m.payload || m.capture_error || (m.http_requests && m.http_requests.length));
   }
   const traceSearchCache = new WeakMap();
   function traceSearchText(m) {
@@ -429,12 +434,12 @@
   function openTraceDetails(m) {
     // Network contents are untrusted; construct their text with textContent.
     const modal = el('div', 'modal modal-trace');
-    modal.appendChild(traceText('div', 'm-head', 'Network capture · #' + m.n));
+    modal.appendChild(traceText('div', 'm-head', 'Trace event · #' + m.n));
     const body = el('div', 'm-body');
     body.appendChild(traceText('p', 'mono trace-content', m.call));
     body.appendChild(traceText('p', 'm-hint', [m.timestamp, m.capture_source,
       m.pid == null ? '' : 'PID ' + m.pid, m.tid == null ? '' : 'TID ' + m.tid].filter(Boolean).join(' · ')));
-    body.appendChild(traceText('p', 'm-hint', 'API entry captures record submitted data; delivery is not confirmed.'));
+    body.appendChild(traceText('p', 'm-hint', m.phase === 'return' ? 'Return observation · invocation ' + m.invocation + (m.errno == null ? '' : ' · errno ' + m.errno) : 'API entry captures record submitted data; delivery is not confirmed.'));
     if (m.capture_error) body.appendChild(traceText('p', 'm-hint c-red', 'Capture unavailable: ' + m.capture_error));
     if (m.assembly_skipped) body.appendChild(traceText('p', 'm-hint', 'HTTP assembly: ' + m.assembly_skipped));
     (m.http_requests || []).forEach((request, i) => {
@@ -470,12 +475,12 @@
     if (!tb.querySelector('thead')) tb.innerHTML = '<thead><tr><th>#</th><th>time UTC</th><th>PID / TID</th><th>cat</th><th>call</th></tr></thead><tbody></tbody>';
     const body = tb.querySelector('tbody');
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td class="c-dim">${m.n}</td><td class="c-dim">${esc((m.timestamp || '').slice(11, 23))}</td><td class="c-dim">${esc(m.pid || '')} / ${esc(m.tid || '')}</td><td class="tcat-${esc(m.cat)}">${esc(m.cat)}</td><td>${esc(m.call)}</td>`;
+    tr.innerHTML = `<td class="c-dim">${m.n}</td><td class="c-dim">${esc((m.timestamp || '').slice(11, 23))}</td><td class="c-dim">${esc(m.pid || '')} / ${esc(m.tid || '')}</td><td class="tcat-${esc(m.cat)}">${esc(m.cat)}</td><td><span class="trace-phase">${esc(m.phase || 'entry')}${m.invocation ? ' #'+m.invocation:''}</span> ${esc(m.call)}</td>`;
     tr.dataset.call = m.call;
     tr.dataset.traceN = m.n;
     if (hasNetworkDetails(m)) {
       const button = traceText('button', 'mini trace-inspect', 'Details');
-      button.setAttribute('aria-label', 'Inspect network capture #' + m.n);
+      button.setAttribute('aria-label', 'Inspect trace event #' + m.n);
       button.onclick = () => openTraceDetails(m);
       tr.lastElementChild.appendChild(button);
       tr.ondblclick = () => openTraceDetails(m);
@@ -669,8 +674,7 @@
 
   function selectBottomTab(name) {
     $$('#bot-tabs .tab').forEach(x => x.classList.toggle('active', x.dataset.bottab === name));
-    ['breakpoints', 'callstack', 'threads', 'modules', 'strings', 'patches', 'trace']
-      .forEach(p => $('#tb-' + p).classList.toggle('hidden', p !== name));
+    $$('.tabbody > [id^="tb-"]').forEach(panel => panel.classList.toggle('hidden', panel.id !== 'tb-' + name));
   }
 
   function selectMemTab(which) {
@@ -803,7 +807,7 @@
       ];
     });
 
-    on('#regs', e => {
+    const registerMenu = e => {
       const row = e.target.closest('.rrow'); if (!row) return [];
       const name = row.dataset.reg, val = row.dataset.val, annot = row.dataset.annot || '';
       const items = [
@@ -811,6 +815,10 @@
         { label: 'Follow value in Memory', fn: () => followMem(val) },
         { label: 'Breakpoint at value', fn: () => cmd('toggle_bp', { addr: val }) },
         { sep: 1 },
+        { label: pinnedRegisters.includes(name) ? 'Unpin register' : 'Pin register', fn: () => {
+          pinnedRegisters = pinnedRegisters.includes(name) ? pinnedRegisters.filter(n => n !== name) : [...pinnedRegisters, name];
+          localStorage.setItem('macdbg-pinned-registers', JSON.stringify(pinnedRegisters)); renderRegs(lastState);
+        } },
         { label: 'Edit value…', fn: () => editReg(name, val) },
         { label: 'Copy value', fn: () => copy(val) }
       ];
@@ -828,7 +836,8 @@
         { label: 'Pin value to Watch 3', fn: () => cmd('watch_set', { slot: 3, addr: val, len: 32 }) }
       );
       return items;
-    });
+    };
+    on('#regs', registerMenu); on('#pinned-regs', registerMenu);
 
     const hexMenu = e => {
       const row = e.target.closest('.hrow'); if (!row || !row.dataset.addr) return [];
@@ -1089,7 +1098,7 @@
       ['fork_trace', 'Trace the whole fork tree', 'DYLD interpose — relaunches the target']
     ]],
     ['Exec', [
-      ['exec_sandbox', 'Sandbox exec & scripts', 'process launches + AppleScript / OSA execution'],
+      ['exec_sandbox', 'Intercept exec & scripts', 'process launches + AppleScript / OSA execution'],
       ['exec_interactive', 'Prompt on execution', 'Allow / Fake / Block / Dump']
     ]]
   ];
@@ -1101,6 +1110,7 @@
     const foot = el('div', 'm-foot'); const close = el('button', 'btn', 'Close');
     const timing = el('button', 'btn', 'Configure timing rules');
     timing.onclick = () => { defensesOpen = false; openTimingRules(); };
+    const identity = el('button', 'btn', 'Machine identity'); identity.onclick = openIdentityProfile; foot.appendChild(identity);
     foot.appendChild(timing);
     close.onclick = () => { defensesOpen = false; closeModal(); }; foot.appendChild(close); m.appendChild(foot);
     openModal(m, e => { if (e.key === 'Escape') { defensesOpen = false; closeModal(); } });
@@ -1113,15 +1123,16 @@
     for (const [title, rows] of DEF_SECTIONS) {
       html += `<div class="toggle-section">${esc(title)}</div><div class="toggle-list">`;
       for (const [key, label, sub] of rows) {
+        const queued = !!(lastState && (lastState.queued_defenses || []).includes(key));
         const on = !!st[key];
         const unsafe = on && ((key === 'analysis_cloak' && st.analysis_cloak_safe === false)
           || (key === 'auto_clock' && (st.auto_clock_safe === false
             || (st.auto_clock_status || {}).counter_coverage_complete === false))
           || (key === 'anti_timing' && st.anti_timing_safe === false));
-        let detail = sub;
+        let detail = queued ? 'Queued — activates at the main entry stop' : sub;
         if (key === 'auto_clock') {
           const clock = st.auto_clock_status || {};
-          detail = clock.error || (on ? 'main executable · ' + (clock.apis || []).length + ' APIs · '
+          detail = clock.error || (queued ? 'Queued — activates at the main entry stop' : on ? 'main executable · ' + (clock.apis || []).length + ' APIs · '
             + (clock.counter_armed || 0) + '/' + (clock.counter_sites || 0) + ' counters · '
             + ((clock.paused_ns || 0) / 1e9).toFixed(2) + 's paused'
             + ((clock.coverage_notes || []).length ? ' · partial coverage: ' + clock.coverage_notes.join('; ') : '') : sub);
@@ -1136,17 +1147,22 @@
             : 'ready · ' + (+st.analysis_cloak_resolved || 0) + ' resolved · '
               + (+st.analysis_cloak_deferred || 0) + ' deferred';
         }
+        if (key === 'all_anti' && st.all_anti_requested && !on) detail = 'Partially armed — click to disable the requested group';
+        const coverage = (st.coverage || {})[key];
+        if (coverage) detail += ' · ' + coverage.state + ' (' + coverage.resolved + '/' + coverage.requested + ' hooks)';
+        if ((st.hits || {})[key]) detail += ' · ' + st.hits[key] + ' interventions';
+        if ((st.failures || {})[key]) detail = 'Failed · ' + st.failures[key];
         html += `<div class="toggle-row${on ? ' on' : ''}${unsafe ? ' unsafe' : ''}" data-key="${key}"><div class="tg-box"></div>`
           + `<div class="tg-text"><b>${esc(label)}</b><span>${esc(detail)}</span></div></div>`;
       }
       html += '</div>';
     }
     body.innerHTML = html;
-    body.querySelectorAll('.toggle-row').forEach(r => r.onclick = () => {
+    body.querySelectorAll('.toggle-row').forEach(r => r.onclick = async () => {
       const key = r.dataset.key;
-      if (key === 'fork_trace') cmd('fork_trace'); else cmd('defense', { key: key });
-      // optimistic flip; the next state refresh corrects it
-      r.classList.toggle('on');
+      r.classList.add('pending'); r.style.pointerEvents = 'none';
+      if (key === 'fork_trace') await cmd('fork_trace'); else await cmd('defense', { key: key });
+      rebuildDefenses();
     });
   }
 
@@ -1383,10 +1399,134 @@
     $('#st-time').textContent = `${h}:${m}:${sec}`;
   }
 
+  // ---- analysis workspace --------------------------------------------------
+  const analysis = (action, args) => cmdSync('analysis', {action, ...(args || {})});
+  function analysisDialog(title, content) {
+    const m = el('div', 'modal modal-trace');
+    m.appendChild(traceText('div','m-head',title));
+    const body = el('div','m-body'); body.appendChild(content); m.appendChild(body);
+    const foot = el('div','m-foot'), close = el('button','btn','Close');
+    close.onclick = closeModal; foot.appendChild(close); m.appendChild(foot);
+    openModal(m,e => { if (e.key === 'Escape') closeModal(); });
+    return {m,body,foot};
+  }
+  function renderAnalysis(st) {
+    $('#stop-explanation').textContent = st.stop ? st.stop.text.replace(/^\[stop\] /,'')
+      : st.process_state === 'running' ? 'Running' : st.process_state === 'exited' ? 'Exited · code '+st.exit_code : 'No stopped process';
+    if (st.before_initializers) $('#stop-explanation').textContent = 'Before initializers — arm startup defenses or queue entry defenses';
+    else if (st.at_entry) $('#stop-explanation').textContent = 'Main entry · ' + hx(st.pc) + ' · ready to configure or continue';
+    else if (st.stop && st.stop.thread_id) $('#stop-explanation').textContent += ' · thread ' + st.stop.thread_id;
+    $('#continue-entry').classList.toggle('hidden', !st.before_initializers);
+    $('#nav-back').disabled = !(st.navigation || {}).back;
+    $('#nav-forward').disabled = !(st.navigation || {}).forward;
+    const d = (st.trace_status || {}).defenses || {};
+    const names = ['analysis_cloak','auto_clock','deny_attach','mach','flag_scrubs','parent','sigtrap','exec_sandbox'];
+    const active = names.filter(name => d[name]);
+    const failed = Object.keys(d.failures || {}).length > 0 || ['analysis_cloak','auto_clock','anti_timing'].some(name => d[name] && d[name+'_safe'] === false);
+    const queued = (st.queued_defenses || []).length;
+    $('#defense-summary').textContent = 'Defenses: '+active.length+' active'+(queued ? ' · '+queued+' queued':'')+(failed ? ' · ATTENTION':Object.values(d.coverage || {}).some(c => c.state !== 'ready') ? ' · partial coverage':'');
+    $('#defense-summary').classList.toggle('c-red',failed);
+    const records = (st.analysis_events || {}).hits || [];
+    $('#analysis-table').innerHTML = '<thead><tr><th>Time</th><th>Kind</th><th>Thread</th><th>Event</th></tr></thead><tbody>'
+      + records.slice().reverse().map(r => `<tr data-event="${r.n}"><td>${esc((r.timestamp || '').slice(11,23))}</td><td>${esc(r.category)}</td><td>${esc(r.tid || '')}</td><td>${esc(r.call)}</td></tr>`).join('')+'</tbody>';
+    $$('#analysis-table tr[data-event]').forEach(row => row.onclick = () => {
+      const record = records.find(r => r.n === +row.dataset.event);
+      const dialog = analysisDialog(record.call,traceText('pre','mono trace-content',JSON.stringify(record,null,2)));
+      if (record.pc) { const follow = el('button','btn primary','Follow in disassembly'); follow.onclick = () => { cmd('follow_disasm',{addr:record.pc}); closeModal(); }; dialog.foot.prepend(follow); }
+    });
+    const memory = st.memory_analysis || {};
+    $('#monitor-memory').textContent = memory.enabled ? 'Stop tracking changes' : 'Track executable changes';
+    $('#disarm-guard').disabled = !memory.guard;
+    $('#memory-coverage').textContent = memory.enabled ? memory.coverage : 'Select a region to inspect it. Execution guards temporarily remove execute permission.';
+    const select = $('#memory-baseline'), chosen = select.value;
+    select.innerHTML = (memory.snapshots || []).map(s => `<option value="${s.id}">#${s.id} ${esc(s.label)} · ${hx(s.addr)}</option>`).join('');
+    if ([...select.options].some(o => o.value === chosen)) select.value = chosen;
+    $('#compare-memory').disabled = !select.options.length;
+    $('#memory-width').value = String(st.memory_width || 16);
+  }
+  async function refreshRegions() {
+    const result = await analysis('memory_map'); if (!result) return;
+    $('#regions-table').innerHTML = '<thead><tr><th>Base</th><th>Size</th><th>Access</th><th>Image / actions</th></tr></thead><tbody>'
+      + result.regions.map((r,i) => `<tr data-region="${i}"><td>${hx(r.base)}</td><td>${hx(r.size)}</td><td>${esc(r.permissions)}</td><td><span class="region-name" title="${esc(r.name || 'anonymous')}">${esc(r.name || 'anonymous')}</span> <button class="mini" data-memory="${i}">Inspect</button>${r.protection & 4 ? ` <button class="mini" data-guard="${i}">Break on first execution</button> <button class="mini" data-svc="${i}" title="Scan the first 256 KiB of this live region; use hardware breakpoints">Scan inline syscalls</button>`:''}</td></tr>`).join('')+'</tbody>';
+    $$('[data-memory]', $('#regions-table')).forEach(b => b.onclick = () => followMem(result.regions[+b.dataset.memory].base));
+    $$('[data-svc]', $('#regions-table')).forEach(b => b.onclick = async () => { const r = result.regions[+b.dataset.svc]; const scan = await analysis('scan_syscalls',{addr:r.base,size:Math.min(r.size,256*1024)}); if (scan) appendConsole('Live syscall scan: '+scan.sites+' sites in '+scan.bytes_scanned+' bytes',false); });
+    $$('[data-guard]', $('#regions-table')).forEach(b => b.onclick = async () => { b.disabled = true; await analysis('execution_guard',{addr:result.regions[+b.dataset.guard].base}); await refreshRegions(); });
+  }
+  async function snapshotMemory() {
+    if (!lastState || !lastState.memory) return;
+    const size = await promptDialog({title:'Snapshot memory and strings', value:'256', hint:'1 byte to 1 MiB. Captures the current Memory address; keeps the latest eight snapshots.'});
+    if (size === null) return;
+    const result = await analysis('memory_snapshot',{addr:lastState.memory.follow,size:size.trim(),label:'Memory snapshot'});
+    if (result) { $('#memory-baseline').value = String(result.id); appendConsole('Snapshot #'+result.id+' · '+result.size+' bytes · '+result.strings.length+' strings',false); }
+  }
+  async function compareMemory() {
+    const result = await analysis('memory_compare',{id:$('#memory-baseline').value}); if (!result) return;
+    const content = el('div','');
+    content.appendChild(traceText('p','m-hint',result.changed_bytes+' changed bytes'+(result.complete ? '' : ' · current memory is partially unreadable')));
+    const table = el('table','grid');
+    table.innerHTML = '<thead><tr><th>Address</th><th>Before</th><th>After</th></tr></thead><tbody>'
+      + result.changes.map(c => `<tr><td>${esc(c.addr)}</td><td>${esc(c.before)}</td><td class="c-green">${esc(c.after)}</td></tr>`).join('')+'</tbody>';
+    content.appendChild(table);
+    content.appendChild(traceText('h4','','New or changed strings'));
+    content.appendChild(traceText('pre','mono trace-content',result.strings_added.map(s => s.addr+' '+s.text).join('\n') || '(none)'));
+    content.appendChild(traceText('h4','','Removed strings'));
+    content.appendChild(traceText('pre','mono trace-content',result.strings_removed.map(s => s.addr+' '+s.text).join('\n') || '(none)'));
+    analysisDialog('Memory comparison · snapshot #'+result.id,content);
+  }
+  async function openTraceConfiguration() {
+    const config = await analysis('tracer_config'); if (!config) return;
+    const content = el('div','');
+    const budget = config.hardware_budget || {};
+    content.innerHTML = `<p class="m-hint">Hardware sites: ${esc(budget.used || 0)} / ${esc(budget.capacity || '?')} used. Two slots are reserved for return/step observations. Disable tracing before changing configuration.</p>`
+      + '<label class="m-hint">Preset<select class="m-input" id="trace-preset"><option value="all">All APIs (software)</option>'+Object.keys(config.presets).map(k => `<option>${esc(k)}</option>`).join('')+'<option value="custom">Custom API list</option></select></label>'
+      + '<label class="m-hint">Exact API names, comma separated<input class="m-input" id="trace-hooks"></label>'
+      + '<label><input type="checkbox" id="trace-hardware"> Hardware entry breakpoints</label><br>'
+      + '<label><input type="checkbox" id="trace-returns"> Capture returns and read/decrypted buffers</label>'
+      + '<p class="m-hint">Return hooks use hardware breakpoints. Unavailable captures are labelled on their entry event. Read buffers are capped at 256 KiB.</p>';
+    const dialog = analysisDialog('Trace configuration',content);
+    const presets = $('#trace-preset'), hooks = $('#trace-hooks');
+    hooks.value = (config.hooks || []).join(', '); presets.value = config.hooks ? 'custom':'all';
+    $('#trace-hardware').checked = config.hardware; $('#trace-returns').checked = config.returns;
+    presets.onchange = () => { hooks.value = (config.presets[presets.value] || []).join(', '); };
+    $('#trace-hardware').onchange = () => { if ($('#trace-hardware').checked && presets.value === 'all') { presets.value = 'file'; presets.onchange(); } };
+    const save = el('button','btn primary','Apply'); save.disabled = !!(lastState && lastState.trace_status.on);
+    save.onclick = async () => { const result = await analysis('tracer_config',{hooks:hooks.value.trim() ? hooks.value.split(',').map(v => v.trim()).filter(Boolean) : null, hardware:$('#trace-hardware').checked,returns:$('#trace-returns').checked}); if (result) closeModal(); };
+    dialog.foot.prepend(save);
+  }
+  function openIdentityProfile() {
+    defensesOpen = false;
+    const profile = (lastState || {}).identity_profile || {};
+    const content = el('div','');
+    content.innerHTML = '<p class="m-hint">Preserve identity keeps the real model, CPU, UUID and serial for hardware-bound licensing. Debugger/environment concealment remains available. Spoof mode uses the same UUID across supported sysctl and IOKit queries.</p>'
+      + '<label>Identity mode<select class="m-input" id="identity-mode"><option value="preserve">Preserve real machine identity</option><option value="spoof">Use spoofed identity</option></select></label>'
+      + ['model','cpu','uuid','serial'].map(k => `<label>${esc(k)}<input class="m-input" id="identity-${k}" value="${esc(profile[k] || '')}"></label>`).join('');
+    const dialog = analysisDialog('Machine identity profile',content);
+    $('#identity-mode').value = profile.mode || 'spoof';
+    const save = el('button','btn primary','Apply profile');
+    save.disabled = !!(lastState && lastState.trace_status.defenses.analysis_cloak);
+    if (save.disabled) content.prepend(traceText('p','m-hint c-red','Disable Analysis cloak before editing identity.'));
+    save.onclick = async () => { const values = {}; ['mode','model','cpu','uuid','serial'].forEach(k => values[k] = $('#identity-'+k).value); if (await analysis('identity_profile',values)) closeModal(); };
+    dialog.foot.prepend(save);
+  }
+  function wireAnalysis() {
+    $('#continue-entry').onclick = () => cmd('continue_entry');
+    $('#defense-summary').onclick = openDefenses;
+    $('#nav-back').onclick = () => cmd('navigate_history',{direction:'back'});
+    $('#nav-forward').onclick = () => cmd('navigate_history',{direction:'forward'});
+    $('#memory-width').onchange = () => cmd('view_options',{memory_width:+$('#memory-width').value});
+    $('#snapshot-memory').onclick = snapshotMemory; $('#compare-memory').onclick = compareMemory;
+    $('#refresh-regions').onclick = refreshRegions;
+    $('[data-bottab="regions"]').addEventListener('click',refreshRegions);
+    $('#monitor-memory').onclick = async () => { await analysis('memory_monitor',{enabled:!(lastState.memory_analysis || {}).enabled}); await refreshRegions(); };
+    $('#disarm-guard').onclick = async () => { await analysis('execution_guard',{enabled:false}); await refreshRegions(); };
+    $('#configure-trace').onclick = openTraceConfiguration;
+  }
+
   // ---- boot ----------------------------------------------------------------
   function boot() {
     wireChrome();
     wireKeys();
+    wireAnalysis();
     setStatus('none', 0, null);
     setInterval(tick, 1000);
     connect();

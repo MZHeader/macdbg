@@ -11,6 +11,10 @@ FRAMEWORKS := -framework CoreFoundation -framework IOKit
 
 .PHONY: all clean
 all: $(BUILD)/workflow_fixture
+all: $(BUILD)/memory_analysis_fixture
+
+$(BUILD)/memory_analysis_fixture: memory_analysis_fixture.c | $(BUILD)
+	clang $(CFLAGS) $< -o $@
 
 all: $(BUILD)/http_fixture
 

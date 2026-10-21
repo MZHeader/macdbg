@@ -6,6 +6,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE_SOURCE = (ROOT / "GUI/server/engine.py").read_text()
+CONTROLLER_SOURCE = (ROOT / 'macdbg/core/session_controller.py').read_text()
 APP_SOURCE = (ROOT / "GUI/web/app.js").read_text()
 README_SOURCE = (ROOT / "README.md").read_text()
 CLAUDE_SKILL = ROOT / ".claude/skills/macdbg-agent/SKILL.md"
@@ -47,10 +48,9 @@ class SurfaceContractTests(unittest.TestCase):
 
     def test_existing_cloak_safety_hooks_remain_in_gui_dispatch(self):
         hidden = ENGINE_SOURCE.index("ids.update(d.analysis_cloak.hidden_bp_ids())")
-        cloak_hit = ENGINE_SOURCE.index(
-            "self.dbg.handle_analysis_cloak_hit(bp_id)")
-        ordinary_hit = ENGINE_SOURCE.index(
-            "self.dbg.handle_anti_ptrace_hit")
+        self.assertIn('handle_defenses(self.dbg, self._console)',ENGINE_SOURCE)
+        cloak_hit = CONTROLLER_SOURCE.index('debugger.handle_analysis_cloak_hit(bid)')
+        ordinary_hit = CONTROLLER_SOURCE.index("for name in ('anti_ptrace'")
         integrity = ENGINE_SOURCE.index(
             "self.dbg.analysis_cloak.validate_integrity(")
         begin_resume = ENGINE_SOURCE.index("def _begin_resume")
@@ -258,6 +258,7 @@ def make_engine(*, enabled=False, safe=True, error=None):
         return run
 
     debugger = types.SimpleNamespace(
+        is_stopped_before_initializers=lambda: False,
         analysis_cloak=cloak,
         anti_ptrace_bp_id=1,
         direct_syscall_bp_ids={2},

@@ -7,6 +7,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 import lldb
 
 from .network_capture import NetworkCapture, FOUNDATION_PATTERN, RESUME_PATTERN, TLS_CLOSES, TLS_WRITES
+from .http_capture import body_record, CAPTURE_LIMIT
+from .return_hooks import ReturnHooks
 
 
 FILE = "FILE"
@@ -179,6 +181,11 @@ def _f_send(frame, p):
 def _f_recv(frame, p):
     return "recv(fd={}, buf={:#x}, n={})".format(
         _reg(frame, "x0"), _reg(frame, "x1"), _reg(frame, "x2"))
+
+
+def _f_tls_read(frame, p):
+    return '{}(context={:#x}, buf={:#x}, capacity={})'.format(
+        frame.GetFunctionName() or 'TLS read', _reg(frame,'x0'), _reg(frame,'x1'), _reg(frame,'x2'))
 
 
 def _f_sendto(frame, p):
@@ -437,6 +444,9 @@ REGEX_SIGS: List[Tuple[str, str, Callable]] = [
 
 
 SIGS: Dict[str, Tuple[str, Callable]] = {
+    'SSL_read': (NET, _f_tls_read),
+    'SSL_read_ex': (NET, _f_tls_read),
+    'SSLRead': (NET, _f_tls_read),
     **{name: (NET, _f_tls_close) for name in TLS_CLOSES},
     "open":               (FILE, _f_open),
     "open$NOCANCEL":      (FILE, _f_open),
@@ -526,6 +536,14 @@ SIGS: Dict[str, Tuple[str, Callable]] = {
 
 
 class Tracer:
+    PRESETS = {'file': ['open', 'read', 'write'],
+               'network': ['connect', 'send', 'recv'],
+               'tls': ['SSL_read', 'SSL_write'],
+               'process': ['system', 'execve', 'posix_spawn']}
+    RETURN_APIS = {'open', 'openat', 'close', 'read', 'pread', 'write', 'pwrite',
+                  'connect', 'send', 'recv', 'sendto', 'recvfrom', 'socket',
+                  'SSL_read', 'SSL_read_ex', 'SSLRead', 'SSL_write', 'SSL_write_ex'}
+
     def __init__(self) -> None:
         self._bp_ids: List[int] = []
         self._hardware_bp_ids: set[int] = set()
@@ -537,25 +555,53 @@ class Tracer:
         self.hardware: bool = False
         self.skip_fd: int = -1
         self.network = NetworkCapture()
+        self.debugger = None
+        self.hooks = None
+        self.capture_returns = False
+        self.returns = None
+
+    def configure(self, *, hooks=None, preset=None, hardware=False, returns=False):
+        if self.enabled:
+            raise ValueError('disable tracing before changing capture settings')
+        if preset is not None:
+            if preset not in self.PRESETS and preset != 'all':
+                raise ValueError('unknown trace preset')
+            hooks = self.PRESETS.get(preset)
+        if hooks is not None:
+            if not isinstance(hooks, list) or not hooks or any(h not in SIGS for h in hooks):
+                raise ValueError('select one or more known API names')
+            hooks = list(dict.fromkeys(hooks))
+        self.hooks = hooks
+        self.hardware = bool(hardware)
+        self.capture_returns = bool(returns)
+
+    def configuration(self):
+        from .breakpoints import hardware_breakpoint_capacity, hardware_usage
+        try:
+            budget = {'capacity': hardware_breakpoint_capacity(),
+                      'used': hardware_usage(self.debugger.target) if self.debugger else 0,
+                      'reserved': 2}
+        except RuntimeError as error:
+            budget = {'error': str(error)}
+        return {'hooks': self.hooks, 'hardware': self.hardware, 'returns': self.capture_returns,
+                'presets': self.PRESETS, 'available': sorted(SIGS), 'hardware_budget': budget}
 
     @property
     def hardware_bp_ids(self) -> set[int]:
-        return set(self._hardware_bp_ids)
+        return set(self._hardware_bp_ids) | (self.returns.ids() if self.returns else set())
 
     def _create_breakpoint(self, target, ci, name, regex=False):
         # Reading argument registers after a prologue is not reliable. Use the
         # command API for payload hooks because the SB name/regex overloads do
         # not expose skip-prologue on the supported LLDB Python bindings.
-        entry = regex or name in TLS_WRITES or name in TLS_CLOSES or name.split("$", 1)[0] in {
-            "send", "sendto", "sendmsg", "write", "writev", "connect", "connectx",
-            "close", "shutdown", "EVP_AEAD_CTX_seal"}
+        entry = True
         if not self.hardware:
-            if ci is not None and entry:
+            if ci is not None:
                 import shlex
                 before = {bp.GetID() for bp in target.breakpoint_iter()}
                 result = lldb.SBCommandReturnObject()
                 ci.HandleCommand("breakpoint set --skip-prologue false {} {}".format(
-                    "-r" if regex else "-n", shlex.quote(name)), result, False)
+                    "-r" if regex else "-F", shlex.quote(name)), result, False)
                 created = [bp for bp in target.breakpoint_iter() if bp.GetID() not in before]
                 if not result.Succeeded() or len(created) != 1:
                     for bp in created:
@@ -569,9 +615,9 @@ class Tracer:
         import shlex
         try:
             bp = create_hardware_breakpoint(
-                target, ci, ("-r " if regex else "-n ") + shlex.quote(name)
+                target, ci, ("-r " if regex else "-F ") + shlex.quote(name)
                 + (" --skip-prologue false" if entry else ""),
-                require_location=False)
+                require_location=False, reserve=2)
         except RuntimeError:
             self.disable(target)
             raise
@@ -582,8 +628,14 @@ class Tracer:
         if self.enabled or not target or not target.IsValid():
             return (0, 0)
         self._exec_name = target.GetExecutable().GetFilename() or ""
+        if self.hardware and self.hooks is None:
+            self.hooks = list(self.PRESETS['file'])
+        if self.capture_returns and self.debugger is None:
+            raise RuntimeError('return capture requires a debugger session')
+        if self.debugger and self.returns is None:
+            self.returns = ReturnHooks(self.debugger)
         resolved_now = 0
-        for name in SIGS:
+        for name in (self.hooks if self.hooks is not None else SIGS):
             bp = self._create_breakpoint(target, ci, name)
             if not bp.IsValid():
                 continue
@@ -591,7 +643,7 @@ class Tracer:
             self._bp_to_name[bp.GetID()] = name
             if bp.GetNumLocations() > 0:
                 resolved_now += 1
-        for pattern, cat, fmt in REGEX_SIGS:
+        for pattern, cat, fmt in (REGEX_SIGS if self.hooks is None else []):
             rbp = self._create_breakpoint(target, ci, pattern, regex=True)
             if not rbp.IsValid():
                 continue
@@ -604,6 +656,8 @@ class Tracer:
         return (len(self._bp_ids), resolved_now)
 
     def disable(self, target: lldb.SBTarget) -> None:
+        if self.returns:
+            self.returns.clear()
         self.network.reset()
         self._hardware_bp_ids.clear()
         if not target or not target.IsValid():
@@ -620,7 +674,39 @@ class Tracer:
         self.enabled = False
 
     def is_trace_bp(self, bp_id: int) -> bool:
-        return bp_id in self._bp_to_name
+        return bp_id in self._bp_to_name or bool(self.returns and bp_id in self.returns.ids())
+
+    def hidden_ids(self):
+        return set(self._bp_to_name) | ((self.returns.ids() | self.returns.retired) if self.returns else set())
+
+    def return_hits(self, thread, process):
+        if not self.returns:
+            return []
+        hits = []
+        for observation in self.returns.consume(thread):
+            entry = observation['payload']
+            name, args = entry['name'], entry['args']
+            raw = _reg(thread.GetFrameAtIndex(0), 'x0')
+            width = 64 if name in {'read','pread','write','pwrite','recv','send','recvfrom','sendto'} else 32
+            value = raw & ((1 << width) - 1)
+            if value & (1 << (width - 1)):
+                value -= 1 << width
+            details = {**entry['details'], 'phase':'return', 'invocation':observation['invocation'],
+                       'return_value':value, 'return_register':hex(raw)}
+            if value == -1 and not name.startswith('SSL'):
+                details['errno'] = self.debugger.analysis_cloak._read_errno(thread, lldb)
+            size = max(0, value)
+            if name in {'SSL_read_ex','SSLRead'}:
+                success = value == (1 if name == 'SSL_read_ex' else 0)
+                data = self.debugger.read_memory(args[3], 8) if success else b''
+                size = int.from_bytes(data, 'little') if len(data) == 8 else 0
+            if name in {'read','pread','recv','recvfrom','SSL_read','SSL_read_ex','SSLRead'} and size:
+                length = min(size, args[2], CAPTURE_LIMIT)
+                data = self.debugger.read_memory(args[1], length)
+                details['payload'] = body_record(data, size, '', status='unreadable' if len(data) < length else None)
+                details['capture_source'] = name + ' return'
+            hits.append(TraceHit(entry['category'], '{} → {}'.format(name, value), details))
+        return hits
 
     def flush_network(self, process=None):
         requests = self.network.http.flush()
@@ -678,6 +764,16 @@ class Tracer:
                 name, request["body"]["captured_bytes"], request["body"]["status"])
         hit = _hit(category, call, frame, process)
         hit.details.update(details)
+        api = name.lstrip('_').split('$', 1)[0]
+        if self.capture_returns and api in self.RETURN_APIS:
+            try:
+                hit.details['invocation'] = self.returns.arm(frame, {
+                    'name': api, 'args': [_reg(frame, 'x'+str(i)) for i in range(8)],
+                    'category':category, 'details':dict(hit.details)})
+                hit.details['return_status'] = 'pending'
+            except RuntimeError as error:
+                hit.details['return_status'] = 'unavailable'
+                hit.details['return_error'] = str(error)
         return hit
 
     def _caller_is_noise(self, frame: lldb.SBFrame) -> bool:

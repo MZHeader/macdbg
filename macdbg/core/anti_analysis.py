@@ -44,6 +44,8 @@ IOKIT_SPOOFS = {
     "IOPlatformSerialNumber": "C02ZQ0ABC123",
     "IOPlatformUUID": PLATFORM_UUID,
 }
+DEFAULT_IDENTITY_PROFILE = {'mode':'spoof', 'model':'Mac14,6', 'cpu':'Apple M2 Pro',
+                            'uuid':PLATFORM_UUID, 'serial':IOKIT_SPOOFS['IOPlatformSerialNumber']}
 
 ParentReturnHook = tuple[str, int, int]
 SysctlReturnHook = tuple[str, str, int, int, int]
@@ -106,6 +108,46 @@ class AnalysisCloak:
         self._owned_existing_bp_ids = {}
         self._target = None
         self._required_hooks: dict[int, str] = {}
+        self.identity_profile = dict(DEFAULT_IDENTITY_PROFILE)
+
+    def configure_identity(self, values):
+        import uuid
+        if self.enabled:
+            raise ValueError('disable Analysis cloak before changing identity')
+        if not isinstance(values, dict) or set(values) - set(self.identity_profile):
+            raise ValueError('unknown identity profile fields')
+        profile = {**self.identity_profile, **values}
+        if profile['mode'] not in ('preserve', 'spoof'):
+            raise ValueError('identity mode must be preserve or spoof')
+        for key in ('model','cpu','serial','uuid'):
+            if not isinstance(profile[key], str) or not 1 <= len(profile[key]) <= 128 or '\0' in profile[key]:
+                raise ValueError('invalid identity field ' + key)
+        profile['uuid'] = str(uuid.UUID(profile['uuid'])).upper()
+        self.identity_profile = profile
+        if getattr(self.debugger, 'state', None):
+            self.debugger.state.identity_profile = dict(profile)
+            self.debugger.state.save()
+        return dict(profile)
+
+    @property
+    def sysctl_spoofs(self):
+        profile = getattr(self, 'identity_profile', None)
+        if not profile:
+            return SYSCTL_SPOOFS
+        values = {'kern.hv_vmm_present':SYSCTL_SPOOFS['kern.hv_vmm_present']}
+        if profile['mode'] == 'spoof':
+            values.update({'hw.model':SpoofValue('cstring', profile['model']),
+                           'machdep.cpu.brand_string':SpoofValue('cstring', profile['cpu']),
+                           'kern.hostuuid':SpoofValue('cstring', profile['uuid'])})
+        return values
+
+    @property
+    def iokit_spoofs(self):
+        profile = getattr(self, 'identity_profile', None)
+        if not profile:
+            return IOKIT_SPOOFS
+        return ({'IOPlatformSerialNumber':profile['serial'], 'IOPlatformUUID':profile['uuid']}
+                if profile['mode'] == 'spoof' else {})
 
     def enable(self) -> tuple[bool, str]:
         if self.enabled:
@@ -345,7 +387,7 @@ class AnalysisCloak:
                                 process.WriteMemory(buffer, original, rollback)
             else:
                 kind, name, buffer, size_pointer, capacity = hook
-                spoof = SYSCTL_SPOOFS[name]
+                spoof = self.sysctl_spoofs[name]
                 payload = (int(spoof.value).to_bytes(4, "little")
                            if kind == "u32" else
                            str(spoof.value).encode() + b"\0")
@@ -436,6 +478,10 @@ class AnalysisCloak:
                                     "cloak failed{}".format(name, rollback))
                             else:
                                 message = "spoofed sysctlbyname({})".format(name)
+            if message and hasattr(self.debugger, 'analysis_events'):
+                self.debugger.record_event('DEFENSE',message,defense='analysis_cloak',
+                    original={'return':hex(returned)},replacement={'return':hex(result.GetValueAsUnsigned())},
+                    ready=self.last_error is None)
             if self.last_error is None and resume:
                 self.debugger.cont()
             return message
@@ -494,14 +540,14 @@ class AnalysisCloak:
             err = lldb.SBError()
             name = (process.ReadCStringFromMemory(name_pointer, 256, err)
                     if name_pointer else "")
-            if (err.Success() and name in SYSCTL_SPOOFS
+            if (err.Success() and name in self.sysctl_spoofs
                     and frame.FindRegister("x3").GetValueAsUnsigned() == 0
                     and frame.FindRegister("x4").GetValueAsUnsigned() == 0):
                 size_data = (self._read_exact(size_pointer, 8, lldb)
                              if size_pointer else None)
                 if size_data is not None:
                     capacity = int.from_bytes(size_data, "little")
-                    hook = (SYSCTL_SPOOFS[name].kind, name, buffer,
+                    hook = (self.sysctl_spoofs[name].kind, name, buffer,
                             size_pointer, capacity)
                 else:
                     entry_message = self._critical(
@@ -571,14 +617,14 @@ class AnalysisCloak:
         if key is None:
             return self._critical(
                 "could not read IOKit property key; cloak failed")
-        if key not in IOKIT_SPOOFS:
+        if key not in self.iokit_spoofs:
             if resume:
                 self.debugger.cont()
             return ""
 
         replacement = self._cfstring_cache.get(key)
         if replacement is None:
-            replacement = self._make_cfstring(IOKIT_SPOOFS[key])
+            replacement = self._make_cfstring(self.iokit_spoofs[key])
             if not replacement:
                 return self._critical(
                     "could not create replacement for {}; cloak failed"
@@ -606,6 +652,9 @@ class AnalysisCloak:
                 "could not return replacement for {}; cloak failed: {}"
                 .format(key, err.strip()))
 
+        if hasattr(self.debugger, 'analysis_events'):
+            self.debugger.record_event('DEFENSE','spoofed IOKit property '+key,defense='analysis_cloak',
+                original={'property':key,'result_observed':False},replacement=self.iokit_spoofs[key])
         if resume:
             self.debugger.cont()
         return "spoofed IORegistryEntryCreateCFProperty({})".format(key)
@@ -725,9 +774,15 @@ class AnalysisCloak:
         return bytes(data)
 
     def _write_exact(self, address: int, data: bytes, lldb_module) -> bool:
+        audit = hasattr(self.debugger,'analysis_events')
+        original = self._read_exact(address,len(data),lldb_module) if audit else None
         error = lldb_module.SBError()
         written = self.debugger.process.WriteMemory(address, data, error)
-        return error.Success() and written == len(data)
+        success = error.Success() and written == len(data)
+        if audit and success:
+            self.debugger.record_event('DEFENSE','cloak memory rewrite',defense='analysis_cloak',
+                address=hex(address),original=original.hex() if original is not None else None,replacement=data.hex())
+        return success
 
     def _critical(self, message: str) -> str:
         if self.last_error is None:

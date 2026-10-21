@@ -40,6 +40,12 @@
       </div>
     </div>
 
+    <div class="analysis-strip">
+      <span id="stop-explanation">Open a target to begin</span>
+      <button class="mini hidden" id="continue-entry">Continue to entry</button>
+      <button class="mini" id="defense-summary" title="Inspect defense readiness">Defenses off</button>
+    </div>
+
     <!-- Resizable workspace -->
     <div id="main">
       <!-- Top row: disassembly | registers + memory tabs -->
@@ -48,6 +54,7 @@
           <header class="panel-head">
             <span class="dot"></span> Disassembly
             <span class="head-sub mono" id="disasm-status"></span>
+            <span class="head-spacer"></span><button class="mini" id="nav-back" title="Previous location">←</button><button class="mini" id="nav-forward" title="Next location">→</button>
           </header>
           <div class="disasm scroll" id="disasm" tabindex="0"></div>
         </section>
@@ -57,6 +64,7 @@
         <aside class="col-right">
           <section class="panel panel-regs" data-pane="regs">
             <header class="panel-head"><span class="dot"></span> Registers</header>
+            <div id="pinned-regs" class="pinned-regs"></div>
             <div class="regs scroll" id="regs"></div>
             <div class="flags" id="flags"></div>
           </section>
@@ -75,6 +83,12 @@
               <span class="mono dim">follow</span>
               <input id="mem-addr" class="mono" placeholder="address / expression" spellcheck="false" autocomplete="off" />
               <span class="mono head-sub" id="mem-follow-info"></span>
+            </div>
+            <div class="memory-tools">
+              <label>Bytes/row <select id="memory-width"><option>16</option><option>8</option></select></label>
+              <button class="mini" id="snapshot-memory">Snapshot bytes + strings</button>
+              <select id="memory-baseline" aria-label="Memory snapshot baseline"></select>
+              <button class="mini" id="compare-memory">Compare</button>
             </div>
             <div class="hexview scroll" id="memory" data-pane="memory"></div>
             <div class="hexview scroll hidden" id="stack" data-pane="stack"></div>
@@ -97,6 +111,8 @@
             <div class="tab" data-bottab="modules">Modules</div>
             <div class="tab" data-bottab="strings">Strings</div>
             <div class="tab" data-bottab="patches">Patches</div>
+            <div class="tab" data-bottab="analysis">Events</div>
+            <div class="tab" data-bottab="regions">Memory Map</div>
             <div class="tab" data-bottab="trace">Trace <span class="badge" id="trace-badge">0</span></div>
           </div>
           <div class="tabbody">
@@ -106,8 +122,15 @@
             <div class="table-wrap scroll hidden" id="tb-modules" data-pane="modules"><table class="grid" id="mod-table"></table></div>
             <div class="table-wrap scroll hidden" id="tb-strings" data-pane="strings"><table class="grid" id="str-table"></table></div>
             <div class="table-wrap scroll hidden" id="tb-patches" data-pane="patches"><table class="grid" id="patch-table"></table></div>
+            <div class="table-wrap scroll hidden" id="tb-analysis"><table class="grid" id="analysis-table"></table></div>
+            <div class="trace-wrap hidden" id="tb-regions">
+              <div class="trace-toolbar"><button class="mini" id="refresh-regions">Refresh map</button><button class="mini" id="monitor-memory">Track executable changes</button><button class="mini" id="disarm-guard">Disarm execution guard</button></div>
+              <div class="m-hint" id="memory-coverage">Select a region to inspect it. Execution guards temporarily remove execute permission.</div>
+              <div class="table-wrap scroll"><table class="grid" id="regions-table"></table></div>
+            </div>
             <div class="trace-wrap hidden" id="tb-trace" data-pane="trace">
               <div class="trace-toolbar">
+                <button class="mini" id="configure-trace">Configure</button>
                 <span class="mono head-sub" id="trace-info">tracer off</span>
                 <input id="trace-search" class="mono" spellcheck="false" autocomplete="off" placeholder="Filter calls / caller / PID" />
                 <span class="tt-spacer"></span>

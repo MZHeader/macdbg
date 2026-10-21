@@ -58,6 +58,19 @@ body {
 .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, monospace; }
 .dim { color: var(--text-dim); }
 .hidden { display: none !important; }
+.analysis-strip { display:flex; align-items:center; gap:10px; min-height:30px; padding:0 10px; background:var(--panel); border-bottom:1px solid var(--border); font-size:12px; }
+#stop-explanation { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.head-spacer { flex:1; }
+.pinned-regs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); padding:4px 8px; border-bottom:1px solid var(--border); font-family:"SF Mono",Menlo,monospace; font-size:12px; }
+.regs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-content:start; column-gap:12px; }
+.rrow { overflow:hidden; }
+.r-annot { overflow:hidden; text-overflow:ellipsis; }
+.memory-tools { display:flex; align-items:center; flex-wrap:wrap; gap:6px; padding:4px 8px; border-bottom:1px solid var(--border); font-size:11px; }
+.memory-tools select { max-width:170px; }
+select { background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:3px; }
+.toggle-row.pending { opacity:.55; cursor:wait; }
+#memory-coverage { padding:4px 8px; font-size:11px; }
+#regions-table button { margin:2px; }
 
 /* Text selection: allow inside data panes (⌘C copies), keep chrome unselectable. */
 .disasm, .regs, .hexview, .console-log, .trace-wrap,
@@ -505,3 +518,6 @@ button:disabled { opacity: .35; cursor: default; }
 .address-choice { display: block; width: 100%; text-align: left; margin: 6px 0; }
 #trace-search { min-width: 100px; width: 170px; background: transparent; border: 1px solid #363c47; color: inherit; padding: 3px 6px; }
 #trace-window { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.region-name { display:inline-block; max-width:180px; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; }
+.trace-phase { color:var(--text-dim); font-size:10px; margin-right:5px; }

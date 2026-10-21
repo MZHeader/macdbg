@@ -4,6 +4,42 @@ import re
 import subprocess
 
 
+def restore_breakpoint(debugger, stored):
+    """Use LLDB's logical resolver, retaining pending/multiple/module locations."""
+    import json
+    import tempfile
+    import lldb
+    target = debugger.target
+    before = {bp.GetID() for bp in target.breakpoint_iter()}
+    try:
+        if stored.specification:
+            # LLDB's format includes module/file addresses, resolver and filters.
+            # Do not collapse a pending symbol or regex into its first location.
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as file:
+                json.dump([stored.specification], file)
+                file.flush()
+                restored = lldb.SBBreakpointList(target)
+                error = target.BreakpointsCreateFromFile(lldb.SBFileSpec(file.name), restored)
+            if error.Fail() or restored.GetSize() != 1:
+                raise RuntimeError('cannot restore breakpoint: ' + (error.GetCString() or 'invalid resolver'))
+            bp = restored.GetBreakpointAtIndex(0)
+        elif stored.hardware:
+            bp = debugger.create_hardware_breakpoint_by_address(stored.addr)
+        else:
+            bp = target.BreakpointCreateByAddress(stored.addr)
+        if not bp.IsValid() or bp.IsHardware() != stored.hardware:
+            raise RuntimeError('restored breakpoint backing does not match saved hardware policy')
+        if stored.hardware:
+            validate_hardware_capacity(target)
+            debugger.hardware_bp_ids.add(bp.GetID())
+        return bp
+    except Exception:
+        for bp in list(target.breakpoint_iter()):
+            if bp.GetID() not in before:
+                debugger.delete_breakpoint(bp.GetID())
+        raise
+
+
 def remember_hardware_return(debugger, bp_id):
     """Remember only an owned, sole hardware return stop before its deletion."""
     import lldb
@@ -140,7 +176,9 @@ def hardware_breakpoint_capacity():
                        "local ARM64 hardware breakpoint support is required")
 
 
-def validate_hardware_capacity(target, reserve=0):
+def hardware_usage(target):
+    if not target or not target.IsValid():
+        return 0
     addresses = set()
     for i in range(target.GetNumBreakpoints()):
         bp = target.GetBreakpointAtIndex(i)
@@ -148,9 +186,13 @@ def validate_hardware_capacity(target, reserve=0):
             continue
         for j in range(bp.GetNumLocations()):
             location = bp.GetLocationAtIndex(j)
-            if location.IsEnabled():
+            if location.IsEnabled() and location.IsResolved():
                 addresses.add(location.GetLoadAddress())
-    requested = len(addresses) + reserve
+    return len(addresses)
+
+
+def validate_hardware_capacity(target, reserve=0):
+    requested = hardware_usage(target) + reserve
     if requested and requested > hardware_breakpoint_capacity():
         raise RuntimeError(
             "hardware breakpoint allocation failed: {} sites exceed {} slots; "

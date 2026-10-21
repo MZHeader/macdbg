@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import struct
 import time
@@ -8,10 +9,14 @@ from typing import Dict, List, Optional, Tuple
 
 import lldb
 
-from .anti_analysis import AnalysisCloak, TOOL_MARKERS, contains_marker
+from .anti_analysis import AnalysisCloak, TOOL_MARKERS, contains_marker, DEFAULT_IDENTITY_PROFILE
 from .timing import TimingDefense
 from .auto_clock import AutomaticClock
 from .script_exec import ScriptExec, OSA_CALLS
+from .self_trap import SelfTrapForwarder
+from .entry_plan import EntryPlan
+from .trace_log import TraceLog
+from .analysis_memory import MemoryAnalysis
 from .state import BinaryState, StoredBP, Patch, load_for, STATE_DIR
 
 
@@ -72,6 +77,45 @@ class Debugger:
         self._step_plan_depth = None
         self._step_cloak_messages = []
         self._step_cloak_handled_stop = None
+        self.self_trap = SelfTrapForwarder(self)
+        self.direct_syscall_requested = False
+        self.entry_plan = EntryPlan(self)
+        self.analysis_events = TraceLog(lambda: self._dumps_dir(), capacity=500, capacity_bytes=2*1024*1024)
+        self._recorded_stop = None
+        self.defense_hits = {}
+        self.memory_analysis = MemoryAnalysis(self)
+
+    def record_event(self, category, message, **details):
+        if not hasattr(self, 'analysis_events'):
+            return None
+        if category == 'DEFENSE' and details.get('defense'):
+            name = details['defense']
+            self.defense_hits[name] = self.defense_hits.get(name,0)+1
+        process = self.process
+        if process and process.IsValid():
+            details.setdefault('pid', process.GetProcessID())
+            if process.GetState() == lldb.eStateStopped:
+                thread = process.GetSelectedThread()
+                details.setdefault('tid', thread.GetThreadID())
+                details.setdefault('pc', thread.GetFrameAtIndex(0).GetPC())
+        return self.analysis_events.append(category, message, **details)
+
+    def record_visible_stop(self):
+        if not self.process or self.process.GetState() != lldb.eStateStopped:
+            return
+        key = (self.process.GetProcessID(), self.process.GetStopID())
+        if key != self._recorded_stop:
+            from .session_controller import describe_stop
+            self._recorded_stop = key
+            stop = describe_stop(self)
+            self.record_event('STOP', stop['text'], **{k:v for k,v in stop.items() if k != 'text'})
+
+    def continue_to_entry(self):
+        self.require_decision_resolved()
+        if not self.is_stopped_before_initializers():
+            raise RuntimeError('Continue to entry is available at the initial loader stop')
+        self.entry_plan.arm()
+        self.cont()
 
     def read_output(self, max_bytes: int = 4096) -> str:
         try:
@@ -95,6 +139,12 @@ class Debugger:
     def _run_execution(self, action):
         """One accounting boundary for LLDB continue and thread-plan resumes."""
         self.require_decision_resolved()
+        if self.self_trap.error:
+            raise RuntimeError(self.self_trap.error)
+        if self.entry_plan.error:
+            raise RuntimeError(self.entry_plan.error)
+        if self.entry_plan.queued and self.is_stopped_before_initializers():
+            self.entry_plan.arm()
         self.script_exec.payloads.apply_stop()
         self.script_exec.require_ready()
         clock = self.auto_clock
@@ -137,6 +187,8 @@ class Debugger:
         except Exception:
             self.state = None
         self.timing.rules = self.state.timing_rules if self.state else []
+        if self.state and self.state.identity_profile:
+            self.analysis_cloak.configure_identity(self.state.identity_profile)
         return self.target
 
     def _dispose_target(self) -> None:
@@ -146,6 +198,12 @@ class Debugger:
         only within their original SBTarget. A replacement starts with all
         target-owned defenses off and can opt in again at its own entry stop.
         """
+        self.entry_plan.clear()
+        self.memory_analysis.reset()
+        self.analysis_events.reset()
+        self.defense_hits.clear()
+        self.self_trap.reset()
+        self.direct_syscall_requested = False
         self.script_exec.reset()
         self.cancel_user_step()
         self.auto_clock.disable()
@@ -154,6 +212,7 @@ class Debugger:
         self.timing.rules = []
         self.timing.hits.clear()
         self.analysis_cloak.disable()
+        self.analysis_cloak.identity_profile = dict(DEFAULT_IDENTITY_PROFILE)
         self._clear_flag_scrub_returns()
         if self.process and self.process.IsValid():
             if self._attached:
@@ -187,21 +246,25 @@ class Debugger:
     def restore_stored_breakpoints(self) -> int:
         if not self.state or not self.target or not self.target.IsValid():
             return 0
-        n = 0
-        for sbp in self.state.breakpoints:
-            bp = self.target.BreakpointCreateByAddress(sbp.addr)
-            if not bp.IsValid():
-                continue
-            if sbp.condition:
-                bp.SetCondition(sbp.condition)
-            if sbp.commands:
-                sl = lldb.SBStringList()
-                for line in sbp.commands:
-                    sl.AppendString(line)
-                bp.SetCommandLineCommands(sl)
-            bp.SetEnabled(sbp.enabled)
-            n += 1
-        return n
+        from .breakpoints import restore_breakpoint
+        restored = []
+        try:
+            for sbp in self.state.breakpoints:
+                bp = restore_breakpoint(self, sbp)
+                restored.append(bp.GetID())
+                if sbp.condition:
+                    bp.SetCondition(sbp.condition)
+                if sbp.commands:
+                    sl = lldb.SBStringList()
+                    for line in sbp.commands:
+                        sl.AppendString(line)
+                    bp.SetCommandLineCommands(sl)
+                bp.SetEnabled(sbp.enabled)
+        except Exception:
+            for bid in restored:
+                self.delete_breakpoint(bid)
+            raise
+        return len(restored)
 
     def snapshot_user_breakpoints(self, exclude_ids: set) -> List[StoredBP]:
         out: List[StoredBP] = []
@@ -211,12 +274,25 @@ class Debugger:
             bp = self.target.GetBreakpointAtIndex(i)
             if bp.GetID() in exclude_ids:
                 continue
-            if bp.GetNumLocations() == 0:
-                continue
+            stream = lldb.SBStream()
+            specification = None
+            serialized = bp.SerializeToStructuredData()
+            if serialized.IsValid() and serialized.GetAsJSON(stream).Success():
+                specification = json.loads(stream.GetData())
             loc = bp.GetLocationAtIndex(0)
-            addr = loc.GetLoadAddress()
-            if addr == lldb.LLDB_INVALID_ADDRESS or addr == 0:
-                continue
+            addr = loc.GetLoadAddress() if loc.IsValid() else 0
+            if addr == lldb.LLDB_INVALID_ADDRESS:
+                addr = 0
+            if specification and loc.IsValid():
+                resolver = specification['Breakpoint'].get('BKPTResolver', {})
+                if resolver.get('Type') == 'Address':
+                    sbaddr = loc.GetAddress()
+                    module = sbaddr.GetModule()
+                    # Apple's LLDB can serialize a section-relative offset but
+                    # restore it as a file address, leaving the site unresolved.
+                    if module.IsValid():
+                        resolver['Options']['AddressOffset'] = sbaddr.GetFileAddress()
+                        resolver['Options']['ModuleName'] = str(module.GetFileSpec())
             symbol = ""
             try:
                 symbol = loc.GetAddress().GetSymbol().GetName() or ""
@@ -231,6 +307,8 @@ class Debugger:
                 condition=bp.GetCondition() or "",
                 commands=commands,
                 enabled=bp.IsEnabled(),
+                hardware=bp.IsHardware(),
+                specification=specification,
             ))
         return out
 
@@ -302,6 +380,10 @@ class Debugger:
         ]
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
+        memory_requested = self.memory_analysis.enabled
+        self.memory_analysis.reset()
+        self.entry_plan.clear(keep_queue=True)
+        self.self_trap.reset()
         self._loader_stop_id = None
         self.script_exec.reset(keep_hooks=True)
         self._retired_hardware_return = None
@@ -309,6 +391,9 @@ class Debugger:
         self._suppress_duplicate_retry = False
         self.cancel_user_step()
         automatic_requested = self.auto_clock.enabled
+        if self.launch_stop == 'loader' and self.analysis_cloak.enabled:
+            self.analysis_cloak.disable()
+            self.entry_plan.queued.add('analysis_cloak')
         self.auto_clock.disable()
         self.auto_clock.hits.clear()
         timing_requested = self.timing.enabled
@@ -359,6 +444,8 @@ class Debugger:
         finally:
             self.dbg.SetAsync(was_async)
         self._hook_listener(self.process)
+        if memory_requested:
+            self.memory_analysis.enable()
         if timing_requested:
             ok, message = self.timing.enable()
             if not ok:
@@ -366,7 +453,9 @@ class Debugger:
                 # resume with a previously armed defense missing.
                 self.timing.enabled = True
                 raise RuntimeError(message)
-        if automatic_requested:
+        if automatic_requested and self.launch_stop == 'loader':
+            self.entry_plan.queued.add('auto_clock')
+        elif automatic_requested:
             ok, message = self.auto_clock.enable()
             if not ok:
                 self.auto_clock.enabled = True
@@ -510,6 +599,7 @@ class Debugger:
         return False
 
     def destroy(self) -> None:
+        self.memory_analysis.disarm_guard()
         if self.process and self.process.IsValid():
             if self._attached:
                 self.process.Detach()
@@ -1275,6 +1365,8 @@ class Debugger:
         return True, "self-trap forwarder armed: brk #0 routed to the target's SIGTRAP handler"
 
     def disable_anti_sigtrap(self) -> Tuple[bool, str]:
+        if self.self_trap.active:
+            return False, "finish the in-flight signal handler or restart before disabling forwarding"
         self.anti_sigtrap_on = False
         return True, "self-trap forwarder disabled"
 
@@ -1299,46 +1391,7 @@ class Debugger:
         return int(m.group(1), 16)
 
     def handle_self_trap(self, thread) -> Optional[str]:
-        """If the target hit a brk it planted on itself (EXC_BREAKPOINT, not one
-        of our breakpoints) and anti_sigtrap is on, run its own SIGTRAP handler
-        the way the kernel would when undebugged. Returns a message if handled,
-        None otherwise (so the caller surfaces the stop normally)."""
-        if not self.anti_sigtrap_on or not self.process:
-            return None
-        if not thread or not thread.IsValid():
-            return None
-        if thread.GetStopReason() != lldb.eStopReasonException:
-            return None
-        frame = thread.GetFrameAtIndex(0)
-        if not frame or not frame.IsValid():
-            return None
-        pc = frame.GetPC()
-        module = frame.GetModule()
-        path = str(module.GetFileSpec()) if module and module.IsValid() else ''
-        if path.startswith(('/System/Library/', '/usr/lib/')):
-            return None
-        # Runtime assertions use other BRK immediates. They are faults, not
-        # probes to forward or skip.
-        if self.read_memory(pc, 4) != b'\x00\x00\x20\xd4':
-            return None
-        insns = self.target.ReadInstructions(lldb.SBAddress(pc, self.target), 1)
-        if insns.GetSize() < 1:
-            return None
-        mn = (insns.GetInstructionAtIndex(0).GetMnemonic(self.target) or "").lower()
-        if mn != "brk":
-            return None
-        SIGTRAP = 5
-        handler = self._read_signal_handler(SIGTRAP)
-        ret = lldb.SBCommandReturnObject()
-        if handler is None or handler in (0, 1):
-            return None
-        # Deliver: x0 = signo, lr = after the brk (so a handler that returns
-        # normally resumes past it), pc = the handler.
-        self.ci.HandleCommand("register write x0 {}".format(SIGTRAP), ret, False)
-        self.ci.HandleCommand("register write lr {:#x}".format(pc + 4), ret, False)
-        self.ci.HandleCommand("register write pc {:#x}".format(handler), ret, False)
-        self.cont()
-        return "self-trap: ran target SIGTRAP handler {:#x} for brk at {:#x}".format(handler, pc)
+        return self.self_trap.forward(thread)
 
     def enable_anti_mach_ports(self) -> Tuple[bool, str]:
         if not self.target or not self.target.IsValid():
@@ -1541,8 +1594,12 @@ class Debugger:
                 if err.Success() and data:
                     flag = int.from_bytes(data, "little")
                     if flag & self._P_TRACED:
-                        self.process.WriteMemory(
+                        written = self.process.WriteMemory(
                             addr, (flag & ~self._P_TRACED).to_bytes(4, "little"), err)
+                        if err.Fail() or written != 4:
+                            raise RuntimeError('cannot scrub P_TRACED; target remains stopped')
+                        self.record_event('DEFENSE','scrubbed P_TRACED',defense='flag_scrubs',
+                            original=hex(flag),replacement=hex(flag & ~self._P_TRACED),address=hex(addr))
                         msgs.append("scrubbed P_TRACED from sysctl(KERN_PROC) result")
             if self._scrub_parent:
                 m = self._scrub_debugger_name(buf, oldlenp)
@@ -1556,7 +1613,11 @@ class Debugger:
             flag = int.from_bytes(data, "little")
             if not (flag & self._CS_DEBUGGED):
                 return ""
-            self.process.WriteMemory(buf, (flag & ~self._CS_DEBUGGED).to_bytes(4, "little"), err)
+            written = self.process.WriteMemory(buf, (flag & ~self._CS_DEBUGGED).to_bytes(4, "little"), err)
+            if err.Fail() or written != 4:
+                raise RuntimeError('cannot scrub CS_DEBUGGED; target remains stopped')
+            self.record_event('DEFENSE','scrubbed CS_DEBUGGED',defense='flag_scrubs',
+                original=hex(flag),replacement=hex(flag & ~self._CS_DEBUGGED),address=hex(buf))
             return "scrubbed CS_DEBUGGED from csops(CS_OPS_STATUS) result"
         return None
 
@@ -1736,15 +1797,46 @@ class Debugger:
                 if bp.IsValid():
                     self.direct_syscall_bp_ids.append(bp.GetID())
                     found.append(svc_addr)
+        self.direct_syscall_requested = True
         return True, "direct-syscall scan: {} svc #0x80 site(s) armed in target __text".format(len(found))
 
     def disable_direct_syscall_scan(self) -> Tuple[bool, str]:
+        self.direct_syscall_requested = False
         if not self.target or not self.direct_syscall_bp_ids:
             return True, "already disabled"
         for bp_id in self.direct_syscall_bp_ids:
             self.delete_breakpoint(bp_id)
         self.direct_syscall_bp_ids = []
         return True, "direct-syscall scan disabled"
+
+    def scan_live_syscalls(self, address, size):
+        """Explicit, bounded scan of unpacked code or a newly loaded image."""
+        if address % 4 or not 0 < size <= 1024*1024:
+            raise ValueError('select an aligned executable range of at most 1 MiB')
+        info = lldb.SBMemoryRegionInfo()
+        error = self.process.GetMemoryRegionInfo(address,info)
+        if error.Fail() or not info.IsExecutable() or address + size > info.GetRegionEnd():
+            raise ValueError('the selected range must be inside one executable memory region')
+        data = self.read_memory(address,size)
+        if len(data) != size:
+            raise ValueError('could not read the complete selected code range')
+        existing = {self.target.FindBreakpointByID(bid).GetLocationAtIndex(0).GetLoadAddress()
+                    for bid in (self.direct_syscall_bp_ids or [])}
+        sites = [address+i for i in range(0,len(data)-3,4)
+                 if data[i:i+4] == b'\x01\x10\x00\xd4' and address+i not in existing]
+        created = []
+        try:
+            for site in sites:
+                created.append(self.create_hardware_breakpoint_by_address(site).GetID())
+        except Exception:
+            for bid in created:
+                self.delete_breakpoint(bid)
+            raise
+        self.direct_syscall_bp_ids = list(self.direct_syscall_bp_ids or []) + created
+        self.direct_syscall_requested = True
+        self.record_event('DEFENSE','scanned live executable memory for inline syscalls',
+            pc=address,bytes_scanned=size,sites=len(created),defense='deny_attach')
+        return {'bytes_scanned':size,'sites':len(created),'scope':'selected live region'}
 
     def handle_direct_syscall_hit(self, bp_id: int) -> Optional[str]:
         if not self.direct_syscall_bp_ids or bp_id not in self.direct_syscall_bp_ids:
@@ -1764,6 +1856,7 @@ class Debugger:
         if x16 == 26 and x0 == 31:
             self.ci.HandleCommand("register write x0 0", ret, False)
             self.ci.HandleCommand("register write pc {:#x}".format(pc + 4), ret, False)
+            self.record_event('DEFENSE','blocked inline PT_DENY_ATTACH',defense='deny_attach',original={'x16':26,'x0':31},replacement={'x0':0,'pc':hex(pc+4)},pc=pc)
             self.cont()
             return "blocked direct ptrace(PT_DENY_ATTACH) svc at {:#x}".format(pc)
         self.cont()
@@ -2185,6 +2278,7 @@ class Debugger:
             return "ptrace(op={}) allowed through".format(req)
         ret = lldb.SBCommandReturnObject()
         self.ci.HandleCommand("thread return 0", ret, False)
+        self.record_event('DEFENSE','blocked PT_DENY_ATTACH',defense='deny_attach',original={'request':req},replacement={'return':0})
         self.cont()
         return "blocked ptrace(PT_DENY_ATTACH) — returned 0 without syscall"
 

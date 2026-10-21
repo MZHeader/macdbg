@@ -95,7 +95,8 @@ class AgentSession:
         self.dbg = Debugger()
         self.dbg.launch_stop = stop_at
         self.tracer = Tracer()
-        self.dbg.extra_hardware_bp_ids = lambda: self.tracer.hardware_bp_ids
+        self.tracer.debugger = self.dbg
+        self.dbg.extra_hardware_bp_ids = lambda: self.tracer.hardware_bp_ids | self.dbg.memory_analysis.returns.ids()
         self.trace_log = TraceLog(lambda: self.dbg._dumps_dir())
         self._trace_count = 0
         self._console: List[str] = []
@@ -209,6 +210,8 @@ class AgentSession:
                      "a {} decision is pending on bp #{}; call decide_{} first "
                      "(or inspect it via 'status')".format(
                          self._pending["kind"], self._pending["bp_id"], self._pending["kind"])}
+        if cmd == "continue_to_entry":
+            return self._pump(resume=self.dbg.continue_to_entry, max_wait=timeout, poll_cb=poll_cb)
         if cmd == "continue":
             return self._pump(resume=self.dbg.cont, max_wait=timeout, poll_cb=poll_cb)
         if cmd == "step_in":
@@ -230,6 +233,9 @@ class AgentSession:
         raise SessionError("unknown resume command {!r}".format(cmd))
 
     def _dispatch_plain(self, cmd: str, args: dict) -> dict:
+        from ..core.session_controller import ANALYSIS_COMMANDS, analysis_command
+        if cmd in ANALYSIS_COMMANDS:
+            return {'ok':True, **analysis_command(self.dbg,self.tracer,cmd,args)}
         if cmd == "clock_status":
             return {"ok": True, **self.dbg.auto_clock.status()}
         if cmd == "timing_rule_add":
@@ -376,7 +382,9 @@ class AgentSession:
             return self.cmd_dump_exec()
         if cmd == "tracer_enable":
             was_enabled = self.tracer.enabled
-            self.tracer.hardware = bool(args.get("hardware", False))
+            if not was_enabled and any(key in args for key in ('hooks','preset','hardware','returns')):
+                self.tracer.configure(hooks=args.get("hooks"), preset=args.get("preset"),
+                    hardware=args.get("hardware", False), returns=args.get("returns", False))
             total, resolved = self.tracer.enable(self.dbg.target, ci=self.dbg.ci)
             return {"ok": True, "total": total, "resolved": resolved, "already_enabled": was_enabled}
         if cmd == "tracer_disable":
@@ -486,6 +494,8 @@ class AgentSession:
             "pc": self.dbg.pc(),
             "pending_decision": self._pending,
             "tracer_enabled": self.tracer.enabled,
+            "queued_defenses": sorted(d.entry_plan.queued),
+            "identity_profile": dict(d.analysis_cloak.identity_profile),
             "trace_hit_count": self._trace_count,
             "defenses": {
                 "auto_clock": automatic["enabled"],
@@ -506,7 +516,7 @@ class AgentSession:
                 "anti_csops": bool(d.anti_csops_bp_id),
                 "anti_sigtrap": bool(d.anti_sigtrap_on),
                 "anti_mach_ports": bool(d.anti_mach_bp_id),
-                "direct_syscall": bool(d.direct_syscall_bp_ids),
+                "direct_syscall": d.direct_syscall_requested,
                 "fork_identity": d.fork_mode == "identity",
                 "exec_sandbox": bool(d.exec_bp_ids),
             },
@@ -727,6 +737,8 @@ class AgentSession:
         self.tracer.network.reset()
         if p and p.IsValid() and p.GetState() not in (lldb.eStateExited, lldb.eStateInvalid):
             p.Kill()
+        if self.tracer.returns:
+            self.tracer.returns.clear()
         hidden = self._hidden_bp_ids() - self.dbg.script_exec.breakpoint_ids()
         for bid in hidden:
             self.dbg.set_bp_enabled(bid, False)
@@ -869,17 +881,14 @@ class AgentSession:
                     continue
                 self._last_handled_stop = stop_key
                 self.dbg.select_stopped_thread()
-                self.dbg.auto_clock.observe_stop(observed_ns)
-                from macdbg.core.breakpoints import consume_hardware_debugger_duplicate
-                if consume_hardware_debugger_duplicate(self.dbg):
-                    self._log('[debugger] retried duplicate hardware debugger stop')
+                from macdbg.core.session_controller import prepare_stop
+                preparation = prepare_stop(self.dbg, observed_ns, self._log)
+                if preparation == 'retry':
                     self.dbg.cont()
                     continue
-                payload_only = self.dbg.script_exec.payloads.apply_stop()
-                clock_only = self.dbg.auto_clock.apply_stop()
-                messages, timing_only = self.dbg.timing.apply_stop()
-                for message in messages:
-                    self._log(message)
+                if preparation == 'visible':
+                    return {"ok": True, "event": "stop", "stop": self._describe_stop(),
+                            "console": self._drain_console()}
                 cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
                     self.tracer.hardware_bp_ids)
                 if not cloak_ok:
@@ -915,7 +924,7 @@ class AgentSession:
                     # auto-continue handlers below.
                     return {"ok": True, "event": "stop", "stop": self._describe_stop(),
                             "console": self._drain_console()}
-                if timing_only or clock_only or payload_only:
+                if preparation == 'internal':
                     self.dbg.cont()
                     hit = _deadline_hit()
                     if hit is not None:
@@ -1018,69 +1027,15 @@ class AgentSession:
             self._trace_count = self.trace_log.append(hit.category, hit.call, **hit.details)["n"]
 
     def _try_auto_anti_debug(self) -> bool:
-        process = self.dbg.process
-        if not process or not process.IsValid():
-            return False
-        thread = process.GetSelectedThread()
-        if not thread or not thread.IsValid():
-            return False
-        # A self-trap (brk #0) surfaces as an exception, not a breakpoint, so
-        # check it before the breakpoint-only path below.
-        trap_msg = self.dbg.handle_self_trap(thread)
-        if trap_msg is not None:
-            self._log("[anti-debug] " + trap_msg)
-            return True
-        if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
-            return False
-        bp_ids = self._stop_bp_ids(thread)
-        if not bp_ids:
-            return False
-        for bp_id in bp_ids:
-            msg = self.dbg.handle_analysis_cloak_hit(bp_id)
-            if msg is not None:
-                if msg:
-                    self._log("[anti-analysis] " + msg)
-                cloak_ok, _cloak_error = (
-                    self.dbg.analysis_cloak.validate_resume())
-                if not cloak_ok:
-                    return False
-                return True
-        for handler in (self.dbg.handle_anti_ptrace_hit,
-                        self.dbg.handle_flag_scrub_hit,
-                        self.dbg.handle_syscall_hit,
-                        self.dbg.handle_anti_mach_hit,
-                        self.dbg.handle_direct_syscall_hit,
-                        self.dbg.handle_fork_hit,
-                        self.dbg.handle_setsid_hit,
-                        self.dbg.handle_exec_hit):
-            for bp_id in bp_ids:
-                msg = handler(bp_id)
-                if msg is not None:
-                    if msg:  # "" == handled silently (a passed-through sysctl)
-                        self._log("[anti-debug] " + msg)
-                    return True
-        return False
+        from ..core.session_controller import handle_defenses
+        return handle_defenses(self.dbg, self._log) == 'handled'
+
+    def _add_trace(self, category, call, details=None):
+        self._trace_count = self.trace_log.append(category, call, **(details or {}))['n']
 
     def _log_trace_hit(self) -> bool:
-        """Record the current stop in the trace log if it is a tracer
-        breakpoint. Returns True if it was. Does not resume, so it is safe to
-        call while a user step is completing."""
-        process = self.dbg.process
-        if not process or not process.IsValid():
-            return False
-        thread = process.GetSelectedThread()
-        if not thread or not thread.IsValid():
-            return False
-        if thread.GetStopReason() != lldb.eStopReasonBreakpoint:
-            return False
-        bp_id = next((b for b in self._stop_bp_ids(thread) if self.tracer.is_trace_bp(b)), None)
-        if bp_id is None:
-            return False
-        frame = thread.GetFrameAtIndex(0)
-        hit = self.tracer.hit_from(frame, process, bp_id=bp_id)
-        if hit is not None:
-            self._trace_count = self.trace_log.append(hit.category, hit.call, **hit.details)["n"]
-        return True
+        from macdbg.core.session_controller import log_trace_stop
+        return log_trace_stop(self.dbg, self.tracer, self._add_trace)
 
     def _try_trace_hit(self) -> bool:
         if not self._log_trace_hit():
@@ -1123,7 +1078,11 @@ class AgentSession:
         return None
 
     def _hidden_bp_ids(self) -> set:
-        ids = set(self.tracer._bp_to_name)
+        ids = self.tracer.hidden_ids()
+        ids.update(self.dbg.memory_analysis.hidden_ids())
+        if getattr(self.dbg, 'entry_plan', None) and self.dbg.entry_plan.bp:
+            ids.add(self.dbg.entry_plan.bp)
+        ids.update(self.dbg.self_trap.hidden_ids())
         ids.update(self.dbg.auto_clock.hidden_bp_ids())
         ids.update(self.dbg.timing.hidden_bp_ids())
         ids.update(self.dbg.analysis_cloak.hidden_bp_ids())
@@ -1160,53 +1119,9 @@ class AgentSession:
         return {"text": text, "code": code, "description": desc}
 
     def _describe_stop(self) -> dict:
-        process = self.dbg.process
-        if not process or not process.IsValid():
-            return {"text": "[stopped]"}
-        thread = process.GetSelectedThread()
-        if not thread or not thread.IsValid():
-            return {"text": "[stopped]"}
-        reason = thread.GetStopReason()
-        pc = self.dbg.pc() or 0
-        frame = thread.GetFrameAtIndex(0)
-        sym = ""
-        if frame and frame.IsValid():
-            sym = frame.GetFunctionName() or (
-                frame.GetSymbol().GetName() if frame.GetSymbol().IsValid() else "") or ""
-        info = {"pc": pc, "function": sym, "thread_id": thread.GetThreadID(), "reason_code": reason}
-        where = " in {}".format(sym) if sym else ""
-        if reason == lldb.eStopReasonBreakpoint and thread.GetStopReasonDataCount() >= 1:
-            bp_id = thread.GetStopReasonDataAtIndex(0)
-            loc_id = thread.GetStopReasonDataAtIndex(1) if thread.GetStopReasonDataCount() >= 2 else 0
-            bp = self.dbg.target.FindBreakpointByID(bp_id) if self.dbg.target else None
-            cond = (bp.GetCondition() if bp and bp.IsValid() else None) or ""
-            cond_txt = " (cond: {})".format(cond) if cond and cond.strip() not in ("", "1") else ""
-            info.update(reason="breakpoint", bp_id=bp_id, loc_id=loc_id,
-                        text="[stop] breakpoint #{}.{} at {:#x}{}{}".format(bp_id, loc_id, pc, where, cond_txt))
-            return info
-        if reason == lldb.eStopReasonWatchpoint and thread.GetStopReasonDataCount() >= 1:
-            wp_id = thread.GetStopReasonDataAtIndex(0)
-            info.update(reason="watchpoint", wp_id=wp_id,
-                        text="[stop] watchpoint #{} at {:#x}{}".format(wp_id, pc, where))
-            return info
-        if reason == lldb.eStopReasonPlanComplete:
-            info.update(reason="step", text="[stop] step complete at {:#x}{}".format(pc, where))
-            return info
-        if reason == lldb.eStopReasonException:
-            desc = thread.GetStopDescription(256)
-            info.update(reason="exception", description=desc,
-                        text="[stop] exception at {:#x}{}: {}".format(pc, where, desc))
-            return info
-        if reason == lldb.eStopReasonSignal and thread.GetStopReasonDataCount() >= 1:
-            sig = thread.GetStopReasonDataAtIndex(0)
-            info.update(reason="signal", signal=sig,
-                        text="[stop] signal {} at {:#x}{}".format(sig, pc, where))
-            return info
-        if reason == lldb.eStopReasonTrace:
-            info.update(reason="trace", text="[stop] trace at {:#x}{}".format(pc, where))
-            return info
-        info.update(reason="other", text="[stop] at {:#x}{} (reason={})".format(pc, where, reason))
-        return info
+        from ..core.session_controller import describe_stop
+        self.dbg.record_visible_stop()
+        return describe_stop(self.dbg)
 
     # -- console buffer ------------------------------------------------
 
