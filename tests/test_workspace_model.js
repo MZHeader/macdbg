@@ -1,0 +1,23 @@
+'use strict';
+const assert = require('node:assert/strict');
+const model = require('../GUI/web/workspace-model.js');
+
+assert.deepEqual(model.parseHex('0x414243'), [65,66,67]);
+assert.deepEqual(model.parseHex('41 42 43'), [65,66,67]);
+assert.throws(()=>model.parseHex('123'));
+assert.throws(()=>model.parseHex('zz'));
+assert.equal(model.typed(Array(8).fill(255),'u64')[0].value,'18446744073709551615');
+assert.equal(model.typed([0,0,128,63],'f32')[0].value,'1');
+assert.equal(model.typed([65,0],'utf16')[0].value,'A');
+assert.deepEqual(model.encodeUtf16('🙂'),[0x3d,0xd8,0x42,0xde]);
+assert.equal(model.typed(model.encodeUtf16('🙂'),'utf16')[0].value,'🙂');
+assert.deepEqual(model.range(99,110,100,8),{addr:100,size:8});
+const dump={history:[],index:-1,addr:null};
+[1,2,3].forEach(a=>model.historyPush(dump,a));
+dump.index=1;model.historyPush(dump,4);
+assert.deepEqual(dump.history,[1,2,4]);
+assert.equal(dump.addr,4);
+assert(model.matches({key:'p',metaKey:true},'Mod+P'));
+assert(model.matches({key:'F9',ctrlKey:true},model.X64_KEYS.step_out));
+assert(!model.matches({key:'F9'},model.X64_KEYS.step_out));
+console.log('Workspace model tests passed');

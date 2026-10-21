@@ -27,6 +27,7 @@ from macdbg.core.tracer import Tracer
 from macdbg.core.trace_log import TraceLog
 
 from . import snapshot
+from .workspace import Workspace
 
 
 def _parse_bytes(s: str) -> Optional[bytes]:
@@ -98,6 +99,7 @@ class Engine:
         self._nav_index = -1
         self._defense_failures = {}
         self._active_defense_key = None
+        self.workspace = Workspace(self.dbg, self._hidden_bp_ids)
 
         self._output_stop = threading.Event()
         self._interpose_stop = threading.Event()
@@ -220,6 +222,9 @@ class Engine:
             self.dbg.create_target(program)
             self.dbg.launch(list(args))
             restored = self.dbg.restore_stored_breakpoints()
+            import shlex
+            self.workspace.preferences.remember({'path':program,'args_text':shlex.join(args),
+                'stop_at':self.dbg.launch_stop,'profile':getattr(self,'_launch_profile','manual')})
             self._console("launched {}".format(program))
             if self.dbg.state:
                 self._console("[state] sha={}… ({} bp, {} comment, {} bookmark, "
@@ -336,6 +341,8 @@ class Engine:
                  "has_process": bool(dbg.process and dbg.process.IsValid())}
         state["process_state"] = (lldb.SBDebugger.StateAsCString(dbg.process.GetState())
                                   if state["has_process"] else "none")
+        state['process_id'] = dbg.process.GetProcessID() if state['has_process'] else 0
+        state['stop_id'] = dbg.process.GetStopID() if state['has_process'] else 0
         from macdbg.core.session_controller import describe_stop
         dbg.record_visible_stop()
         state['stop'] = describe_stop(dbg) if state['process_state'] == 'stopped' else None
@@ -419,6 +426,10 @@ class Engine:
                             + [["live", "{:#x}".format(a), len(s), s]
                                for a, s in self._strings_live[:4000]])
         state['memory_width'] = self._memory_width
+        state['edit_history'] = self.workspace.history()
+        if state['process_state']=='stopped':
+            state['breakpoint_details'] = self.workspace.breakpoints()
+            state['instruction_info'] = self.workspace.code.info(pc) if pc else None
         state['navigation'] = {'back':self._nav_index > 0, 'forward':self._nav_index < len(self._nav_history)-1}
         state["trace_status"] = self._trace_status()
         return state
@@ -474,6 +485,8 @@ class Engine:
             self._resuming = False
         if e.state == lldb.eStateStopped:
             self.dbg.select_stopped_thread()
+            if hasattr(self,'workspace'):
+                self.workspace.code.observe_stop()
             try:
                 from macdbg.core.session_controller import prepare_stop
                 preparation = prepare_stop(self.dbg, e.observed_ns or None, self._console)
@@ -803,7 +816,10 @@ class Engine:
             self._resume_failed(error)
 
     def _c_step_in(self, a):
-        self._resume_action(self.dbg.step_in)
+        def action():
+            self.workspace.code.arm_observation()
+            return self.dbg.step_in()
+        self._resume_action(action)
 
     def _c_step_over(self, a):
         self._resume_action(self.dbg.step_over)
@@ -954,7 +970,15 @@ class Engine:
         from macdbg.core.session_controller import analysis_command
         action = a.get('action')
         result = analysis_command(self.dbg,self.tracer,action,{k:v for k,v in a.items() if k != 'action'})
-        self._emit_state()
+        if action not in ('memory_map','memory_compare','analysis_events'):
+            self._emit_state()
+        return result
+
+    def _c_workspace(self, a):
+        action = a.get('action','')
+        result = self.workspace.command(action,{k:v for k,v in a.items() if k!='action'})
+        if action not in ('preferences','symbols','references','instruction','graph','dump','breakpoints','edit_history','save_launch','remove_launch'):
+            self._emit_state()
         return result
 
     def _c_continue_entry(self, a):
@@ -974,10 +998,8 @@ class Engine:
         if addr is None or data is None:
             self._console("[mem] bad address or bytes", error=True)
             return
-        ok, msg = self.dbg.write_memory(addr, data)
-        self._console("[mem] " + msg)
-        if ok:
-            self._emit_state()
+        self.workspace.edit_memory(addr,data)
+        self._emit_state()
 
     def _c_write_reg(self, a):
         name = a.get("name", "")
@@ -986,10 +1008,8 @@ class Engine:
         except ValueError:
             self._console("[reg] bad value", error=True)
             return
-        ok, msg = self.dbg.write_register(name, v)
-        self._console("[reg] " + msg)
-        if ok:
-            self._emit_state()
+        self.workspace.edit_register(name,str(v))
+        self._emit_state()
 
     def _c_flip_flag(self, a):
         reg = a.get("reg", "")
@@ -1000,10 +1020,8 @@ class Engine:
         r = frame.FindRegister(reg)
         if not r.IsValid():
             return
-        ok, msg = self.dbg.write_register(reg, r.GetValueAsUnsigned() ^ (1 << bit))
-        self._console("[reg] " + msg)
-        if ok:
-            self._emit_state()
+        self.workspace.edit_register(reg,str(r.GetValueAsUnsigned() ^ (1 << bit)))
+        self._emit_state()
 
     def _c_comment(self, a):
         if not self.dbg.state:
@@ -1624,6 +1642,7 @@ class Engine:
         profile = a.get("profile", "manual")
         if profile not in ("manual", "intercept"):
             raise ValueError("unknown launch profile")
+        self._launch_profile = profile
         self.program, self.program_args, self.attach_pid = path, args, None
         self._launch(path, args)
         if profile == "intercept" and self.dbg.process and self.dbg.process.GetState() == lldb.eStateStopped:
@@ -1824,6 +1843,7 @@ class Engine:
 
 # ---- command + toggle tables (bound after class body) ------------------------
 Engine._COMMANDS = {
+    'workspace':Engine._c_workspace,
     'analysis':Engine._c_analysis, 'continue_entry':Engine._c_continue_entry,
     'navigate_history':Engine._c_navigate_history, 'view_options':Engine._c_view_options,
     "step_in": Engine._c_step_in, "step_over": Engine._c_step_over,
@@ -1852,7 +1872,7 @@ Engine._COMMANDS = {
     "trace_export": Engine._c_trace_export,
     "kill": Engine._c_kill,
 }
-Engine._SYNC = {"complete", "list_processes", "resolve_address", "trace_export", 'analysis', 'defense', 'view_options'}
+Engine._SYNC = {"complete", "list_processes", "resolve_address", "trace_export", 'analysis', 'defense', 'view_options', 'workspace', 'write_mem', 'write_reg'}
 Engine._DEFENSE_TOGGLES = {
     "auto_clock": Engine._t_auto_clock,
     "anti_timing": Engine._t_anti_timing,

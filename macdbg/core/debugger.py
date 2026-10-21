@@ -1153,9 +1153,13 @@ class Debugger:
             return
         for i, p in enumerate(self.state.patches):
             if p.addr == addr and len(p.new) == len(new):
-                self.state.patches[i] = Patch(addr=addr, orig=p.orig, new=new)
+                if new == p.orig:
+                    del self.state.patches[i]
+                else:
+                    self.state.patches[i] = Patch(addr=addr, orig=p.orig, new=new)
                 return
-        self.state.patches.append(Patch(addr=addr, orig=orig, new=new))
+        if orig != new:
+            self.state.patches.append(Patch(addr=addr, orig=orig, new=new))
 
     def revert_patch(self, index: int) -> Tuple[bool, str]:
         if not self.state or not (0 <= index < len(self.state.patches)):

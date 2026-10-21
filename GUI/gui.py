@@ -343,9 +343,9 @@ def _build_menu():
         ]),
         Menu("Breakpoints", [
             MenuAction("Toggle at PC", lambda: post("toggle_bp")),
-            MenuAction("Remove All", lambda: post("run_cmd", {"cmd": "breakpoint delete -f"})),
+            MenuAction("Remove All User Breakpoints", lambda: post("workspace", {"action": "breakpoints_clear"})),
         ]),
-        Menu("Trace", [
+        Menu("API Trace", [
             MenuAction("Toggle Tracer", lambda: post("trace_toggle")),
             MenuAction("Cycle Scope", lambda: post("trace_scope")),
             MenuAction("Clear", lambda: post("trace_clear")),
@@ -358,7 +358,11 @@ def _build_menu():
             MenuAction("Enable ALL Anti-Debug", lambda: post("defense", {"key": "all_anti"})),
         ]),
         Menu("View", [
-            MenuAction("Command Palette…", lambda: post("ui", {"action": "palette"})),
+            MenuAction("CPU", lambda: post("ui", {"action":"view","view":"cpu"})),
+            MenuAction("Graph", lambda: post("ui", {"action":"view","view":"graph"})),
+            MenuAction("Symbols", lambda: post("ui", {"action":"view","view":"symbols"})),
+            MenuAction("Actions…", lambda: post("ui", {"action": "palette"})),
+            MenuAction("LLDB Command Palette…", lambda: post("ui", {"action": "lldb_palette"})),
             MenuAction("Find in Memory…", lambda: post("ui", {"action": "find"})),
             MenuAction("Go to Address…", lambda: post("ui", {"action": "goto"})),
             MenuAction("Snap Disasm to PC", lambda: post("snap_pc")),

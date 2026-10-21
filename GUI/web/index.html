@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>macdbg</title>
-<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="styles.css" /><link rel="stylesheet" href="workspace.css" />
 </head>
 <body>
   <div id="app">
@@ -31,7 +31,7 @@
       </div>
       <span class="tb-sep"></span>
       <button class="tb tb-wide" data-act="defenses" title="Defenses menu (⌘D)"><svg viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.4 8.5-8 11-4.6-2.5-8-6-8-11V5z"/></svg><em>Defenses</em></button>
-      <button class="tb tb-wide" id="tb-tracer" data-act="trace_toggle" title="Toggle tracer (⌘T)"><svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4" fill="none" stroke="currentColor" stroke-width="2"/></svg><em>Tracer <b id="tracer-state">off</b></em></button>
+      <button class="tb tb-wide" id="tb-tracer" data-act="trace_toggle" title="Toggle tracer (⌘T)"><svg viewBox="0 0 24 24"><path d="M3 12h4l3 8 4-16 3 8h4" fill="none" stroke="currentColor" stroke-width="2"/></svg><em>API Trace <b id="tracer-state">off</b></em></button>
       <button class="tb" id="tb-scope" data-act="trace_scope" title="Cycle trace scope (⌘Y)"><em class="mono" id="scope-label">balanced</em></button>
       <span class="tb-sep"></span>
       <div class="tb-target" title="current target">
@@ -46,66 +46,8 @@
       <button class="mini" id="defense-summary" title="Inspect defense readiness">Defenses off</button>
     </div>
 
-    <!-- Resizable workspace -->
-    <div id="main">
-      <!-- Top row: disassembly | registers + memory tabs -->
-      <div id="top">
-        <section class="panel panel-disasm col-left" data-pane="disasm">
-          <header class="panel-head">
-            <span class="dot"></span> Disassembly
-            <span class="head-sub mono" id="disasm-status"></span>
-            <span class="head-spacer"></span><button class="mini" id="nav-back" title="Previous location">←</button><button class="mini" id="nav-forward" title="Next location">→</button>
-          </header>
-          <div class="disasm scroll" id="disasm" tabindex="0"></div>
-        </section>
-
-        <div class="splitter split-v" title="drag to resize"></div>
-
-        <aside class="col-right">
-          <section class="panel panel-regs" data-pane="regs">
-            <header class="panel-head"><span class="dot"></span> Registers</header>
-            <div id="pinned-regs" class="pinned-regs"></div>
-            <div class="regs scroll" id="regs"></div>
-            <div class="flags" id="flags"></div>
-          </section>
-
-          <div class="splitter split-h" title="drag to resize"></div>
-
-          <section class="panel panel-mem">
-            <div class="tabstrip" id="mem-tabs">
-              <div class="tab active" data-memtab="memory">Memory</div>
-              <div class="tab" data-memtab="stack">Stack</div>
-              <div class="tab" data-memtab="watch1">Watch 1</div>
-              <div class="tab" data-memtab="watch2">Watch 2</div>
-              <div class="tab" data-memtab="watch3">Watch 3</div>
-            </div>
-            <div class="mem-addrbar" id="mem-addrbar">
-              <span class="mono dim">follow</span>
-              <input id="mem-addr" class="mono" placeholder="address / expression" spellcheck="false" autocomplete="off" />
-              <span class="mono head-sub" id="mem-follow-info"></span>
-            </div>
-            <div class="memory-tools">
-              <label>Bytes/row <select id="memory-width"><option>16</option><option>8</option></select></label>
-              <button class="mini" id="snapshot-memory">Snapshot bytes + strings</button>
-              <select id="memory-baseline" aria-label="Memory snapshot baseline"></select>
-              <button class="mini" id="compare-memory">Compare</button>
-            </div>
-            <div class="hexview scroll" id="memory" data-pane="memory"></div>
-            <div class="hexview scroll hidden" id="stack" data-pane="stack"></div>
-            <div class="hexview scroll hidden" id="watch1" data-pane="watch1" data-slot="1"></div>
-            <div class="hexview scroll hidden" id="watch2" data-pane="watch2" data-slot="2"></div>
-            <div class="hexview scroll hidden" id="watch3" data-pane="watch3" data-slot="3"></div>
-          </section>
-        </aside>
-      </div>
-
-      <div class="splitter split-h" id="split-main" title="drag to resize"></div>
-
-      <!-- Bottom row: tab group | console -->
-      <div id="bot">
-        <section class="panel panel-tabs">
-          <div class="tabstrip" id="bot-tabs">
-            <div class="tab active" data-bottab="breakpoints">Breakpoints</div>
+<div class="workspace-nav"><div class="tabstrip" id="bot-tabs"><div class="tab active" data-bottab="cpu">CPU</div><div class="tab" data-bottab="graph">Graph</div><div class="tab" data-bottab="symbols">Symbols</div><div class="tab" data-bottab="references">References</div>
+            <div class="tab" data-bottab="breakpoints">Breakpoints</div>
             <div class="tab" data-bottab="callstack">Call Stack</div>
             <div class="tab" data-bottab="threads">Threads</div>
             <div class="tab" data-bottab="modules">Modules</div>
@@ -113,15 +55,57 @@
             <div class="tab" data-bottab="patches">Patches</div>
             <div class="tab" data-bottab="analysis">Events</div>
             <div class="tab" data-bottab="regions">Memory Map</div>
-            <div class="tab" data-bottab="trace">Trace <span class="badge" id="trace-badge">0</span></div>
-          </div>
+            <div class="tab" data-bottab="trace">API Trace <span class="badge" id="trace-badge">0</span></div>
+          </div><button class="mini" id="actions-button">Actions ⌘P</button><button class="mini" id="recent-button">Recent</button><button class="mini" id="settings-button">Settings</button></div>
+<div id="main"><div id="cpu-workspace"><div id="cpu-left"><section class="panel panel-disasm col-left" data-pane="disasm">
+          <header class="panel-head">
+            <span class="dot"></span> Disassembly
+            <span class="head-sub mono" id="disasm-status"></span>
+            <span class="head-spacer"></span><button class="mini" id="nav-back" title="Previous location">←</button><button class="mini" id="nav-forward" title="Next location">→</button>
+          </header>
+          <div class="disasm scroll" id="disasm" tabindex="0"></div>
+        <div id="instruction-info" class="instruction-info">Select an instruction for details.</div></section><div class="workspace-split horizontal" data-drag="top"></div><section class="panel panel-mem">
+            <div class="tabstrip" id="mem-tabs">
+              <div class="tab active" data-memtab="memory">Dump 1</div>
+
+              <div class="tab" data-memtab="watch1">Dump 2</div>
+              <div class="tab" data-memtab="watch2">Dump 3</div>
+              <div class="tab" data-memtab="watch3">Dump 4</div>
+            </div>
+            <div class="mem-addrbar" id="mem-addrbar">
+              <button class="mini" id="dump-back" title="Previous dump location">←</button><button class="mini" id="dump-forward" title="Next dump location">→</button>
+              <input id="mem-addr" class="mono" placeholder="address / expression" spellcheck="false" autocomplete="off" />
+              <span class="mono head-sub" id="mem-follow-info"></span>
+            </div>
+            <div class="memory-tools"><select id="dump-format" aria-label="Dump format"><option value="hex">Hex + ASCII</option><option value="pointers">Pointers</option><option value="u32">Unsigned 32-bit</option><option value="u64">Unsigned 64-bit</option><option value="f32">Float 32-bit</option><option value="f64">Float 64-bit</option><option value="utf16">UTF-16 LE</option></select><button class="mini" id="dump-edit">Edit selection</button><button class="mini" id="undo-edit">Undo edit</button>
+              <label>Bytes/row <select id="memory-width"><option>16</option><option>8</option></select></label>
+              <button class="mini" id="snapshot-memory">Snapshot bytes + strings</button>
+              <select id="memory-baseline" aria-label="Memory snapshot baseline"></select>
+              <button class="mini" id="compare-memory">Compare</button>
+            </div>
+            <div class="dump-body"><div class="hexview scroll" id="memory" data-pane="memory" tabindex="0"></div><div id="dump-comparison" class="scroll hidden"></div></div><div id="dump-selection" class="selection-status">Click a byte; Shift-click or drag to select a range.</div>
+
+            <div class="hexview scroll hidden" id="watch1" data-pane="watch1" data-slot="1"></div>
+            <div class="hexview scroll hidden" id="watch2" data-pane="watch2" data-slot="2"></div>
+            <div class="hexview scroll hidden" id="watch3" data-pane="watch3" data-slot="3"></div>
+          </section></div><div class="workspace-split vertical" data-drag="left"></div><div id="cpu-right"><section class="panel panel-regs" data-pane="regs">
+            <header class="panel-head"><span class="dot"></span> Registers</header>
+            <div id="pinned-regs" class="pinned-regs"></div>
+            <div class="regs scroll" id="regs"></div>
+            <div class="flags" id="flags"></div>
+          </section><section class="panel panel-stack"><header class="panel-head">Stack <span class="head-sub">pointers · offsets from SP</span></header><div class="hexview scroll" id="stack" data-pane="stack"></div></section></div></div><div id="tool-workspace" class="hidden"><section class="panel panel-tabs">
+
           <div class="tabbody">
-            <div class="table-wrap scroll" id="tb-breakpoints" data-pane="breakpoints"><table class="grid" id="bp-table"></table></div>
+<div id="tb-symbols" class="tool-browser hidden"><div class="view-toolbar"><select id="symbol-module" aria-label="Symbol module"></select><input id="symbol-search" placeholder="Search symbols…"/><button class="mini" id="symbol-more">More symbols</button><span id="symbol-count" class="m-hint"></span></div><div class="scroll"><table class="grid" id="symbol-table"></table></div></div>
+<div id="tb-references" class="tool-browser hidden"><div class="view-toolbar"><input id="reference-address" placeholder="Address or symbol"/><select id="reference-module" aria-label="Module to scan"></select><button class="mini" id="find-references">Find references</button><button class="mini" id="reference-more">Scan next page</button></div><div id="reference-coverage" class="m-hint"></div><div class="scroll"><table class="grid" id="reference-table"></table></div></div>
+<div id="tb-graph" class="tool-browser hidden"><div class="view-toolbar"><button class="mini" id="graph-refresh">Graph selected function</button><button class="mini" id="graph-overview">Overview</button><label>Zoom <input id="graph-zoom" type="range" min="50" max="150" value="100"/></label><span id="graph-title"></span></div><div id="graph-coverage" class="m-hint"></div><div id="graph-scroll" class="scroll"><div id="graph-canvas"></div></div></div>
+
+            <div class="tool-browser hidden" id="tb-breakpoints" data-pane="breakpoints"><div class="view-toolbar"><button class="mini" id="new-breakpoint">Add breakpoint</button><button class="mini" id="new-watchpoint">Add memory watchpoint</button><span id="breakpoint-budget"></span></div><div class="scroll"><table class="grid" id="bp-table"></table><h4>Memory watchpoints</h4><table class="grid" id="wp-table"></table></div></div>
             <div class="table-wrap scroll hidden" id="tb-callstack" data-pane="callstack"><table class="grid" id="cs-table"></table></div>
             <div class="table-wrap scroll hidden" id="tb-threads" data-pane="threads"><table class="grid" id="th-table"></table></div>
             <div class="table-wrap scroll hidden" id="tb-modules" data-pane="modules"><table class="grid" id="mod-table"></table></div>
             <div class="table-wrap scroll hidden" id="tb-strings" data-pane="strings"><table class="grid" id="str-table"></table></div>
-            <div class="table-wrap scroll hidden" id="tb-patches" data-pane="patches"><table class="grid" id="patch-table"></table></div>
+            <div class="table-wrap scroll hidden" id="tb-patches" data-pane="patches"><table class="grid" id="patch-table"></table><h4>UI edit history</h4><table class="grid" id="edit-table"></table></div>
             <div class="table-wrap scroll hidden" id="tb-analysis"><table class="grid" id="analysis-table"></table></div>
             <div class="trace-wrap hidden" id="tb-regions">
               <div class="trace-toolbar"><button class="mini" id="refresh-regions">Refresh map</button><button class="mini" id="monitor-memory">Track executable changes</button><button class="mini" id="disarm-guard">Disarm execution guard</button></div>
@@ -143,12 +127,8 @@
               <div class="table-wrap scroll" id="trace-scroll"><table class="grid" id="trace-table"></table></div>
             </div>
           </div>
-        </section>
-
-        <div class="splitter split-v" title="drag to resize"></div>
-
-        <section class="panel panel-console" data-pane="console">
-          <header class="panel-head"><span class="dot"></span> Console <span class="head-sub">lldb command interpreter</span></header>
+        </section></div></div><section class="panel panel-console" data-pane="console">
+          <header class="panel-head"><span class="dot"></span> Console <span class="head-sub">lldb command interpreter</span><span class="head-spacer"></span><button class="mini" id="console-toggle">Show console</button></header>
           <div class="console-log scroll" id="console"></div>
           <div class="console-input">
             <span class="cmd-prompt mono">lldb&gt;</span>
@@ -156,9 +136,6 @@
             <div class="completions hidden" id="completions"></div>
           </div>
         </section>
-      </div>
-    </div>
-
     <!-- Priority keyboard-shortcut bar (x64dbg / Textual style) -->
     <div class="keybar" id="keybar"></div>
 
@@ -176,6 +153,6 @@
     <div id="ctxmenu" class="ctxmenu hidden"></div>
     <div id="modal-backdrop" class="modal-backdrop hidden"></div>
   </div>
-  <script src="app.js"></script>
+  <script src="workspace-model.js"></script><script src="workspace.js"></script><script src="app.js"></script>
 </body>
 </html>

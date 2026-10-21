@@ -24,13 +24,14 @@
   const sessionToken = suppliedToken || sessionStorage.getItem('macdbg-token') || '';
 
   async function cmd(name, args) {
+    if (workspace && ['follow_disasm','snap_pc','navigate_history','search'].includes(name)) workspace.showView('cpu');
     try {
       const r = await fetch('/cmd', {
         method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Macdbg-Token': sessionToken },
         body: JSON.stringify({ name: name, args: args || {} })
       });
       const result = await r.json();
-      if (!result.ok) appendConsole(result.error || 'Command failed', true);
+      if (!result.ok) { appendConsole(result.error || 'Command failed', true); if (workspace) workspace.toast(result.error || 'Command failed'); }
       return result;
     } catch (e) { appendConsole('Connection failed: ' + String(e), true); return { ok: false, error: String(e) }; }
   }
@@ -42,6 +43,7 @@
   }
 
   // ---- global state --------------------------------------------------------
+  let workspace = null;
   let lastState = null;
   let selDisasm = null;   // address of the single-clicked disassembly line
   let traceRows = [];
@@ -93,11 +95,13 @@
   //  render: full state snapshot
   // ===========================================================================
   function onState(st) {
+    if (lastState && lastState.process_id !== st.process_id) selDisasm = null;
+    else if (st.disasm_center != null && (!lastState || st.disasm_center !== lastState.disasm_center)) selDisasm=st.disasm_center;
+    else if (lastState && (lastState.stop_id !== st.stop_id || (lastState.disasm_center != null && st.disasm_center == null))) selDisasm=null;
     lastState = st;
     renderDisasm(st);
     renderRegs(st);
-    renderHex($('#memory'), st.memory);
-    renderHex($('#stack'), st.stack);
+    if (!workspace) { renderHex($('#memory'), st.memory); renderHex($('#stack'), st.stack); }
     for (let i = 1; i <= 3; i++) renderWatch(i, (st.watches || [])[i - 1]);
     renderBreakpoints(st.breakpoints || []);
     renderCallstack(st.backtrace || []);
@@ -120,9 +124,10 @@
     if (st.modules && st.modules.length)
       mt.textContent = String(st.modules[0][0] || '').split('/').pop() || '—';
     if (defensesOpen) rebuildDefenses();
+    if (workspace) workspace.onState(st);
   }
 
-  function onRunning() { $('#stop-explanation').textContent = 'Running — displayed registers are from the last stop'; setStatus('running', lastState && lastState.pc, lastState && lastState.modules); }
+  function onRunning() { if (workspace) workspace.running(); $('#stop-explanation').textContent = 'Running — displayed registers are from the last stop'; setStatus('running', lastState && lastState.pc, lastState && lastState.modules); }
   function onMeta(m) { $('#menu-target').textContent = m.target ? m.target.split('/').pop() : (m.attach ? 'pid ' + m.attach : '—'); }
 
   function setStatus(kind, pc, modules) {
@@ -152,9 +157,8 @@
       if (r.func) html += `<div class="funchead">▼ ${esc(r.func)}:</div>`;
       const gut = (r.gutter || []).map(g => `<span class="${g[1]}">${esc(g[0])}</span>`).join('');
       const pcmk = r.pc ? '<span class="mk mk-pc">▶</span>' : '<span class="mk"> </span>';
-      const bpmk = r.bp ? `<span class="mk ${r.bp_on ? 'mk-bp-on' : 'mk-bp-off'}">${r.bp_on ? '●' : '○'}</span>`
-        : '<span class="mk"> </span>';
-      const ops = (r.ops || []).map(o => `<span class="${o[1]}">${esc(o[0])}</span>`).join('');
+      const bpmk = `<button class="mk bp-gutter ${r.bp ? (r.bp_on ? 'mk-bp-on' : 'mk-bp-off') : ''}" aria-label="Toggle breakpoint at ${hx(r.addr)}">${r.bp ? (r.bp_on ? '●' : '○') : '·'}</button>`;
+      const ops = (r.ops || []).map(o => `<span class="${o[1]}${['op-hex','op-reg'].includes(o[1]) ? ' operand-link' : ''}">${esc(o[0])}</span>`).join('');
       const opsRaw = (r.ops || []).map(o => o[0]).join('');
       let tail = '';
       if (r.comment) tail += ` <span class="d-comment">; ${esc(r.comment)}</span>`;
@@ -546,6 +550,7 @@
     selDisasm = addr;
     $$('#disasm .drow').forEach(r => r.classList.toggle('sel', +r.dataset.addr === addr));
     if (!lastState || lastState.disasm_center == null) $('#disasm-status').textContent = 'selected ' + hx(addr);
+    if (workspace) workspace.selected(addr);
   }
   function opAddr(rowEl, fallback) {
     const ops = rowEl.dataset.ops || '';
@@ -582,7 +587,7 @@
     } else cmd('pick_file');
   }
 
-  function openLaunch(path) {
+  function openLaunch(path, preset = null) {
     const modal = el('div', 'modal modal-launch');
     modal.innerHTML = '<div class="m-head">Launch target</div><div class="m-body">'
       + '<p class="mono">' + esc(path) + '</p>'
@@ -597,8 +602,11 @@
       const args = { path, args_text: $('#launch-args').value, stop_at: $('#launch-stop').value, profile: $('#launch-profile').value };
       closeModal(); cmd('open_target', args);
     };
-    foot.append(cancel, launch); modal.appendChild(foot);
+    const save = el('button','btn','Save profile');
+    save.onclick = () => workspace && workspace.saveLaunch({path,args_text:$('#launch-args').value,stop_at:$('#launch-stop').value,profile:$('#launch-profile').value});
+    foot.append(cancel, save, launch); modal.appendChild(foot);
     openModal(modal, e => { if (e.key === 'Escape') closeModal(); });
+    if (preset) { $('#launch-args').value=preset.args_text||''; $('#launch-stop').value=preset.stop_at||'loader'; $('#launch-profile').value=preset.profile||'manual'; }
   }
   async function findInMemory() {
     const v = await promptDialog({ title: 'Find in Memory', placeholder: 'ASCII text, 0x… hex, or "all:" to scan libraries', hint: 'Empty + ⌘F cycles to the next hit.' });
@@ -673,11 +681,13 @@
   }
 
   function selectBottomTab(name) {
+    if (workspace) return workspace.showView(name);
     $$('#bot-tabs .tab').forEach(x => x.classList.toggle('active', x.dataset.bottab === name));
     $$('.tabbody > [id^="tb-"]').forEach(panel => panel.classList.toggle('hidden', panel.id !== 'tb-' + name));
   }
 
   function selectMemTab(which) {
+    if (workspace) return workspace.selectDump(which);
     $$('#mem-tabs .tab').forEach(x => x.classList.toggle('active', x.dataset.memtab === which));
     ['memory', 'stack', 'watch1', 'watch2', 'watch3'].forEach(p => $('#' + p).classList.toggle('hidden', p !== which));
     $('#mem-addrbar').classList.toggle('hidden', which !== 'memory');
@@ -685,26 +695,34 @@
   // Follow an address in the memory view AND surface it: switch to the Memory
   // sub-tab so the update isn't lost behind the Stack / Watch panes.
   function followMem(addr) {
+    if (workspace) return workspace.followMemory(addr);
     selectMemTab('memory');
     return cmd('follow_mem', { addr: addr });
   }
+
+  function followDump(slot,addr) { if (workspace) return workspace.followMemory(addr,slot); return cmd('watch_set',{slot,addr,len:32}); }
 
   // double-click a disasm line toggles a breakpoint; a table pc row follows it
   function wireRowActivate() {
     $('#disasm').addEventListener('click', e => {
       const row = e.target.closest('.drow'); if (!row) return;
+      if (e.target.closest('.bp-gutter')) { if (e.detail < 2) cmd('toggle_bp',{addr:+row.dataset.addr}); return; }
       if (!window.getSelection().isCollapsed) return;   // don't steal a text drag-select
       selectDisasm(+row.dataset.addr);
+      if (workspace && e.target.closest('.operand-link')) workspace.operand(e.target.closest('.operand-link'));
+      $('#disasm').focus();
     });
     $('#disasm').addEventListener('dblclick', e => {
-      const row = e.target.closest('.drow'); if (row) { selectDisasm(+row.dataset.addr); cmd('toggle_bp', { addr: +row.dataset.addr }); }
+      const row = e.target.closest('.drow'); if (row && !e.target.closest('.bp-gutter')) { selectDisasm(+row.dataset.addr); if (workspace && e.target.closest('.operand-link')) { workspace.operand(e.target.closest('.operand-link')); workspace.followOperand(); } }
     });
     ['#cs-table', '#th-table', '#mod-table'].forEach(sel => {
       $(sel).addEventListener('dblclick', e => {
         const tr = e.target.closest('tr'); if (tr && tr.dataset.addr) cmd('follow_disasm', { addr: tr.dataset.addr });
       });
     });
+    ['#regs','#pinned-regs'].forEach(id => $(id).addEventListener('dblclick', e => { const row=e.target.closest('.rrow'); if (row) editReg(row.dataset.reg,row.dataset.val); }));
     $('#bp-table').addEventListener('dblclick', e => {
+      if (workspace) return;
       const tr = e.target.closest('tr'); if (tr && tr.dataset.addr) cmd('follow_disasm', { addr: tr.dataset.addr });
     });
     $('#str-table').addEventListener('dblclick', e => {
@@ -764,10 +782,11 @@
   function showCtx(x, y, items, header) {
     let html = header ? `<div class="cx-header">${esc(header)}</div>` : '';
     items.forEach((it, i) => {
+      if (workspace && it.action) it.key=workspace.shortcut(it.action);
       if (it.sep) html += '<div class="cx-sep"></div>';
       else if (it.section) html += `<div class="cx-section">${esc(it.section)}</div>`;
       else html += `<div class="cx-item${it.danger ? ' danger' : ''}" data-i="${i}">`
-        + `<span class="cx-check">${it.check ? '✓' : ''}</span>${esc(it.label)}</div>`;
+        + `<span class="cx-check">${it.check ? '✓' : ''}</span>${esc(it.label)}${it.key ? `<span class="cx-key">${esc(it.key)}</span>` : ''}</div>`;
     });
     ctx.innerHTML = html;
     ctx.classList.remove('hidden');
@@ -792,18 +811,20 @@
       selectDisasm(addr);
       return [
         { label: 'Follow operand in Disassembly', fn: () => cmd('follow_disasm', { addr: oa }) },
+        { label: 'Find references to selection', key:'X', fn: () => workspace && workspace.references(addr) },
+        { label: 'Graph this function', key:'G', fn: () => workspace && workspace.showView('graph') },
         { label: 'Follow operand in Memory', fn: () => followMem(oa) },
         { sep: 1 },
-        { label: 'Toggle breakpoint here', fn: () => cmd('toggle_bp', { addr: addr }) },
+        { label: 'Toggle breakpoint here', action: 'toggle_bp', fn: () => cmd('toggle_bp', { addr: addr }) },
         { label: 'Set PC to here (jump execution)', fn: () => cmd('set_pc', { addr: addr }) },
-        { label: 'Run to cursor', fn: () => cmd('run_to', { addr: addr }) },
+        { label: 'Run to cursor', action: 'run_to', fn: () => cmd('run_to', { addr: addr }) },
         { sep: 1 },
-        { label: 'Add / edit comment…', fn: () => editComment(addr) },
+        { label: 'Add / edit comment…', action: 'comment', fn: () => editComment(addr) },
         { label: 'Copy address', fn: () => copy(hx(addr)) },
         { sep: 1 },
-        { label: 'Pin to Watch 1', fn: () => cmd('watch_set', { slot: 1, addr: addr, len: 32 }) },
-        { label: 'Pin to Watch 2', fn: () => cmd('watch_set', { slot: 2, addr: addr, len: 32 }) },
-        { label: 'Pin to Watch 3', fn: () => cmd('watch_set', { slot: 3, addr: addr, len: 32 }) }
+        { label: 'Follow in Dump 2', fn: () => followDump(1, addr) },
+        { label: 'Follow in Dump 3', fn: () => followDump(2, addr) },
+        { label: 'Follow in Dump 4', fn: () => followDump(3, addr) }
       ];
     });
 
@@ -817,7 +838,7 @@
         { sep: 1 },
         { label: pinnedRegisters.includes(name) ? 'Unpin register' : 'Pin register', fn: () => {
           pinnedRegisters = pinnedRegisters.includes(name) ? pinnedRegisters.filter(n => n !== name) : [...pinnedRegisters, name];
-          localStorage.setItem('macdbg-pinned-registers', JSON.stringify(pinnedRegisters)); renderRegs(lastState);
+          if (workspace) workspace.pinChanged(pinnedRegisters); else localStorage.setItem('macdbg-pinned-registers', JSON.stringify(pinnedRegisters)); renderRegs(lastState);
         } },
         { label: 'Edit value…', fn: () => editReg(name, val) },
         { label: 'Copy value', fn: () => copy(val) }
@@ -831,9 +852,9 @@
       }
       items.push(
         { sep: 1 },
-        { label: 'Pin value to Watch 1', fn: () => cmd('watch_set', { slot: 1, addr: val, len: 32 }) },
-        { label: 'Pin value to Watch 2', fn: () => cmd('watch_set', { slot: 2, addr: val, len: 32 }) },
-        { label: 'Pin value to Watch 3', fn: () => cmd('watch_set', { slot: 3, addr: val, len: 32 }) }
+        { label: 'Follow value in Dump 2', fn: () => followDump(1, val) },
+        { label: 'Follow value in Dump 3', fn: () => followDump(2, val) },
+        { label: 'Follow value in Dump 4', fn: () => followDump(3, val) }
       );
       return items;
     };
@@ -851,9 +872,9 @@
         { label: 'Edit ASCII here…', fn: () => editMem(row, addr, 'ascii') },
         { sep: 1 },
         { label: 'Set watchpoint on this address…', fn: () => setWatchAt(addr) },
-        { label: 'Pin to Watch 1', fn: () => cmd('watch_set', { slot: 1, addr: addr, len: 32 }) },
-        { label: 'Pin to Watch 2', fn: () => cmd('watch_set', { slot: 2, addr: addr, len: 32 }) },
-        { label: 'Pin to Watch 3', fn: () => cmd('watch_set', { slot: 3, addr: addr, len: 32 }) },
+        { label: 'Follow in Dump 2', fn: () => followDump(1, addr) },
+        { label: 'Follow in Dump 3', fn: () => followDump(2, addr) },
+        { label: 'Follow in Dump 4', fn: () => followDump(3, addr) },
         { sep: 1 },
         { label: 'Copy address', fn: () => copy(hx(addr)) },
         { label: 'Copy row (hex)', fn: () => copy(row.dataset.hex) }
@@ -951,7 +972,7 @@
   }
   async function editReg(name, val) {
     const v = await promptDialog({ title: 'Set ' + name, value: val, placeholder: 'new value (0x… or decimal)' });
-    if (v !== null && v.trim()) cmd('write_reg', { name: name, value: v.trim() });
+    if (v !== null && v.trim()) { if (workspace) workspace.editRegisterValue(name,v.trim()); else cmd('write_reg', { name: name, value: v.trim() }); }
   }
   // Map a hex-view pane back to its state block (memory / stack / watchN).
   function blockForPane(id) {
@@ -983,6 +1004,7 @@
   // (the focus span, e.g. a search hit), edit exactly that; otherwise default
   // to two lines from the clicked row. Prefill with the range's current bytes.
   function editMem(row, clickedAddr, kind) {
+    if (workspace) return workspace.editMemoryAt(clickedAddr,kind);
     const pane = row.closest('.hexview');
     const block = pane ? blockForPane(pane.id) : null;
     const width = (block && block.width) || 16;
@@ -1012,6 +1034,7 @@
     cmd('write_mem', { addr: addr, bytes: hexStr });
   }
   async function setWatchAt(addr) {
+    if (workspace) return workspace.editWatchpoint({addr:addr,size:8,access:'write',enabled:true,condition:''});
     const s = await promptDialog({ title: 'Set watchpoint', value: hx(addr), placeholder: 'address', hint: 'Runs `watchpoint set expression`.' });
     if (s !== null && s.trim()) cmd('run_cmd', { cmd: 'watchpoint set expression -- ' + s.trim() });
   }
@@ -1282,7 +1305,8 @@
   }
 
   // ---- command palette -----------------------------------------------------
-  function openPalette() {
+  function openPalette() { if (workspace) return workspace.openActions(); return openLLDBPalette(); }
+  function openLLDBPalette() {
     const m = el('div', 'modal');
     m.innerHTML = '<div class="m-head">Command Palette <span class="m-sub">lldb — Enter to run</span></div>';
     const body = el('div', 'm-body');
@@ -1356,6 +1380,8 @@
   //  ui action relay (native menu → dialog)
   // ===========================================================================
   function handleUiAction(action, message = {}) {
+    if (workspace && action === 'view') return workspace.showView(message.view);
+    if (action === 'lldb_palette') return openLLDBPalette();
     if (action === 'launch') return openLaunch(message.path);
     if (action === 'open') return chooseTarget();
     ({ attach: openAttach, defenses: openDefenses, palette: openPalette, find: findInMemory,
@@ -1375,12 +1401,14 @@
     document.addEventListener('keydown', e => {
       // ⌘/Ctrl+C copies the current text selection (the native Edit menu is off)
       if ((e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C')) {
+        if (workspace && e.target.closest('#memory') && workspace.copySelection()) {e.preventDefault();return;}
         const sel = window.getSelection ? String(window.getSelection()) : '';
         if (sel) copy(sel);
         return;
       }
       if (modalKeyHandler) { modalKeyHandler(e); return; }
       if (e.key === 'Escape') { if (closeTopLayer()) { e.preventDefault(); return; } }
+      if (workspace) { if (workspace.handleKey(e)) { e.preventDefault(); } return; }
       if (FKEYS[e.key]) { e.preventDefault(); doAct(FKEYS[e.key]); return; }
       if (e.ctrlKey || e.metaKey) {
         const map = { g: focusGoto, f: findInMemory, t: () => cmd('trace_toggle'), y: () => cmd('trace_scope'), k: () => cmd('trace_clear'), d: openDefenses, b: () => cmd('interrupt'), r: () => cmd('restart'), p: openPalette };
@@ -1527,6 +1555,12 @@
     wireChrome();
     wireKeys();
     wireAnalysis();
+    workspace = window.MacdbgWorkspace.create({cmd,cmdSync,copy,esc,hx,analysis,analysisDialog,promptDialog,closeModal,
+      state:()=>lastState,selected:()=>selDisasm,select:selectDisasm,doAct,editComment,findInMemory,focusGoto,
+      openDefenses,chooseTarget,openLaunch,rawPalette:openLLDBPalette,
+      recenter:()=>{const row=$('#disasm .drow[data-addr="'+(selDisasm==null?(lastState&&lastState.pc):selDisasm)+'"]');if(row&&row.offsetParent!==null)row.scrollIntoView({block:'center'});},
+      setPins:pins=>{pinnedRegisters=pins;if(lastState)renderRegs(lastState);}});
+    workspace.mount();
     setStatus('none', 0, null);
     setInterval(tick, 1000);
     connect();
