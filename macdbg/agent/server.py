@@ -119,6 +119,7 @@ class Daemon:
 
     def _request_shutdown(self) -> None:
         self._shutdown = True
+        self.session.dbg.instruction_trace.run = None
         # A quit while a continue/step is blocked inside AgentSession._pump
         # would otherwise sit there until the target happens to stop on its
         # own -- the accept loop can't exit until _handle_conn returns, so
@@ -155,6 +156,7 @@ class Daemon:
                     continue
                 cmd = req.get("cmd")
                 if cmd == "interrupt":
+                    self.session.dbg.instruction_trace.run = None
                     self.session.dbg.interrupt()
                     _send_json(f, {"ok": True})
                 elif cmd == "status":

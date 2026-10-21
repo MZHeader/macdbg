@@ -100,17 +100,21 @@ class Workspace:
         self.code = CodeNavigation(debugger)
         self.edits = []
         self._pid = None
+        self.assembly_previews = {}
 
     def sync(self):
         pid = self.dbg.process.GetProcessID() if self.dbg.process else None
         if pid != self._pid:
             self.edits.clear(); self._pid = pid
+            self.assembly_previews.clear()
         self.code.sync()
 
     def stopped(self):
         self.sync()
         if not self.dbg.process or self.dbg.process.GetState()!=lldb.eStateStopped:
             raise ValueError('Pause the target first')
+        if self.dbg.in_user_step() or self.dbg.instruction_trace.run:
+            raise ValueError('Wait for the current step or pause automatic tracing first')
 
     def address(self,expression):
         found = resolve(self.dbg,expression)
@@ -131,8 +135,20 @@ class Workspace:
             self.preferences.data['launches'] = [p for p in self.preferences.data['launches'] if p['name']!=args['name']]
             self.preferences.save(); return copy.deepcopy(self.preferences.data)
         self.stopped()
+        if action == 'assemble_preview': return self.assemble_preview(args)
+        if action == 'assemble_apply': return self.assemble_apply(args['token'])
+        if action in ('patch_manifest', 'patch_export', 'patch_import'):
+            from macdbg.core.patch_export import PatchExporter
+            exporter = PatchExporter(self.dbg)
+            if action == 'patch_manifest': return exporter.manifest()
+            if action == 'patch_export': return exporter.export(**args)
+            result = exporter.import_manifest(**args)
+            if result['applied']:
+                self.edits.clear()
+                self.save()
+            return result
         if action=='instruction': return self.code.info(self.address(args['address']))
-        if action=='graph': return self.code.graph(self.address(args['address']))
+        if action=='graph': return self.code.graph(self.address(args['address']),int(args.get('limit',1024)),int(args.get('offset',0)))
         if action=='symbols': return self.code.symbols(str(args.get('query','')),args.get('module'),int(args.get('offset',0)))
         if action=='references': return self.code.references(self.address(args['address']),args.get('module'),int(args.get('offset',0)))
         if action=='dump': return self.dump(self.address(args['address']),int(args.get('size',512)))
@@ -152,6 +168,41 @@ class Workspace:
         if action=='undo': return self.undo()
         if action=='edit_history': return self.history()
         raise ValueError('Unknown workspace action')
+
+    def assemble_preview(self, args):
+        import uuid
+        from macdbg.core.assembly import assemble
+        if not (self.dbg.target.GetTriple() or '').startswith(('arm64-', 'arm64e-', 'aarch64-')):
+            raise ValueError('Assembly supports ARM64 targets only')
+        address = self.address(args['address'])
+        data = assemble(args['source'], address, self.address)
+        size = int(args.get('size') or len(data))
+        if size < len(data) or size > 4096 or size % 4:
+            raise ValueError('Replacement span must fit the assembly and contain at most 4096 aligned bytes')
+        data += bytes.fromhex('1f2003d5') * ((size - len(data)) // 4)
+        original = self.dbg.read_memory(address, size)
+        if len(original) != size: raise ValueError('Cannot read the whole replacement span')
+        token = uuid.uuid4().hex
+        preview = {'token': token, 'address': hex(address), 'original': original.hex(), 'new': data.hex(),
+                   'stop': self.dbg.process.GetStopID(), 'process': self.dbg.process.GetUniqueID()}
+        instructions = self.dbg.target.GetInstructions(lldb.SBAddress(address, self.dbg.target), data)
+        preview['instructions'] = [{'address': hex(i.GetAddress().GetLoadAddress(self.dbg.target)),
+                                    'mnemonic': i.GetMnemonic(self.dbg.target), 'operands': i.GetOperands(self.dbg.target)} for i in instructions]
+        self.assembly_previews[token] = preview
+        while len(self.assembly_previews) > 8: self.assembly_previews.pop(next(iter(self.assembly_previews)))
+        return preview
+
+    def assemble_apply(self, token):
+        preview = self.assembly_previews.get(token)
+        if not preview: raise ValueError('Preview expired; assemble again')
+        address, original = int(preview['address'], 16), bytes.fromhex(preview['original'])
+        if (preview['stop'] != self.dbg.process.GetStopID() or preview['process'] != self.dbg.process.GetUniqueID()
+                or self.dbg.read_memory(address, len(original)) != original):
+            raise ValueError('Target changed since preview; assemble again')
+        result = self.edit_memory(address, bytes.fromhex(preview['new']))
+        self.assembly_previews.pop(token, None)
+        self.save()
+        return result
 
     def save(self):
         if self.dbg.state and self.dbg.save_state(self.hidden_ids()) is None:
@@ -301,6 +352,7 @@ class Workspace:
         self.edits.append({'kind':'memory','address':address,'before':before.hex(),'after':data.hex(),
                            'stop':self.dbg.process.GetStopID()})
         self.edits = self.edits[-100:]
+        self.dbg.record_event('EDIT', 'Debugger memory edit', address=hex(address), before=before.hex(), after=data.hex())
         return self.history()
 
     def register_bytes(self,name):
@@ -354,6 +406,8 @@ class Workspace:
                            'thread':self.dbg.frame().GetThread().GetThreadID(),
                            'stop':self.dbg.process.GetStopID()})
         self.edits = self.edits[-100:]
+        self.dbg.record_event('EDIT', 'Debugger register edit', register=parent,
+                              before=parent_before.hex(), after=self.register_bytes(parent).hex())
         return self.history()
 
     def history(self):
@@ -379,4 +433,6 @@ class Workspace:
             self.write_register_bytes(register,bytes.fromhex(edit['before']))
             ok,message = True,''
         if not ok: raise RuntimeError(message)
-        self.edits.pop(); return self.history()
+        self.edits.pop()
+        self.dbg.record_event('EDIT', 'Undid debugger edit', edit=edit)
+        return self.history()

@@ -345,6 +345,7 @@ class Engine:
         state['stop_id'] = dbg.process.GetStopID() if state['has_process'] else 0
         from macdbg.core.session_controller import describe_stop
         dbg.record_visible_stop()
+        state['instruction_trace'] = dbg.instruction_trace.status()
         state['stop'] = describe_stop(dbg) if state['process_state'] == 'stopped' else None
         state['analysis_events'] = dbg.analysis_events.snapshot()
         state['queued_defenses'] = sorted(dbg.entry_plan.queued)
@@ -490,11 +491,15 @@ class Engine:
             try:
                 from macdbg.core.session_controller import prepare_stop
                 preparation = prepare_stop(self.dbg, e.observed_ns or None, self._console)
+                if preparation == 'resumed':
+                    self._resuming = True
+                    return
                 if preparation == 'retry':
                     self.dbg.cont()
                     self._resuming = True
                     return
                 if preparation == 'visible':
+                    self.dbg.instruction_trace.run = None
                     self._console(self._describe_stop())
                     self._emit_state()
                     return
@@ -504,12 +509,14 @@ class Engine:
             cloak_ok, cloak_error = self.dbg.analysis_cloak.validate_integrity(
                 self.tracer.hardware_bp_ids)
             if not cloak_ok:
+                self.dbg.instruction_trace.run = None
                 self.dbg.cancel_user_step()
                 self._console("[anti-analysis] " + cloak_error, error=True)
                 self._emit_state()
                 return
             try:
                 if self.dbg.script_exec.find_hit() is not None:
+                    self.dbg.instruction_trace.run = None
                     self.dbg.cancel_user_step()
                     self._handle_anti_debug_hit()
                     return
@@ -528,6 +535,9 @@ class Engine:
                     return
                 if step_state == "more":
                     self._resuming = True
+                    return
+                if self.dbg.instruction_trace.continue_run(self.tracer.hidden_ids()) is True:
+                    self._c_step_in({})
                     return
                 self._console(self._describe_stop())
                 self._emit_state()
@@ -554,7 +564,11 @@ class Engine:
             self._console(self._describe_stop())
             self._emit_state()
         elif e.state == lldb.eStateExited:
+            self.dbg.offline_network.drain()
+            self.dbg.offline_network.disable()
+            self.dbg.instruction_trace.observe_stop()
             self._flush_network()
+            self.dbg.instruction_trace.stop('Target exited')
             self.dbg.cancel_user_step()
             self._pending_exec = self._pending_fork = self._pending_exec_token = None
             self._console(self._describe_exit())
@@ -563,7 +577,11 @@ class Engine:
             if self.dbg.process and self.dbg.process.GetState() == lldb.eStateRunning:
                 self._emit({"t": "running"})
         elif e.state in (lldb.eStateCrashed, lldb.eStateDetached, lldb.eStateInvalid):
+            self.dbg.offline_network.drain()
+            self.dbg.offline_network.disable()
+            self.dbg.instruction_trace.observe_stop()
             self._flush_network()
+            self.dbg.instruction_trace.stop('Target terminated or detached')
             self._pending_exec = self._pending_fork = self._pending_exec_token = None
             self.dbg.cancel_user_step()
             self._console("process " + e.description)
@@ -682,6 +700,7 @@ class Engine:
         return True
 
     def _add_trace(self, category: str, call: str, details=None) -> None:
+        self.dbg.instruction_trace.event('API/' + category, call, details or {})
         row = self.trace_log.append(category, call, **(details or {}))
         self._trace_count = row["n"]
         self._emit({"t": "trace", **row, "cat": category})
@@ -704,6 +723,7 @@ class Engine:
     def _hidden_bp_ids(self) -> set:
         ids = self.tracer.hidden_ids()
         ids.update(self.dbg.memory_analysis.hidden_ids())
+        ids.update(self.dbg.offline_network.hidden_ids())
         if getattr(self.dbg, 'entry_plan', None) and self.dbg.entry_plan.bp:
             ids.add(self.dbg.entry_plan.bp)
         d = self.dbg
@@ -803,6 +823,10 @@ class Engine:
     # -- execution
     def _resume_failed(self, error):
         self._resuming = False
+        recorder = getattr(self.dbg, 'instruction_trace', None)
+        if recorder is not None:
+            recorder.run = None
+            recorder.gap('Resume failed: ' + str(error))
         self.dbg.cancel_user_step()
         self._console("[resume] " + str(error), error=True)
         self._emit_state()
@@ -831,12 +855,36 @@ class Engine:
         self._resume_action(self.dbg.cont)
 
     def _c_interrupt(self, a):
+        self.dbg.instruction_trace.run = None
         p = self.dbg.process
         if p and p.IsValid() and p.GetState() == lldb.eStateRunning:
             self.dbg.interrupt()
             self._console("[wrapper] interrupt requested")
         else:
             self._console("[wrapper] nothing to interrupt")
+
+    def _c_instruction_trace_run(self, a):
+        self.dbg.require_decision_resolved()
+        if self._resuming or self.dbg.in_user_step():
+            raise ValueError('Pause or wait for the current execution action before tracing')
+        self.dbg.instruction_trace.begin_run(a.get('count', 1000), a.get('seconds', 30), a.get('until'))
+        run = self.dbg.instruction_trace.run
+        identity = self.dbg.instruction_trace._identity()
+        def expire():
+            if (self.dbg.instruction_trace._identity() == identity
+                    and self.dbg.instruction_trace.cancel_run(run)):
+                self.dbg.interrupt()
+        timer = threading.Timer(float(a.get('seconds', 30)), expire)
+        timer.daemon = True
+        timer.start()
+        self._c_step_in({})
+
+    def _c_instruction_trace(self, a):
+        from macdbg.core.session_controller import analysis_command
+        result = analysis_command(self.dbg, self.tracer, 'instruction_trace', dict(a))
+        if a.get('action', 'status') in ('start', 'stop', 'open'):
+            self._emit_state()
+        return result
 
     def _c_kill(self, a):
         if self.dbg.process and self.dbg.process.IsValid():
@@ -970,7 +1018,8 @@ class Engine:
         from macdbg.core.session_controller import analysis_command
         action = a.get('action')
         result = analysis_command(self.dbg,self.tracer,action,{k:v for k,v in a.items() if k != 'action'})
-        if action not in ('memory_map','memory_compare','analysis_events'):
+        if (action not in ('memory_map','memory_compare','analysis_events') and
+                (action not in ('signal_policy','related_processes','syscall_monitor','offline_network') or len(a)>1)):
             self._emit_state()
         return result
 
@@ -1586,6 +1635,8 @@ class Engine:
         cmd = (a.get("cmd") or "").strip()
         if not cmd:
             return
+        self.dbg.instruction_trace.gap('Raw LLDB command: subsequent effects may not be captured')
+        self.dbg.record_event('COMMAND', 'User LLDB command', command=cmd)
         cl = cmd.lower()
         if any(cl == x or cl.startswith(x + " ") for x in self._RELAUNCH):
             self._forget_stop_event_identity()
@@ -1750,6 +1801,23 @@ class Engine:
         procs.sort(key=lambda p: p["pid"], reverse=True)
         return procs
 
+    def _c_debug_child(self, a):
+        from macdbg.core.session_tools import related_processes
+        import subprocess
+        import os
+        pid = int(a['pid'])
+        family = related_processes(self.dbg)
+        if pid == family['root'] or pid not in {r['pid'] for r in family['processes']}:
+            raise ValueError('Select a live descendant of the current target')
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # Each native window owns its backend and attached-process lifecycle.
+        # The parent debugger stays intact and independently controllable.
+        child = subprocess.Popen([os.path.join(root, 'GUI', 'run.sh'), '--attach', str(pid)],
+                                 cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        return {'window_process': child.pid, 'target': pid,
+                'note': 'Opening an independent debugger window. Attach success or failure is shown there.'}
+
     # ---- interpose reader ----------------------------------------------------
     _INTERPOSE_CAT = {"read": "FILE", "write": "FILE", "open": "FILE",
                       "send": "NET", "recv": "NET", "connect": "NET"}
@@ -1843,6 +1911,9 @@ class Engine:
 
 # ---- command + toggle tables (bound after class body) ------------------------
 Engine._COMMANDS = {
+    'debug_child': Engine._c_debug_child,
+    'instruction_trace': Engine._c_instruction_trace,
+    'instruction_trace_run': Engine._c_instruction_trace_run,
     'workspace':Engine._c_workspace,
     'analysis':Engine._c_analysis, 'continue_entry':Engine._c_continue_entry,
     'navigate_history':Engine._c_navigate_history, 'view_options':Engine._c_view_options,
@@ -1873,6 +1944,8 @@ Engine._COMMANDS = {
     "kill": Engine._c_kill,
 }
 Engine._SYNC = {"complete", "list_processes", "resolve_address", "trace_export", 'analysis', 'defense', 'view_options', 'workspace', 'write_mem', 'write_reg'}
+Engine._SYNC.add('instruction_trace')
+Engine._SYNC.add('debug_child')
 Engine._DEFENSE_TOGGLES = {
     "auto_clock": Engine._t_auto_clock,
     "anti_timing": Engine._t_anti_timing,

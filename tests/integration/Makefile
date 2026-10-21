@@ -12,6 +12,10 @@ FRAMEWORKS := -framework CoreFoundation -framework IOKit
 .PHONY: all clean
 all: $(BUILD)/workflow_fixture
 all: $(BUILD)/ui_fixture
+all: $(BUILD)/environment_fixture
+
+$(BUILD)/environment_fixture: environment_fixture.c | $(BUILD)
+	clang $(CFLAGS) -framework SystemConfiguration -framework CoreFoundation $< -o $@
 
 $(BUILD)/ui_fixture: ui_fixture.c ui_fixture.S | $(BUILD)
 	clang $(CFLAGS) $^ -o $@

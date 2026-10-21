@@ -17,6 +17,9 @@ from .self_trap import SelfTrapForwarder
 from .entry_plan import EntryPlan
 from .trace_log import TraceLog
 from .analysis_memory import MemoryAnalysis
+from .instruction_trace import InstructionTrace
+from .syscall_monitor import SyscallMonitor
+from .offline_network import OfflineNetwork
 from .state import BinaryState, StoredBP, Patch, load_for, STATE_DIR
 
 
@@ -42,6 +45,8 @@ class Debugger:
         self._retired_hardware_return = None
         self._hardware_continue = None
         self._suppress_duplicate_retry = False
+        self._hardware_recovery = None
+        self._hardware_recovery_failed = None
         self.process: Optional[lldb.SBProcess] = None
         self.listener: lldb.SBListener = self.dbg.GetListener()
         self._attached: bool = False
@@ -84,6 +89,9 @@ class Debugger:
         self._recorded_stop = None
         self.defense_hits = {}
         self.memory_analysis = MemoryAnalysis(self)
+        self.instruction_trace = InstructionTrace(self)
+        self.syscall_monitor = SyscallMonitor(self)
+        self.offline_network = OfflineNetwork(self)
 
     def record_event(self, category, message, **details):
         if not hasattr(self, 'analysis_events'):
@@ -98,6 +106,9 @@ class Debugger:
                 thread = process.GetSelectedThread()
                 details.setdefault('tid', thread.GetThreadID())
                 details.setdefault('pc', thread.GetFrameAtIndex(0).GetPC())
+        recorder = getattr(self, 'instruction_trace', None)
+        if recorder:
+            recorder.event(category, message, details)
         return self.analysis_events.append(category, message, **details)
 
     def record_visible_stop(self):
@@ -199,6 +210,10 @@ class Debugger:
         target-owned defenses off and can opt in again at its own entry stop.
         """
         self.entry_plan.clear()
+        self._hardware_recovery = self._hardware_recovery_failed = None
+        self.instruction_trace.stop('Target changed')
+        self.offline_network.disable()
+        self.syscall_monitor.configure(False)
         self.memory_analysis.reset()
         self.analysis_events.reset()
         self.defense_hits.clear()
@@ -380,6 +395,10 @@ class Debugger:
         ]
 
     def launch(self, argv: List[str]) -> lldb.SBProcess:
+        self._hardware_recovery = self._hardware_recovery_failed = None
+        self.offline_network.disable()
+        self.instruction_trace.stop('Target relaunched')
+        self.syscall_monitor.configure(False)
         memory_requested = self.memory_analysis.enabled
         self.memory_analysis.reset()
         self.entry_plan.clear(keep_queue=True)
@@ -599,6 +618,10 @@ class Debugger:
         return False
 
     def destroy(self) -> None:
+        if hasattr(self, 'offline_network'):
+            self.offline_network.disable()
+        if hasattr(self, 'instruction_trace'):
+            self.instruction_trace.stop('Debugger closed')
         self.memory_analysis.disarm_guard()
         if self.process and self.process.IsValid():
             if self._attached:
@@ -614,6 +637,8 @@ class Debugger:
 
     def cont(self) -> None:
         if self.process:
+            if hasattr(self, 'instruction_trace'):
+                self.instruction_trace.gap('Continue: instructions between stops are not recorded')
             self.auto_clock.apply_stop()
             self.timing.require_ready()
             messages, _ = self.timing.apply_stop()
@@ -670,12 +695,16 @@ class Debugger:
             self._step_active = True
             self._step_target_depth = None
             self._pending_step_scrubs = None
+            if hasattr(self, 'instruction_trace'):
+                self.instruction_trace.capture()
             self._run_execution(lambda: t.StepInstruction(False))
 
     def step_out(self) -> None:
         """Run until the current frame returns (gdb's 'finish')."""
         t = self._thread()
         if t:
+            if hasattr(self, 'instruction_trace'):
+                self.instruction_trace.gap('Step out: callee instructions are not recorded')
             self._check_step_out_frame(t)
             self._process_cloak_step_stop(t)
             self._require_step_slot()
@@ -770,6 +799,8 @@ class Debugger:
             self._step_target_depth = t.GetNumFrames()
         else:
             self._step_target_depth = None
+        if hasattr(self, 'instruction_trace'):
+            self.instruction_trace.capture('step_over')
         self._run_execution(lambda: t.StepInstruction(False))
 
     def advance_user_step(self, auto_bp_ids=None) -> str:
@@ -1151,20 +1182,16 @@ class Debugger:
     def _record_patch(self, addr: int, orig: bytes, new: bytes) -> None:
         if not self.state:
             return
-        for i, p in enumerate(self.state.patches):
-            if p.addr == addr and len(p.new) == len(new):
-                if new == p.orig:
-                    del self.state.patches[i]
-                else:
-                    self.state.patches[i] = Patch(addr=addr, orig=p.orig, new=new)
-                return
-        if orig != new:
-            self.state.patches.append(Patch(addr=addr, orig=orig, new=new))
+        from .patch_export import normalized
+        rows = normalized(self.state.patches + [Patch(addr=addr, orig=orig, new=new)])
+        self.state.patches = [Patch(addr=r['address'], orig=bytes(r['original']), new=bytes(r['new'])) for r in rows]
 
     def revert_patch(self, index: int) -> Tuple[bool, str]:
         if not self.state or not (0 <= index < len(self.state.patches)):
             return False, "no such patch"
         p = self.state.patches[index]
+        if self.read_memory(p.addr, len(p.new)) != p.new:
+            return False, 'live bytes changed since the patch; revert refused'
         ok, msg = self.write_memory(p.addr, p.orig, track=False)
         if ok:
             del self.state.patches[index]

@@ -56,6 +56,8 @@
             <div class="tab" data-bottab="analysis">Events</div>
             <div class="tab" data-bottab="regions">Memory Map</div>
             <div class="tab" data-bottab="trace">API Trace <span class="badge" id="trace-badge">0</span></div>
+            <div class="tab" data-bottab="history">Time Machine</div>
+            <div class="tab" data-bottab="environment">Environment</div>
           </div><button class="mini" id="actions-button">Actions ⌘P</button><button class="mini" id="recent-button">Recent</button><button class="mini" id="settings-button">Settings</button></div>
 <div id="main"><div id="cpu-workspace"><div id="cpu-left"><section class="panel panel-disasm col-left" data-pane="disasm">
           <header class="panel-head">
@@ -96,6 +98,8 @@
           </section><section class="panel panel-stack"><header class="panel-head">Stack <span class="head-sub">pointers · offsets from SP</span></header><div class="hexview scroll" id="stack" data-pane="stack"></div></section></div></div><div id="tool-workspace" class="hidden"><section class="panel panel-tabs">
 
           <div class="tabbody">
+<div id="tb-history" class="tool-browser hidden"></div>
+<div id="tb-environment" class="tool-browser hidden"></div>
 <div id="tb-symbols" class="tool-browser hidden"><div class="view-toolbar"><select id="symbol-module" aria-label="Symbol module"></select><input id="symbol-search" placeholder="Search symbols…"/><button class="mini" id="symbol-more">More symbols</button><span id="symbol-count" class="m-hint"></span></div><div class="scroll"><table class="grid" id="symbol-table"></table></div></div>
 <div id="tb-references" class="tool-browser hidden"><div class="view-toolbar"><input id="reference-address" placeholder="Address or symbol"/><select id="reference-module" aria-label="Module to scan"></select><button class="mini" id="find-references">Find references</button><button class="mini" id="reference-more">Scan next page</button></div><div id="reference-coverage" class="m-hint"></div><div class="scroll"><table class="grid" id="reference-table"></table></div></div>
 <div id="tb-graph" class="tool-browser hidden"><div class="view-toolbar"><button class="mini" id="graph-refresh">Graph selected function</button><button class="mini" id="graph-overview">Overview</button><label>Zoom <input id="graph-zoom" type="range" min="50" max="150" value="100"/></label><span id="graph-title"></span></div><div id="graph-coverage" class="m-hint"></div><div id="graph-scroll" class="scroll"><div id="graph-canvas"></div></div></div>
@@ -153,6 +157,6 @@
     <div id="ctxmenu" class="ctxmenu hidden"></div>
     <div id="modal-backdrop" class="modal-backdrop hidden"></div>
   </div>
-  <script src="workspace-model.js"></script><script src="workspace.js"></script><script src="app.js"></script>
+  <script src="workspace-model.js"></script><script src="advanced.js"></script><script src="workspace.js"></script><script src="app.js"></script>
 </body>
 </html>

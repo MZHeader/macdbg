@@ -13,6 +13,7 @@
       const dumps=Array.from({length:4},()=>({addr:null,history:[],index:-1,data:null,request:0,scroll:0}));
       const keys=()=>({...M.DEFAULT_KEYS,...(settings.shortcuts||{})});
       const paused=()=>state && state.process_state==='stopped';
+      const advanced=window.MacdbgAdvanced.create({...u,showView,paused,address:()=>address(),toast:text=>toast(text),dialog,button});
       const address=()=>u.selected()==null ? (state && (state.disasm_center==null?state.pc:state.disasm_center)) : u.selected();
       function toast(text) {
         let node=$('.workspace-toast'); if (node) node.remove();
@@ -62,6 +63,7 @@
         if(name==='references' && !$('#reference-address').value) $('#reference-address').value=hx(address());
         if(name==='cpu') {renderDump();selectionInfo();}
         decorateTables();
+        advanced.show(name);
       }
       function setConsole(open) {settings.console_open=open;applySettings();saveSettings({console_open:open});if(open)$('#cmd').focus();}
       function paneForMemory(which) {return which==='memory'?0:Math.max(0,Number(which.replace('watch','')));}
@@ -258,11 +260,11 @@
         const result=await call('references',{address:$('#reference-address').value,module:$('#reference-module').value,offset:referenceNext});
         $('#find-references').disabled=false;if(!result)return;
         references=references.concat(result.rows).slice(-4096);referenceNext=result.next;$('#reference-more').disabled=result.complete;
-        $('#reference-coverage').textContent=result.coverage+' · '+references.length+' latest matches · '+referenceNext+' bytes scanned'+(result.complete?' · complete':' · more code remains');
+        $('#reference-coverage').textContent=result.coverage+' · '+references.length+' latest matches · '+referenceNext+' bytes scanned'+(result.complete?(result.coverage_complete?' · complete':' · incomplete scan stopped'):' · more code remains');
         $('#reference-table').innerHTML='<thead><tr><th>Address</th><th>Instruction</th><th>Evidence</th></tr></thead><tbody>'+references.map(r=>`<tr data-ref="${r.addr}"><td>${hx(r.addr)}</td><td>${esc(r.mn+' '+r.ops)}</td><td>${esc(r.kind)}</td></tr>`).join('')+'</tbody>';
         $$('[data-ref]').forEach(r=>r.ondblclick=()=>{showView('cpu');u.cmd('follow_disasm',{addr:r.dataset.ref});});decorateTables();
       }
-      async function loadGraph() {if(!paused())return;const result=await call('graph',{address:hx(address())});if(result){graph=result;renderGraph();}}
+      async function loadGraph(more=false) {if(!paused())return;const result=await call('graph',{address:hx(address()),limit:+$('#graph-limit').value,offset:more===true&&graph?graph.next||0:0});if(result){graph=result;$('#graph-more').disabled=result.next==null;renderGraph();}}
       function renderGraph() {
         if(!graph)return;
         $('#graph-title').textContent=graph.name||'Function graph';$('#graph-coverage').textContent=graph.coverage+(graph.truncated?' · bounded / incomplete function range':'');
@@ -273,13 +275,14 @@
         let paths='',html='';
         const pc=state.pc;
         blocks.forEach(block=>{const p=positions.get(block.addr),current=block.instructions.some(i=>i.addr===pc);const notes=graph.edges.filter(e=>e.from===block.addr && (!positions.has(e.to)||e.source!=='decoded')).map(e=>(e.to==null?'unknown target':hx(e.to))+' · '+e.source);
-          html+=`<section class="graph-node${current?' current':''}" style="left:${p.x}px;top:${p.y}px;height:${p.h}px"><header data-graph-follow="${block.addr}">${hx(block.addr)}${current?' · PC':''}</header>${overview?'':`<div class="graph-code">${block.instructions.map(i=>`<div data-graph-follow="${i.addr}" class="${i.addr===pc?'current':''}">${esc(i.mn.padEnd(7)+' '+i.ops)}</div>`).join('')}</div>`}<div class="graph-edge-note">${esc(notes.join(' · '))}</div></section>`;
+          html+=`<section class="graph-node${current?' current':''}" style="left:${p.x}px;top:${p.y}px;height:${p.h}px"><header data-graph-follow="${block.addr}">${hx(block.addr)}${current?' · PC':''}${block.visits?' · '+block.visits+' recorded instruction visits':''}</header>${overview?'':`<div class="graph-code">${block.instructions.map(i=>`<div data-graph-follow="${i.addr}" class="${i.addr===pc?'current':''}">${esc(i.mn.padEnd(7)+' '+i.ops)}</div>`).join('')}</div>`}<div class="graph-edge-note">${esc(notes.join(' · '))}</div></section>`;
         });
         graph.edges.forEach(edge=>{const a=positions.get(edge.from),b=positions.get(edge.to);if(!a||!b)return;const color=edge.source!=='decoded'?'#d9a4ff':edge.kind==='taken'?'#62d995':edge.kind==='fallthrough'?'#e0ab65':'#70b5ee';const x=a.x+a.w/2,ex=b.x+b.w/2,sy=a.y+a.h,ey=b.y;paths+=`<path d="M${x},${sy} C${x},${sy+25} ${ex},${ey-25} ${ex},${ey}" fill="none" stroke="${color}" stroke-width="${edge.active?4:2}" opacity="${edge.active===false ? 0.35 : 1}" ${edge.source!=='decoded'?'stroke-dasharray="5 4"':''} marker-end="url(#arrow)"/>`;});
         $('#graph-canvas').style.width=canvasWidth+'px';$('#graph-canvas').style.height=(y+20)+'px';$('#graph-canvas').innerHTML=`<svg width="${canvasWidth}" height="${y+20}"><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#9eacbd"/></marker></defs>${paths}</svg>`+html;
         $$('[data-graph-follow]').forEach(n=>n.ondblclick=()=>{showView('cpu');u.cmd('follow_disasm',{addr:n.dataset.graphFollow});});
       }
       const ACTIONS=[
+        ['time_machine','Time Machine / instruction history',()=>showView('history')],['record_instructions','Record instructions',()=>advanced.startRecording()],['assemble','Assemble at selection',()=>advanced.assemble()],['environment','Signals, child processes and offline connectivity',()=>showView('environment')],
         ['run','Run / continue',()=>u.doAct('cont')],['step_in','Step into',()=>u.doAct('step_in')],['step_over','Step over',()=>u.doAct('step_over')],['step_out','Step out',()=>u.doAct('step_out')],['pause','Pause target',()=>u.cmd('interrupt')],['restart','Restart target',()=>u.cmd('restart')],['open','Open target',()=>u.chooseTarget()],
         ['toggle_bp','Toggle breakpoint',()=>u.doAct('toggle_bp')],['run_to','Run to selection',()=>u.doAct('run_to')],['follow','Follow selected operand',followOperand],['snap_pc','Return to current PC',()=>u.cmd('snap_pc')],['back','Previous code location',()=>u.cmd('navigate_history',{direction:'back'})],['forward','Next code location',()=>u.cmd('navigate_history',{direction:'forward'})],['comment','Add / edit comment',()=>u.editComment(address())],
         ['find','Find text / bytes in memory',()=>u.findInMemory()],['goto','Go to address or symbol',()=>u.focusGoto()],['trace','Toggle API Trace',()=>u.cmd('trace_toggle')],['defenses','Configure defenses',()=>u.openDefenses()],['graph','Graph selected function',()=>showView('graph')],['references','Find references / callers',()=>openReferences()],['symbols','Search symbols',()=>{showView('symbols');$('#symbol-search').focus();}],
@@ -336,6 +339,8 @@
         return false;
       }
       function wire() {
+        const graphLimit=document.createElement('select');graphLimit.id='graph-limit';graphLimit.setAttribute('aria-label','Graph instruction budget');graphLimit.innerHTML='<option value="1024">1,024 instructions</option><option value="4096">4,096 instructions</option><option value="16384">16,384 instructions</option>';$('#graph-refresh').after(graphLimit);graphLimit.onchange=()=>loadGraph();
+        button($('#graph-refresh').parentElement,'Next graph range',()=>loadGraph(true),'mini').id='graph-more';
         $('#console-toggle').onclick=()=>setConsole(!settings.console_open);
         $('#actions-button').onclick=openActions;$('#recent-button').onclick=openRecent;$('#settings-button').onclick=openSettings;
         $('#dump-format').onchange=()=>{selection=null;anchor=null;const formats=(settings.dump_formats||['hex','hex','hex','hex']).slice();formats[activeDump]=$('#dump-format').value;saveSettings({dump_formats:formats});renderDump();};
@@ -367,13 +372,14 @@
         if(pendingSnapshot && (state.memory_analysis.snapshots||[]).some(s=>s.id===pendingSnapshot)){$('#memory-baseline').value=String(pendingSnapshot);pendingSnapshot=null;}
         ['#dump-edit','#snapshot-memory'].forEach(id=>$(id).disabled=!paused());
         renderHistory();decorateTables();
+        advanced.onState(next);
       }
-      async function mount(){wire();const data=await call('preferences');if(data){settings=data.settings;recent=data.recent;launches=data.launches;applySettings();}showView('cpu');if(u.state())onState(u.state());}
+      async function mount(){advanced.mount();wire();const data=await call('preferences');if(data){settings=data.settings;recent=data.recent;launches=data.launches;applySettings();}showView('cpu');if(u.state())onState(u.state());}
       return {copySelection,mount,onState,showView,selectDump,followMemory,selected,operand,followOperand,handleKey,openActions,openSettings,openRecent,editBreakpoint,editWatchpoint,editSelection,compare,toast,
         editRegisterValue:(name,value)=>call('edit_register',{name,value}),references:openReferences,editMemoryAt:(addr,kind)=>{if(!selection||addr<selection.addr||addr>=selection.addr+selection.size)chooseByte(addr);return editSelection(kind==='ascii'?'ascii':'hex');},
         pinChanged:pins=>saveSettings({pinned_registers:pins}),
         saveLaunch:async item=>{const name=await u.promptDialog({title:'Save launch profile',value:item.path.split('/').pop()});if(name){await call('save_launch',{...item,name});u.openLaunch(item.path,item);toast('Launch profile saved.');}},
-        running:()=>{if(state)state={...state,process_state:'running'};['#dump-edit','#snapshot-memory','#undo-edit','#compare-memory'].forEach(id=>$(id).disabled=true);$('#dump-selection').textContent='Last captured bytes — target running';infoRequest++;stackRequest++;comparisonRequest++;dumps.forEach(d=>d.request++);},
+        running:()=>{if(state)state={...state,process_state:'running'};advanced.running();['#dump-edit','#snapshot-memory','#undo-edit','#compare-memory'].forEach(id=>$(id).disabled=true);$('#dump-selection').textContent='Last captured bytes — target running';infoRequest++;stackRequest++;comparisonRequest++;dumps.forEach(d=>d.request++);},
         shortcut:name=>keys()[name]||''};
     }
   };

@@ -5,6 +5,7 @@ import os
 import lldb
 
 from .disasm import DisasmRow, _branch_target, _evaluate_condition, _parse_adrp_imm, _first_hex_addr
+from .code_flow import reference_candidates
 
 INDIRECT = {'br', 'blr', 'braa', 'brab', 'braaz', 'brabz', 'blraa', 'blrab', 'blraaz', 'blrabz'}
 CONDITIONAL = {'cbz', 'cbnz', 'tbz', 'tbnz'}
@@ -60,6 +61,7 @@ class CodeNavigation:
     def __init__(self, debugger):
         self.dbg = debugger
         self.observed = set()
+        self.observed_code = {}
         self._step = None
         self._pid = None
 
@@ -68,6 +70,7 @@ class CodeNavigation:
         if pid != self._pid:
             self._pid, self._step = pid, None
             self.observed.clear()
+            self.observed_code.clear()
 
     def instructions(self, address, count):
         target = self.dbg.target
@@ -173,7 +176,7 @@ class CodeNavigation:
         frame = self.dbg.frame()
         rows = self.instructions(frame.GetPC(),1) if frame else []
         if rows and rows[0]['mn'] in INDIRECT:
-            self._step = (self.dbg.process.GetStopID(),frame.GetThread().GetThreadID(),frame.GetPC())
+            self._step = (self.dbg.process.GetStopID(),frame.GetThread().GetThreadID(),frame.GetPC(), self.dbg.read_memory(frame.GetPC(),4))
         else:
             self._step = None
 
@@ -186,8 +189,9 @@ class CodeNavigation:
                 and thread.GetStopReason() in (lldb.eStopReasonPlanComplete,lldb.eStopReasonTrace)):
             if len(self.observed) < 4096:
                 self.observed.add((previous[2],thread.GetFrameAtIndex(0).GetPC()))
+                self.observed_code[(previous[2],thread.GetFrameAtIndex(0).GetPC())] = previous[3]
 
-    def graph(self,address):
+    def graph(self,address,limit=1024,offset=0):
         self.sync()
         target = self.dbg.target
         resolved = target.ResolveLoadAddress(address)
@@ -197,9 +201,30 @@ class CodeNavigation:
         end = item.GetEndAddress().GetLoadAddress(target) if item.IsValid() else start+1024
         known = start <= address < end and end != lldb.LLDB_INVALID_ADDRESS
         if not known: start,end = address,address+1024
-        count = min((end-start)//4,1024)
-        rows = self.instructions(start,count)
-        blocks,edges = blocks_for(rows,self.observed)
+        limit, offset = int(limit), int(offset)
+        if not 16 <= limit <= 16384 or offset < 0 or offset % 4: raise ValueError('Invalid graph range')
+        if not known: end = start + limit*4
+        if start+offset >= end: raise ValueError('Graph offset is outside the function')
+        count = min((end-start-offset)//4,limit)
+        rows = self.instructions(start+offset,count)
+        recorder = getattr(self.dbg, 'instruction_trace', None)
+        trace_edges = set()
+        visited = {}
+        row_addresses = {r['addr'] for r in rows}
+        if recorder and not recorder.readonly and recorder._identity() == getattr(recorder, 'identity', None):
+            trace_edges = {edge for edge in getattr(recorder, 'edges', set())
+                           if edge[0] in row_addresses and self.dbg.read_memory(edge[0], 4).hex() == recorder.edge_code.get(edge)}
+            visited = getattr(recorder, 'visited', {})
+        observed = {edge for edge in self.observed if edge[0] in row_addresses and self.dbg.read_memory(edge[0],4) == self.observed_code.get(edge)}
+        blocks,edges = blocks_for(rows,observed | trace_edges)
+        inferred = {r['addr']: r for r in reference_candidates(rows, self.dbg.read_memory) if r['kind'].startswith('inferred indirect')}
+        for block in blocks:
+            last = block['instructions'][-1]
+            block['visits'] = sum(visited.get(i['addr'], 0) for i in block['instructions'])
+            if last['addr'] in inferred:
+                ref = inferred[last['addr']]
+                if not any(e['from'] == block['addr'] and e['to'] == ref['target'] for e in edges):
+                    edges.append({'from': block['addr'], 'to': ref['target'], 'kind': 'indirect', 'source': ref['kind']})
         for block in blocks:
             last = block['instructions'][-1]
             if last['addr'] == self.dbg.pc() and branch_kind(last['mn']) == 'conditional':
@@ -208,8 +233,9 @@ class CodeNavigation:
                     if edge['from']==block['addr'] and taken is not None:
                         edge['active'] = (edge['kind']=='taken') == taken
         return {'name':item.GetName() if item.IsValid() else 'Unknown function', 'start':start,
-                'blocks':blocks,'edges':edges,'pc':self.dbg.pc(), 'truncated':end-start>4096 or not known,
-                'coverage':'Decoded function, at most 1,024 instructions. Indirect edges require an observed instruction step.'}
+                'blocks':blocks,'edges':edges,'pc':self.dbg.pc(), 'truncated':start+offset+len(rows)*4<end or not known,
+                'next':offset+len(rows)*4 if len(rows)==count and start+offset+len(rows)*4<end else None,
+                'coverage':'{} decoded instructions. Direct, inferred and observed edges are distinguished; unresolved edges remain explicit. {}'.format(len(rows), 'Unknown function boundary; selected window only.' if not known else '')}
 
     def module(self,name=None):
         if not self.dbg.target: raise ValueError('Open a target first')
@@ -241,25 +267,14 @@ class CodeNavigation:
         if not section.IsValid(): raise ValueError('Module has no __TEXT,__text section')
         base,size = section.GetLoadAddress(self.dbg.target),section.GetByteSize()
         if offset < 0 or offset % 4 or offset > size: raise ValueError('Invalid scan offset')
-        scan_start = max(0,offset-4)
-        rows = self.instructions(base+scan_start,min((size-scan_start)//4,16384))
-        refs = []
-        for index,row in enumerate(rows):
-            target = None; kind = 'decoded direct'
-            if row['mn'] in ('b','bl','adr') or branch_kind(row['mn']) == 'conditional':
-                target = _branch_target(row['ops'])
-            if index and rows[index-1]['mn'] == 'adrp' and row['mn'] in ('add','ldr','ldrsw'):
-                prior = rows[index-1]; register = prior['ops'].split(',')[0].strip()
-                match = re.match(r'\w+,\s*\[?'+re.escape(register)+r',\s*#?(0x[\da-fA-F]+|\d+)',row['ops'])
-                page = _first_hex_addr(prior['ops'])
-                relative = _parse_adrp_imm(prior['ops'])
-                if page is None and relative is not None:
-                    page = (prior['addr'] & ~4095)+(relative << 12)
-                if match and page is not None:
-                    target = page+int(match[1],0)
-                    kind = 'adjacent ADRP address calculation'
-            if target == address and row['addr']>=base+offset:
-                refs.append({**row,'kind':kind})
+        scan_start = max(0,offset-1024)
+        requested = min((size-scan_start)//4,16384)
+        rows = self.instructions(base+scan_start,requested)
+        refs = [r for r in reference_candidates(rows, self.dbg.read_memory)
+                if r['target'] == address and r['addr'] >= base+offset]
         next_offset = scan_start+len(rows)*4
-        return {'rows':refs,'next':next_offset,'complete':next_offset>=size or not rows,
-                'coverage':'Selected module: direct branches, ADR, and adjacent ADRP+ADD/LDR. Unresolved indirect references are not guessed.'}
+        short = len(rows) < requested
+        return {'rows':refs,'next':next_offset,'complete':next_offset>=size or short,
+                'coverage_complete':next_offset>=size,
+                'coverage':'Selected module: direct branches and conservative basic-block address propagation, including current pointer contents. Inferences are labeled; constants are discarded at control boundaries. Pages overlap by 256 instructions.' +
+                           (' Decode stopped early at {:#x}; remaining bytes were not examined.'.format(base+next_offset) if short else '')}

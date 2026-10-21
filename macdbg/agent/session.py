@@ -175,6 +175,21 @@ class AgentSession:
     def dispatch(self, cmd: str, args: dict, poll_cb: Optional[Callable[[], None]] = None) -> dict:
         args = args or {}
         try:
+            if cmd == 'instruction_trace_run':
+                self.dbg.require_decision_resolved()
+                self.dbg.instruction_trace.begin_run(args.get('count', 1000), args.get('seconds', 30), args.get('until'))
+                try:
+                    while True:
+                        result = self._dispatch_resume('step_in', {'timeout': 1}, poll_cb)
+                        while result.get('event') == 'running' and self.dbg.instruction_trace.run:
+                            if time.monotonic() >= self.dbg.instruction_trace.run['deadline']:
+                                self.dbg.interrupt()
+                                self.dbg.instruction_trace.run = None
+                            result = self._pump(max_wait=1, poll_cb=poll_cb)
+                        if not result.get('ok') or result.get('event') != 'stop' or not self.dbg.instruction_trace.continue_run(self.tracer.hidden_ids()):
+                            return {**result, 'instruction_trace': self.dbg.instruction_trace.status()}
+                finally:
+                    self.dbg.instruction_trace.run = None
             if cmd in _RESUME_COMMANDS:
                 return self._dispatch_resume(cmd, args, poll_cb)
             return self._dispatch_plain(cmd, args)
@@ -251,6 +266,7 @@ class AgentSession:
         if cmd == "restart":
             return self.cmd_restart()
         if cmd == "interrupt":
+            self.dbg.instruction_trace.run = None
             self.dbg.interrupt()
             return {"ok": True}
         if cmd == "breakpoint_toggle":
@@ -489,6 +505,7 @@ class AgentSession:
             "program": self.program,
             "attach_pid": self.attach_pid,
             "process_state": state,
+            "instruction_trace": d.instruction_trace.status(),
             "stop_at": d.launch_stop,
             "before_initializers": d.is_stopped_before_initializers(),
             "pc": self.dbg.pc(),
@@ -883,6 +900,8 @@ class AgentSession:
                 self.dbg.select_stopped_thread()
                 from macdbg.core.session_controller import prepare_stop
                 preparation = prepare_stop(self.dbg, observed_ns, self._log)
+                if preparation == 'resumed':
+                    continue
                 if preparation == 'retry':
                     self.dbg.cont()
                     continue
@@ -955,13 +974,21 @@ class AgentSession:
                 return {"ok": True, "event": "stop", "stop": self._describe_stop(),
                         "console": self._drain_console()}
             if state == lldb.eStateExited:
+                self.dbg.offline_network.drain()
+                self.dbg.offline_network.disable()
+                self.dbg.instruction_trace.observe_stop()
                 self._flush_network_trace()
+                self.dbg.instruction_trace.stop('Target exited')
                 self.dbg.cancel_user_step()
                 self._pending = None
                 return {"ok": True, "event": "exited", "exit": self._describe_exit(),
                         "console": self._drain_console()}
             if state in (lldb.eStateCrashed, lldb.eStateDetached, lldb.eStateInvalid):
+                self.dbg.offline_network.drain()
+                self.dbg.offline_network.disable()
+                self.dbg.instruction_trace.observe_stop()
                 self._flush_network_trace()
+                self.dbg.instruction_trace.stop('Target terminated or detached')
                 self.dbg.cancel_user_step()
                 self._pending = None
                 return {"ok": True, "event": "terminated",
@@ -1031,6 +1058,7 @@ class AgentSession:
         return handle_defenses(self.dbg, self._log) == 'handled'
 
     def _add_trace(self, category, call, details=None):
+        self.dbg.instruction_trace.event('API/' + category, call, details or {})
         self._trace_count = self.trace_log.append(category, call, **(details or {}))['n']
 
     def _log_trace_hit(self) -> bool:
@@ -1080,6 +1108,7 @@ class AgentSession:
     def _hidden_bp_ids(self) -> set:
         ids = self.tracer.hidden_ids()
         ids.update(self.dbg.memory_analysis.hidden_ids())
+        ids.update(self.dbg.offline_network.hidden_ids())
         if getattr(self.dbg, 'entry_plan', None) and self.dbg.entry_plan.bp:
             ids.add(self.dbg.entry_plan.bp)
         ids.update(self.dbg.self_trap.hidden_ids())

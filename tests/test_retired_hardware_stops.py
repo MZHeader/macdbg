@@ -6,10 +6,52 @@ import lldb
 from macdbg.core.breakpoints import (
     consume_hardware_debugger_duplicate, remember_hardware_return,
     remember_continue_positions,
+    recover_owned_hardware_stop,
 )
 
 
 class RetiredHardwareStopTests(unittest.TestCase):
+    def image_return(self):
+        d,p,t,bp=self.debugger()
+        d._hardware_recovery=None;d._hardware_recovery_failed=None
+        p.GetUniqueID.return_value=123
+        bp.GetID.return_value=40;bp.IsEnabled.return_value=True
+        d.target.breakpoint_iter.return_value=iter([bp])
+        d._traced_hardware_stop=(123,20,30,0x1000,bytes.fromhex('1f2003d5'),40)
+        d.analysis_cloak.validate_resume.return_value=(True,'')
+        d.analysis_cloak.validate_integrity.return_value=(True,'')
+        d._run_execution.side_effect=lambda fn:fn()
+        return d,p,t,bp
+
+    def test_missing_image_return_id_executes_instruction_then_continues(self):
+        d,p,t,_=self.image_return()
+        self.assertEqual(recover_owned_hardware_stop(d,Mock()),'resumed')
+        t.StepInstruction.assert_called_once_with(False)
+        t.GetFrameAtIndex.return_value.SetPC.assert_not_called()
+        p.GetStopID.return_value=22
+        t.GetStopReason.return_value=lldb.eStopReasonPlanComplete
+        self.assertEqual(recover_owned_hardware_stop(d,Mock()),'internal')
+        self.assertIsNone(d._hardware_recovery)
+
+    def test_missing_id_recovery_preserves_real_traps_foreign_sites_and_failed_steps(self):
+        for change in ('trap','foreign','thread','user_step'):
+            d,p,t,bp=self.image_return()
+            if change=='trap':d.read_memory.return_value=bytes.fromhex('000020d4')
+            if change=='foreign':
+                foreign=Mock();foreign.GetID.return_value=41;foreign.GetNumLocations.return_value=1
+                foreign.GetLocationAtIndex.return_value.GetLoadAddress.return_value=0x1000
+                d.target.breakpoint_iter.return_value=iter([bp,foreign])
+            if change=='thread':bp.GetThreadID.return_value=31
+            if change=='user_step':d.in_user_step.return_value=True
+            self.assertIsNone(recover_owned_hardware_stop(d,Mock()))
+            t.StepInstruction.assert_not_called()
+        d,p,t,_=self.image_return()
+        self.assertEqual(recover_owned_hardware_stop(d,Mock()),'resumed')
+        p.GetStopID.return_value=22
+        self.assertEqual(recover_owned_hardware_stop(d,Mock()),'visible')
+        self.assertEqual(recover_owned_hardware_stop(d,Mock()),'visible')
+        t.StepInstruction.assert_called_once()
+
     def debugger(self):
         d = Mock()
         d._retired_hardware_return = None

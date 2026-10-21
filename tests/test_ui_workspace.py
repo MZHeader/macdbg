@@ -7,6 +7,17 @@ from unittest import mock
 
 
 class WorkspaceUnitTests(unittest.TestCase):
+    def test_short_reference_decode_does_not_claim_complete_coverage(self):
+        navigation=CodeNavigation(mock.Mock())
+        section=mock.Mock()
+        section.GetLoadAddress.return_value=0x1000;section.GetByteSize.return_value=1024
+        navigation.module=lambda _name:mock.Mock(FindSection=lambda _:mock.Mock(FindSubSection=lambda _:section))
+        navigation.instructions=mock.Mock(return_value=[{'addr':0x1000,'mn':'nop','ops':''}])
+        result=navigation.references(0x2000)
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['coverage_complete'])
+        self.assertIn('remaining bytes were not examined',result['coverage'])
+
     def test_reference_paging_keeps_an_adrp_pair_crossing_the_boundary(self):
         navigation = CodeNavigation(mock.Mock())
         section = mock.Mock()
@@ -17,7 +28,7 @@ class WorkspaceUnitTests(unittest.TestCase):
             {'addr':0x11000,'mn':'add','ops':'x0, x8, #0x30'}])
         result=navigation.references(0x12030,offset=65536)
         self.assertEqual(result['rows'][0]['addr'],0x11000)
-        self.assertEqual(navigation.instructions.call_args.args[0],0x10ffc)
+        self.assertEqual(navigation.instructions.call_args.args[0],0x10c00)
 
     def test_preferences_and_launches_survive_a_new_server_instance(self):
         with tempfile.TemporaryDirectory(prefix='md-ui-prefs-',dir='/private/tmp') as directory:

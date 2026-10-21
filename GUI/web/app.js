@@ -1059,12 +1059,19 @@
   const backdrop = $('#modal-backdrop');
   let modalKeyHandler = null;
   let modalDecision = false;
+  let modalPreviousFocus = null;
   function openModal(node, onKey, decision = false) {
+    if(backdrop.classList.contains('hidden'))modalPreviousFocus=document.activeElement;
     backdrop.innerHTML = ''; backdrop.appendChild(node); backdrop.classList.remove('hidden');
+    node.setAttribute('role','dialog');node.setAttribute('aria-modal','true');node.tabIndex=-1;
+    node.setAttribute('aria-label',node.querySelector('.m-head')?.textContent||'Debugger dialog');
+    Array.from(backdrop.parentElement.children).forEach(child=>{if(child!==backdrop)child.inert=true;});
+    node.addEventListener('keydown',e=>{if(e.key!=='Tab')return;const fields=Array.from(node.querySelectorAll('input,textarea,select,button,[tabindex="0"]')).filter(n=>!n.disabled&&n.offsetParent!==null);if(!fields.length){e.preventDefault();node.focus();return;}const first=fields[0],last=fields[fields.length-1];if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}});
+    queueMicrotask(()=>{if(backdrop.contains(node))(node.querySelector('input:not(:disabled),textarea:not(:disabled),select:not(:disabled),button:not(:disabled)')||node).focus();});
     modalKeyHandler = onKey || null;
     modalDecision = decision;
   }
-  function closeModal() { backdrop.classList.add('hidden'); backdrop.innerHTML = ''; modalKeyHandler = null; modalDecision = false; }
+  function closeModal() { backdrop.classList.add('hidden'); backdrop.innerHTML = ''; modalKeyHandler = null; modalDecision = false;Array.from(backdrop.parentElement.children).forEach(child=>child.inert=false);if(modalPreviousFocus?.isConnected)modalPreviousFocus.focus();modalPreviousFocus=null; }
   backdrop.addEventListener('mousedown', e => { if (e.target === backdrop && !modalDecision) closeModal(); });
 
   function el(tag, cls, html) { const n = document.createElement(tag); if (cls) n.className = cls; if (html != null) n.innerHTML = html; return n; }

@@ -9,6 +9,7 @@ from typing import Optional
 # import session.py and, transitively, `lldb`. session.py re-exports this
 # same set rather than defining its own, so there's one source of truth.
 _RESUME_COMMANDS = {
+    'instruction_trace_run',
     "continue", "continue_to_entry", "step_in", "step_over", "step_out", "step_in_source",
     "step_over_source", "wait", "decide_fork", "decide_exec",
 }

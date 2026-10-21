@@ -109,6 +109,8 @@ def consume_hardware_debugger_duplicate(debugger):
     changed instruction, live breakpoint, or concurrent real stop rejects it.
     """
     import lldb
+    debugger._retired_step_candidate = None
+    retired_candidate = None
     retired = getattr(debugger, '_retired_hardware_return', None)
     debugger._retired_hardware_return = None
     continued = getattr(debugger, '_hardware_continue', None)
@@ -135,6 +137,7 @@ def consume_hardware_debugger_duplicate(debugger):
         code = None
         if retired and retired[:3] == (key, owner, pc) and subcode == pc:
             code = retired[3]
+            retired_candidate = (owner, pc)
         # Darwin can complete a single step after a free continue without PC
         # progress when hardware sites are armed. This mirrors LLDB's
         # StopInfoMachException::WasContinueInterrupted compatibility check.
@@ -155,7 +158,88 @@ def consume_hardware_debugger_duplicate(debugger):
                 for j in range(bp.GetNumLocations())):
             return False
     debugger._suppress_duplicate_retry = True
+    if len(matched) == 1:
+        debugger._retired_step_candidate = retired_candidate
     return True
+
+
+def start_hardware_recovery(debugger, owner, pc, log, source):
+    process = debugger.process
+    thread = process.GetSelectedThread()
+    if thread.GetThreadID() != owner: return 'visible'
+    if not debugger.analysis_cloak.validate_resume()[0]: return 'visible'
+    if not debugger.analysis_cloak.validate_integrity(debugger.extra_hardware_bp_ids())[0]: return 'visible'
+    key = (process.GetUniqueID(), owner, pc)
+    debugger._hardware_recovery = (process.GetUniqueID(), process.GetStopID(), owner, pc)
+    log('[debugger] single-stepping an owned hardware site with missing stop ID')
+    debugger.record_event('DEBUGGER', 'Recovered an unclassified hardware stop without skipping its instruction',
+                          pc=hex(pc), thread=owner, source=source)
+    try:
+        debugger._run_execution(lambda: thread.StepInstruction(False))
+    except Exception:
+        debugger._hardware_recovery = None
+        debugger._hardware_recovery_failed = key
+        raise
+    return 'resumed'
+
+
+def recover_owned_hardware_stop(debugger, log):
+    """Single-step a passive API trace site whose hardware stop lost its ID.
+
+    Darwin can report EXC_BREAKPOINT at a live hardware return site instead of
+    its logical breakpoint. Never advance PC manually or classify arbitrary
+    exceptions: require the exact thread/site, unchanged non-BRK instruction,
+    no colocated foreign breakpoint and no concurrent real stop. A recovery
+    that does not finish as an instruction step is surfaced, never retried.
+    """
+    import lldb
+    process = debugger.process
+    traced = getattr(debugger, '_traced_hardware_stop', None)
+    debugger._traced_hardware_stop = None
+    token = getattr(debugger, '_hardware_recovery', None)
+    if isinstance(token, tuple):
+        debugger._hardware_recovery = None
+        identity, stop, owner, pc = token
+        thread = process.GetSelectedThread()
+        if (process.GetUniqueID() == identity and process.GetStopID() == stop + 1
+                and thread.GetThreadID() == owner
+                and thread.GetStopReason() in (lldb.eStopReasonPlanComplete, lldb.eStopReasonTrace)
+                and all(t.GetThreadID() == owner or t.GetStopReason() in (lldb.eStopReasonNone, lldb.eStopReasonInvalid) for t in process)):
+            debugger._hardware_recovery_failed = None
+            debugger._suppress_duplicate_retry = False
+            return 'internal'
+        debugger._hardware_recovery_failed = (identity, owner, pc)
+        return 'visible'
+    if debugger.in_user_step() or not process or process.GetState() != lldb.eStateStopped:
+        return None
+    thread = process.GetSelectedThread()
+    if thread.GetStopReason() != lldb.eStopReasonException:
+        debugger._hardware_recovery_failed = None
+        return None
+    pc, owner = thread.GetFrameAtIndex(0).GetPC(), thread.GetThreadID()
+    if (thread.GetStopDescription(256) or '').lower() != 'exc_breakpoint (code=1, subcode={:#x})'.format(pc):
+        return None
+    key = (process.GetUniqueID(), owner, pc)
+    if getattr(debugger, '_hardware_recovery_failed', None) == key: return 'visible'
+    traced_site = (isinstance(traced, tuple) and traced[:4] ==
+                   (process.GetUniqueID(), process.GetStopID()-1, owner, pc)
+                   and debugger.read_memory(pc,4) == traced[4])
+    if not traced_site: return None
+    bid = traced[5]
+    bp = debugger.target.FindBreakpointByID(bid)
+    if (not bp.IsValid() or not bp.IsHardware() or not bp.IsEnabled()
+            or bp.GetThreadID() not in (owner, lldb.LLDB_INVALID_THREAD_ID)):
+        return None
+    code = debugger.read_memory(pc, 4)
+    if len(code) != 4 or int.from_bytes(code, 'little') & 0xffe0001f == 0xd4200000: return None
+    if any(t.GetThreadID() != owner and t.GetStopReason() not in (lldb.eStopReasonNone, lldb.eStopReasonInvalid) for t in process):
+        return None
+    for other in debugger.target.breakpoint_iter():
+        if other.GetID() != bid and other.IsEnabled() and any(
+                other.GetLocationAtIndex(i).IsEnabled() and other.GetLocationAtIndex(i).GetLoadAddress() == pc
+                for i in range(other.GetNumLocations())):
+            return None
+    return start_hardware_recovery(debugger, owner, pc, log, 'previously observed API trace stop')
 
 
 @functools.lru_cache(maxsize=1)

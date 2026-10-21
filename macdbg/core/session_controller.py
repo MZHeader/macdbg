@@ -2,7 +2,8 @@
 import lldb
 
 ANALYSIS_COMMANDS = {'memory_map','memory_monitor','memory_snapshot','memory_compare',
-                     'execution_guard','queue_defense','identity_profile','analysis_events','tracer_config','scan_syscalls'}
+                     'execution_guard','queue_defense','identity_profile','analysis_events','tracer_config','scan_syscalls',
+                     'instruction_trace', 'signal_policy', 'related_processes', 'syscall_monitor', 'offline_network'}
 
 
 def analysis_command(debugger, tracer, command, args):
@@ -14,6 +15,23 @@ def analysis_command(debugger, tracer, command, args):
             raise ValueError('expected an integer')
         return int(value,0) if isinstance(value,str) else int(value)
     memory = debugger.memory_analysis
+    if command == 'offline_network':
+        return debugger.offline_network.configure(**args) if args else debugger.offline_network.status()
+    if command == 'signal_policy':
+        from .session_tools import signal_policy
+        return signal_policy(debugger, **args)
+    if command == 'related_processes':
+        from .session_tools import related_processes
+        return related_processes(debugger)
+    if command == 'syscall_monitor':
+        return debugger.syscall_monitor.configure(**args) if args else debugger.syscall_monitor.status()
+    if command == 'instruction_trace':
+        recorder = debugger.instruction_trace
+        action = args.pop('action', 'status')
+        methods = {'status': recorder.status, 'start': recorder.start, 'stop': recorder.stop,
+                   'query': recorder.query, 'read': recorder.read, 'open': recorder.open, 'export': recorder.export}
+        if action not in methods: raise ValueError('Unknown instruction trace action')
+        return methods[action](**args)
     if command == 'scan_syscalls':
         return debugger.scan_live_syscalls(number('addr'),number('size'))
     if command == 'memory_map':
@@ -46,12 +64,25 @@ def analysis_command(debugger, tracer, command, args):
 
 def prepare_stop(debugger, observed_ns, log):
     """Shared ordering for clock accounting, mutation guards and internal stops."""
-    from .breakpoints import consume_hardware_debugger_duplicate
+    from .breakpoints import consume_hardware_debugger_duplicate, recover_owned_hardware_stop, start_hardware_recovery
+    if hasattr(debugger, 'instruction_trace'):
+        debugger.instruction_trace.observe_stop()
     debugger.auto_clock.observe_stop(observed_ns)
+    recovery = recover_owned_hardware_stop(debugger, log)
+    if recovery is not None:
+        return recovery
     if consume_hardware_debugger_duplicate(debugger):
+        candidate = getattr(debugger, '_retired_step_candidate', None)
+        if isinstance(candidate, tuple):
+            return start_hardware_recovery(debugger, *candidate, log, 'owned retired hardware return')
         log('[debugger] retried duplicate hardware debugger stop')
         return 'retry'
     memory_action = debugger.memory_analysis.apply_stop()
+    if hasattr(debugger, 'offline_network') and debugger.offline_network.apply_stop() is True:
+        memory_action = 'internal'
+    if hasattr(debugger, 'syscall_monitor') and debugger.syscall_monitor.observe() is True:
+        log('[syscalls] incomplete coverage; inspect the syscall monitor before continuing')
+        return 'visible'
     if memory_action == 'visible' or debugger.entry_plan.apply_stop() is True:
         return 'visible'
     trap_only = debugger.self_trap.complete() is True
@@ -114,6 +145,15 @@ def log_trace_stop(debugger, tracer, emit):
     matched = any(tracer.is_trace_bp(bid) for bid in ids)
     if not matched:
         return False
+    # Retain proof of a passive hardware trace stop that has already been
+    # observed. Darwin can next report the same site without its logical ID.
+    if len(ids) == 1 and not debugger.in_user_step():
+        bp = debugger.target.FindBreakpointByID(ids[0])
+        pc = thread.GetFrameAtIndex(0).GetPC()
+        code = debugger.read_memory(pc, 4)
+        if bp.IsValid() and bp.IsHardware() and len(code) == 4:
+            debugger._traced_hardware_stop = (process.GetUniqueID(), process.GetStopID(),
+                thread.GetThreadID(), pc, code, ids[0])
     for hit in tracer.return_hits(thread, process):
         emit(hit.category, hit.call, hit.details)
     bid = next((bid for bid in ids if bid in tracer._bp_to_name), None)
