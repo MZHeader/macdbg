@@ -5,6 +5,7 @@ getters are evaluated with a timeout; request streams are never consumed.
 """
 from collections import OrderedDict
 import json
+import re
 import struct
 
 import lldb
@@ -29,6 +30,9 @@ FOUNDATION_PATTERN = (r"-\[.* (dataTaskWithRequest:|dataTaskWithRequest:completi
                       r"uploadTaskWithRequest:fromFile:|uploadTaskWithRequest:fromFile:completionHandler:|"
                       r"uploadTaskWithStreamedRequest:)\]")
 RESUME_PATTERN = r"-\[(NSURLSessionTask|__NSCF[^ ]*Task) resume\]"
+# LLDB may demangle Rust symbols with or without the legacy hash suffix.
+# Match the method boundary so write_all/flush aren't decoded as byte slices.
+RUSTLS_WRITE_PATTERN = r"rustls.*conn.*Writer.*::write(_vectored)?(::h[0-9a-f]+)?$"
 
 
 def _reg(frame, name):
@@ -214,16 +218,19 @@ class NetworkCapture:
                 key = "pid:{}:{}:{:#x}".format(pid, writer, _reg(frame, "x0"))
                 requests.extend(self.http.flush(key))
             return {"http_requests": requests} if requests else {}
+        if function in ('read', 'recv', 'recvfrom') and descriptor in self.sockets:
+            return {'capture_stream': descriptor, 'direction': 'inbound'}
         if "TaskWith" in name or name.endswith(" resume]"):
             request = _request(frame, process, name)
             return {"capture_source": name, "http_requests": [request]} if request else {}
-        is_tls = function in TLS_WRITES or ("rustls" in function and "Writer" in function)
+        rustls_write = re.search(RUSTLS_WRITE_PATTERN, function)
+        is_tls = function in TLS_WRITES or bool(rustls_write)
         is_aead = function == "EVP_AEAD_CTX_seal"
         is_send = function in ("send", "sendto", "sendmsg")
         is_write = function in ("write", "writev") and descriptor in self.sockets
         if not (is_tls or is_aead or is_send or is_write):
             return {}
-        if function in ("sendmsg", "writev"):
+        if function in ("sendmsg", "writev") or (rustls_write and rustls_write.group(1)):
             address = _reg(frame, "x1")
             if function == "sendmsg":
                 header = _read(process, address, 28)
@@ -244,6 +251,14 @@ class NetworkCapture:
             data = _read(process, address, length)
         key = ("pid:{}:{}:{:#x}".format(pid, function, _reg(frame, "x0"))
                if is_tls or is_aead else descriptor)
+        if rustls_write:
+            # Writer is a temporary wrapper around a fat PlaintextSink pointer.
+            # Its stack address can change between writes or be reused by other
+            # connections. The sink data pointer identifies the connection.
+            sink = _read(process, _reg(frame, "x0"), 8)
+            if len(sink) != 8 or not int.from_bytes(sink, "little"):
+                raise ValueError("rustls Writer sink unavailable")
+            key = "pid:{}:rustls.Writer:{:#x}".format(pid, int.from_bytes(sink, "little"))
         payload = body_record(data, length, status=("unreadable"
                               if len(data) < min(length, CAPTURE_LIMIT) else None))
         nested = False
@@ -268,7 +283,7 @@ class NetworkCapture:
                         self.send_entries.popitem(last=False)
                 elif entry[3] and entry[4] and previous == entry:
                     nested = True
-        details = {"capture_source": name, "capture_stream": key, "payload": payload,
+        details = {"capture_source": name, "capture_stream": key, "direction": "outbound", "payload": payload,
                    "http_requests": [] if nested else self.http.feed(key, data, total_length=length)}
         if nested:
             details["assembly_skipped"] = "nested socket write; outer API input already observed"

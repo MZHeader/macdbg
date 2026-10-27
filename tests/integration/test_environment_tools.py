@@ -1,7 +1,11 @@
 import os
 import signal
+import socket
+import ssl
 import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from macdbg.agent.session import AgentSession
@@ -60,6 +64,45 @@ class EnvironmentIntegrationTests(unittest.TestCase):
         rows=session.dbg.instruction_trace.query()['rows']
         self.assertTrue(any(r.get('category')=='NETWORK' for r in rows),rows)
         self.assertTrue(any('DNS name' in r.get('message','') for r in rows),rows)
+
+    def test_https_requires_certificate_and_rolls_back_bad_key(self):
+        session = self.start('network')
+        rule = {'host': 'connectivity.macdbg.invalid', 'port': 443}
+        result = session.dispatch('offline_network', {'rules': [rule]})
+        self.assertFalse(result['ok'], result)
+        self.assertIn('tls_cert', str(result))
+        rule.update(tls_cert='/nonexistent/macdbg.crt', tls_key='/nonexistent/macdbg.key')
+        result = session.dispatch('offline_network', {'rules': [rule]})
+        self.assertFalse(result['ok'], result)
+        self.assertFalse(session.dbg.offline_network.servers)
+        self.assertFalse(session.dbg.offline_network.hooks)
+        self.assertFalse(session.dbg.offline_network.enabled)
+
+    def test_stalled_tls_client_does_not_block_response_or_shutdown(self):
+        from .test_language_network import certificate
+        session = self.start('network')
+        with tempfile.TemporaryDirectory(prefix='md-tls-', dir='/private/tmp') as directory:
+            cert, key, ca = certificate(Path(directory))
+            result = session.dispatch('offline_network', {'rules': [{
+                'host': 'connectivity.macdbg.invalid', 'port': 443,
+                'tls_cert': str(cert), 'tls_key': str(key), 'body': 'fixture-online'}]})
+            self.assertTrue(result['ok'], result)
+            port = result['rules'][0]['local_port']
+            context = ssl.create_default_context(cafile=str(ca))
+            with socket.create_connection(('127.0.0.1', port), timeout=2) as stalled:
+                with socket.create_connection(('127.0.0.1', port), timeout=2) as raw:
+                    with context.wrap_socket(raw, server_hostname='connectivity.macdbg.invalid') as client:
+                        client.sendall(b'GET /check HTTP/1.0\r\nHost: connectivity.macdbg.invalid\r\n\r\n')
+                        response = b''
+                        while True:
+                            chunk = client.recv(4096)
+                            if not chunk: break
+                            response += chunk
+                self.assertIn(b'fixture-online', response)
+                start = time.monotonic()
+                session.dbg.offline_network.disable()
+                self.assertLess(time.monotonic() - start, 1)
+            self.assertFalse(session.dbg.offline_network.servers)
 
     def test_changed_executable_mapping_is_scanned_before_manual_continue(self):
         session=self.start('mapping')

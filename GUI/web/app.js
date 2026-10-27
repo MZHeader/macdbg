@@ -1518,6 +1518,7 @@
       + '<label><input type="checkbox" id="trace-hardware"> Hardware entry breakpoints</label><br>'
       + '<label><input type="checkbox" id="trace-returns"> Capture returns and read/decrypted buffers</label>'
       + '<p class="m-hint">Return hooks use hardware breakpoints. Unavailable captures are labelled on their entry event. Read buffers are capped at 256 KiB.</p>';
+    content.appendChild(el('p','m-hint',config.coverage || ''));
     const dialog = analysisDialog('Trace configuration',content);
     const presets = $('#trace-preset'), hooks = $('#trace-hooks');
     hooks.value = (config.hooks || []).join(', '); presets.value = config.hooks ? 'custom':'all';

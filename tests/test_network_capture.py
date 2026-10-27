@@ -93,6 +93,26 @@ class NetworkCaptureTests(unittest.TestCase):
         self.assertEqual(result["payload"]["text"], "plaintext")
         self.assertEqual(result["capture_stream"], "pid:101:EVP_AEAD_CTX_seal:0x2000")
 
+    def test_rustls_scalar_and_vectored_writes_share_sink_not_wrapper(self):
+        wire = http_request()
+        self.memory.update({0x1000: wire[:13], 0x1100: wire[13:27], 0x1200: wire[27:],
+                            0x2000: struct.pack('<Q', 0x9000),
+                            0x2100: struct.pack('<Q', 0x9000),
+                            0x3000: struct.pack('<QQQQ', 0x1100, 14, 0x1200, len(wire)-27)})
+        name = '<rustls::conn::connection::Writer as std::io::Write>::'
+        first = self.observe(name+'write::h0123abcd', x0=0x2000, x1=0x1000, x2=13)
+        second = self.observe(name+'write_vectored', x0=0x2100, x1=0x3000, x2=2)
+        self.assertEqual(first['capture_stream'], second['capture_stream'])
+        self.assertEqual(second['http_requests'][0]['body']['text'], 'abcdef')
+        self.assertTrue(second['http_requests'][0]['complete'])
+        self.assertEqual(self.observe(name+'write_all', x0=0x2000, x1=0x1000, x2=13), {})
+
+    def test_rustls_missing_sink_is_not_merged_into_unknown_connection(self):
+        self.memory[0x1000] = http_request()
+        with self.assertRaisesRegex(ValueError, 'sink unavailable'):
+            self.observe('<rustls::conn::Writer as std::io::Write>::write',
+                         x0=0x2000, x1=0x1000, x2=len(self.memory[0x1000]))
+
     def test_sendmsg_and_writev_preserve_only_contiguous_readable_prefix(self):
         for function in ("sendmsg", "writev"):
             with self.subTest(function=function):

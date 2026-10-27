@@ -1,4 +1,4 @@
-"""Opt-in domain-specific DNS/TCP redirection to a real local HTTP responder.
+"""Opt-in domain-specific DNS/TCP redirection to a local HTTP(S) responder.
 
 No TLS handshake or certificate verification is fabricated. This is connectivity
 simulation, not network isolation: unmatched traffic follows the normal stack.
@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import queue
 import re
 import socket
+import ssl
 import struct
 import threading
 
@@ -44,12 +45,20 @@ class OfflineNetwork:
                 raise ValueError('Use distinct literal domain names; wildcard rules are not supported')
             status = int(item.get('status', 200)); body = str(item.get('body', 'online')).encode('utf-8')
             port = int(item.get('port', 80))
-            if port == 443: raise ValueError('HTTPS simulation requires certificate-aware interception; port 443 is not supported by the HTTP responder')
+            tls = bool(item.get('tls', port == 443))
+            certificate, key = item.get('tls_cert'), item.get('tls_key')
+            if port == 443 and not tls:
+                raise ValueError('Port 443 requires TLS; use tls_cert and tls_key for the responder')
+            if tls and (not certificate or not key):
+                raise ValueError('HTTPS simulation requires tls_cert and tls_key PEM paths; the target must trust that certificate')
+            if not tls and (certificate or key):
+                raise ValueError('Set tls:true when using a certificate on a non-443 port')
             if not 1 <= port <= 65535 or not 200 <= status <= 599 or len(body) > 65536:
                 raise ValueError('Invalid port, HTTP status or response size')
             domains.add(host)
             checked.append({'host': host, 'status': status, 'body': body.decode('utf-8'),
-                            'port': port, 'address': '127.77.{}.1'.format(index + 1)})
+                            'port': port, 'address': '127.77.{}.1'.format(index + 1), 'tls': tls,
+                            **({'tls_cert': str(certificate), 'tls_key': str(key)} if tls else {})})
         self.rules, self.reachability = checked, bool(reachability)
         self.epoch += 1
         try:
@@ -70,6 +79,11 @@ class OfflineNetwork:
 
     def _serve(self, rule):
         events, epoch = self.requests, self.epoch
+        context = None
+        if rule['tls']:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(rule['tls_cert'], rule['tls_key'])
+            context.set_alpn_protocols(['http/1.1'])
         class Handler(BaseHTTPRequestHandler):
             protocol_version = 'HTTP/1.0'
 
@@ -82,7 +96,8 @@ class OfflineNetwork:
             def respond(self):
                 try:
                     events.put_nowait({'epoch': epoch, 'host': rule['host'], 'method': self.command,
-                                       'path': self.path[:4096], 'status': rule['status']})
+                                       'path': self.path[:4096], 'status': rule['status'],
+                                       'scheme': 'https' if rule['tls'] else 'http'})
                 except queue.Full: pass
                 body = rule['body'].encode('utf-8') if rule['status'] not in (204, 304) else b''
                 self.send_response(rule['status'])
@@ -92,8 +107,22 @@ class OfflineNetwork:
                 self.end_headers()
                 if self.command != 'HEAD': self.wfile.write(body)
 
-            do_GET = do_HEAD = do_POST = do_PUT = do_OPTIONS = respond
-        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+            do_GET = do_HEAD = do_POST = do_PUT = do_OPTIONS = do_PATCH = do_DELETE = respond
+
+        class Server(ThreadingHTTPServer):
+            # Handshake in the worker, not accept(): a stalled TLS client must
+            # not block other requests or debugger shutdown.
+            def finish_request(self, request, client_address):
+                if context is None:
+                    return super().finish_request(request, client_address)
+                request.settimeout(3)
+                try:
+                    with context.wrap_socket(request, server_side=True) as secured:
+                        self.RequestHandlerClass(secured, client_address, self)
+                except (ssl.SSLError, OSError):
+                    pass  # The target reports handshake/trust failures normally.
+
+        server = Server(('127.0.0.1', 0), Handler)
         server.daemon_threads = True
         worker = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
         worker.start()
@@ -161,7 +190,7 @@ class OfflineNetwork:
                 if rule:
                     replacement = data[:2] + struct.pack('>H', rule['local_port']) + socket.inet_aton('127.0.0.1') + data[8:]
                     self._register('x1', self._buffer(thread, 'connect', replacement))
-                    self.dbg.record_event('DEFENSE', 'Redirected TCP connection to local HTTP responder', defense='offline_network', host=rule['host'], port=port, local_port=rule['local_port'])
+                    self.dbg.record_event('DEFENSE', 'Redirected TCP connection to local responder', defense='offline_network', host=rule['host'], port=port, local_port=rule['local_port'], scheme='https' if rule['tls'] else 'http')
             elif name == 'SCNetworkReachabilityGetFlags':
                 original = self.dbg.read_memory(reg('x1'), 4)
                 if len(original) != 4: raise RuntimeError('Cannot inspect reachability output buffer')
@@ -185,4 +214,4 @@ class OfflineNetwork:
     def status(self):
         return {'enabled': self.enabled, 'rules': self.rules, 'reachability': self.reachability,
                 'hooks': [{'name': name, 'locations': self.dbg.target.FindBreakpointByID(bid).GetNumLocations()} for bid, name in self.hooks.items()],
-                'coverage': 'Exact configured getaddrinfo names and IPv4 connect calls, plus optional reachability APIs. HTTP uses a real local TCP server. Unmatched traffic is unchanged. Custom DNS, direct syscalls, proxy stacks, HTTPS certificate validation and pinned TLS are not simulated. At most 64 KiB of argument buffers remain allocated until target exit. Not a network sandbox.'}
+                'coverage': 'Exact configured getaddrinfo names and IPv4 connect calls, plus optional reachability APIs. HTTP(S) uses a real local server. TLS requires a PEM certificate/key and target trust; certificate validation and pinning are not bypassed. Unmatched traffic is unchanged. Custom DNS, connectx/Network.framework, direct syscalls and proxy stacks are not redirected. At most 64 KiB of argument buffers remain allocated until target exit. Not a network sandbox.'}

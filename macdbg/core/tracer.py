@@ -6,7 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import lldb
 
-from .network_capture import NetworkCapture, FOUNDATION_PATTERN, RESUME_PATTERN, TLS_CLOSES, TLS_WRITES
+from .network_capture import NetworkCapture, FOUNDATION_PATTERN, RESUME_PATTERN, RUSTLS_WRITE_PATTERN, TLS_CLOSES, TLS_WRITES
 from .http_capture import body_record, CAPTURE_LIMIT
 from .return_hooks import ReturnHooks
 
@@ -37,16 +37,21 @@ def _hit(category, call, frame, process):
     if caller and caller.IsValid():
         details.update(caller=hex(caller.GetPC()),
                        caller_module=caller.GetModule().GetFileSpec().GetFilename() or "")
+    else:
+        details['caller_unavailable'] = True
+        details['link_register'] = hex(_reg(frame, 'lr'))
     return TraceHit(category, call, details)
 
 
-def _read_cstr(process: lldb.SBProcess, addr: int, cap: int = 256) -> str:
+def _read_cstr(process: lldb.SBProcess, addr: int, cap: int = 4096) -> str:
     if addr == 0:
         return "NULL"
     err = lldb.SBError()
     s = process.ReadCStringFromMemory(addr, cap, err)
     if not err.Success():
         return "<unreadable>"
+    if s and len(s.encode('utf-8', 'replace')) >= cap - 1:
+        return s + '… [capture limit]'
     return s or ""
 
 
@@ -427,17 +432,18 @@ def _f_aead_seal(frame, p):
 def _f_rustls_write(frame, p):
     # rustls Writer::write, plaintext &[u8] in x1/x2. Matched by regex since the
     # symbol has a per-build hash; gone entirely if the binary is stripped.
+    if '::write_vectored' in (frame.GetFunctionName() or ''):
+        return 'rustls Writer::write_vectored(iov={:#x}, count={})'.format(
+            _reg(frame, 'x1'), _reg(frame, 'x2'))
     buf = _reg(frame, "x1")
     n = _reg(frame, "x2")
     data = _read_mem(p, buf, n, 1024)
     return "rustls Writer::write({} B) {}".format(n, _fmt_text(data))
 
 
-# (pattern, category, formatter) for symbols with per-build hashes. The
-# "rustls..conn" prefix only exists in statically linked rustls so nothing else
-# collides; "::write::h" matches write, not flush/write_all/write_vectored.
+# Symbol patterns for Rust methods and Foundation request/task selectors.
 REGEX_SIGS: List[Tuple[str, str, Callable]] = [
-    (r"rustls..conn.*Writer.*::write::h", NET, _f_rustls_write),
+    (RUSTLS_WRITE_PATTERN, NET, _f_rustls_write),
     (FOUNDATION_PATTERN, NET, _f_task_resume),
     (RESUME_PATTERN, NET, _f_task_resume),
 ]
@@ -584,7 +590,13 @@ class Tracer:
         except RuntimeError as error:
             budget = {'error': str(error)}
         return {'hooks': self.hooks, 'hardware': self.hardware, 'returns': self.capture_returns,
-                'presets': self.PRESETS, 'available': sorted(SIGS), 'hardware_budget': budget}
+                'presets': self.PRESETS, 'available': sorted(SIGS), 'hardware_budget': budget,
+                'active_hooks': [{'name': name, 'locations': self.debugger.target.FindBreakpointByID(bid).GetNumLocations()}
+                                 for bid, name in self._bp_to_name.items()] if self.debugger else [],
+                'coverage': 'API-entry observations, not proof of successful I/O. Missing caller stacks are retained. '
+                            'Go crypto/tls and Rust rustls plaintext require resolvable writer symbols; stripped or inlined '
+                            'functions may be unavailable. HTTP/2 is not decoded. Incoming buffers require return capture; '
+                            'Go/Rust TLS decrypted reads are not supported. Hardware return sites are finite.'}
 
     @property
     def hardware_bp_ids(self) -> set[int]:
@@ -746,7 +758,7 @@ class Tracer:
             details = self.network.observe(frame, process, name)
         except Exception as error:
             details = {"capture_source": name, "capture_error": str(error)}
-        if details.get("payload") or details.get("http_requests"):
+        if details.get("payload") or details.get("http_requests") or details.get('capture_stream'):
             category = NET
         if user_only and category != NET and self._caller_is_noise(frame):
             return None
@@ -767,9 +779,14 @@ class Tracer:
         api = name.lstrip('_').split('$', 1)[0]
         if self.capture_returns and api in self.RETURN_APIS:
             try:
+                # Link the return by invocation, without exporting the same
+                # outbound request/body twice as if two requests were made.
+                returned = {key: value for key, value in hit.details.items()
+                            if key not in ('payload', 'http_requests', 'capture_source', 'assembly_skipped')}
+                returned['entry_call'] = call
                 hit.details['invocation'] = self.returns.arm(frame, {
                     'name': api, 'args': [_reg(frame, 'x'+str(i)) for i in range(8)],
-                    'category':category, 'details':dict(hit.details)})
+                    'category':category, 'details':returned})
                 hit.details['return_status'] = 'pending'
             except RuntimeError as error:
                 hit.details['return_status'] = 'unavailable'
@@ -781,13 +798,17 @@ class Tracer:
             return False
         thread = frame.GetThread()
         limit = min(1 + self.caller_depth, thread.GetNumFrames())
+        # Go's libc trampolines can leave LLDB with only frame zero. An
+        # unavailable caller is not evidence of a system-only call chain.
+        if limit <= 1:
+            return False
         for i in range(1, limit):
             f = thread.GetFrameAtIndex(i)
             if not f.IsValid():
-                break
+                return False
             module = f.GetModule()
             if not module.IsValid():
-                continue
+                return False
             modname = module.GetFileSpec().GetFilename() or ""
             if modname == self._exec_name:
                 return False
