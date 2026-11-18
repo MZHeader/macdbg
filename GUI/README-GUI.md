@@ -1,118 +1,58 @@
 # macdbg GUI
 
-A macOS **GUI** for macdbg, styled after x64dbg / WinDbg. It reuses macdbg's
-existing LLDB engine (`macdbg/core/`) — the same engine the TUI and the headless
-agent drive — so it has the full capability set: debugging, the syscall/network
-tracer, the anti-anti-debug bypass suite, fork/exec sandboxing, watches,
-comments, command palette, and per-binary persistence.
+## Launch
 
-## Why two processes
-
-LLDB's Python bindings load **only** under `/usr/bin/python3` (Python 3.9, CLT),
-whose only bundled GUI toolkit is Apple's deprecated **Tk 8.5.9** — which renders
-blank windows on modern macOS. So a single-process native GUI is impossible. The
-UI is therefore split:
-
-- **Backend** (`GUI/serve.py` + `GUI/server/`) runs under system Python 3.9, owns
-  the debugger, and exposes it over a localhost HTTP + Server-Sent-Events bridge.
-- **Native window** (`GUI/gui.py`) runs under Python 3.13 with **pywebview**
-  (WKWebView). It spawns the backend and renders the UI in a real native macOS
-  window — own window, own menu bar, normal close/quit. No browser.
-
-It behaves like one app; two processes is just an implementation detail forced by
-the lldb / Python-version constraint.
-
-## Requirements
-
-- Xcode Command Line Tools (for lldb).
-- For the native window: a Python 3.13 with pywebview — `python3 -m pip install pywebview`.
-  Without it, the launcher falls back to a chromeless Chromium / Safari browser window.
-
-## Run
+Use Apple Silicon and the Xcode Command Line Tools. Run these commands from the repository root.
 
 ```sh
-GUI/run.sh                 # start screen (File → Open / Attach)
-GUI/run.sh test/hello      # launch a target
-GUI/run.sh --attach 12345  # attach to a running pid
-GUI/run.sh --stop-at loader test/hello  # stop before initializers
+GUI/run.sh                                  # open the workspace
+GUI/run.sh /path/to/binary                  # launch a target
+GUI/run.sh --attach 12345                   # attach to a running process
+GUI/run.sh --stop-at loader /path/to/binary  # stop before initializers
 ```
 
-Double-clickable app:
+You can also open the bundled `macdbg.app` from Finder or run `open macdbg.app --args /path/to/binary`. Keep the app in the checkout so it can find the launcher and debugger code. To rebuild the bundle, run `GUI/build_app.sh`.
+
+### Native window
+
+The launcher uses pywebview and WKWebView when it finds a Python with the native dependencies. Otherwise it opens the interface in Chromium or Safari. The launcher automatically checks for a virtual environment at `~/.macdbg/venv`.
 
 ```sh
-GUI/build_app.sh           # produces macdbg.app at the repository root
-open macdbg.app
-open macdbg.app --args test/hello
+python3 -m venv ~/.macdbg/venv
+~/.macdbg/venv/bin/python3 -m pip install pywebview
 ```
 
-`run.sh` prefers the native pywebview window; if no pywebview Python is found it
-falls back to `GUI/main.py`, which opens the UI in a chromeless Chromium `--app`
-window (or a Safari tab).
+Set `MACDBG_PYTHON` to use a specific Python interpreter. For an offline Mac, copy the ARM64 bundle that matches the interpreter's Python version from the [native-deps release](https://github.com/MZHeader/macdbg/releases/tag/native-deps). The command below installs the Python 3.13 bundle.
 
-## Layout
+```sh
+export MACDBG_PYTHON=/path/to/python3.13
+GUI/get-native-deps.sh ./pywebview-macos-arm64-cp313.tar.gz
+```
 
-x64dbg-style: a toolbar, then Disassembly (left) beside Registers over a
-Memory/Stack/Watch tab group; a bottom row of Breakpoints / Call Stack / Strings
-/ Patches / Threads / Modules / Trace tabs beside the Console.
+If the app fails to open, check `~/.macdbg/launch.log`.
 
-- **Disassembly** — control-flow arrow gutter (green/red on the live pc branch),
-  breakpoint dots, ▶ pc marker, syntax highlighting, inline adrp-deref hints,
-  lldb comments, gold user comments, function banners.
-- **Registers** — changed values in red, pointer/string annotations, flag decode.
-- **Memory / Stack / Watch** — hex + ascii with focus highlighting; Memory has an
-  address bar; watches stay pinned as you step.
-- **Console** — lldb command entry with history.
+## Workspace
 
-## Keys
+- **CPU** keeps disassembly, registers, the stack and a four-tab dump pane in view. Select an instruction for its details. Right-click a row to follow an address, edit a value or add a comment.
+- **Breakpoints** manages software and hardware breakpoints and memory watchpoints. Breakpoints can have conditions and LLDB commands to run on hit. Breakpoints, comments and bookmarks are saved per binary.
+- **Graph**, **Symbols** and **References** show the selected function's control flow, loaded symbols and references in the chosen module.
+- **API Trace** records supported file, process and network calls. Use **Configure** to select hooks and enable return capture. Open **Details** on a network row for captured headers and bodies, or use **Export JSONL** for the full trace. Captures are capped at 64 KiB for headers and 256 KiB for bodies. See the [testing guide](../docs/testing.md#connectivity-simulation-and-capture-boundaries) for supported APIs and protocols.
+- **Console** accepts LLDB commands and supports history and tab completion. **Actions** searches debugger actions and opens the separate LLDB command palette.
+
+See [historical debugging](../docs/historical-debugging.md) for Time Machine, patch export and environment controls.
+
+## Default shortcuts
 
 | Key | Action | Key | Action |
-|-----|--------|-----|--------|
-| F7 / F8 / F6 | Step in / over / out | Ctrl/⌘+T | Toggle tracer |
-| F9 | Continue | Ctrl/⌘+Y | Cycle trace scope |
-| F2 | Toggle breakpoint at pc | Ctrl/⌘+K | Clear trace |
-| F5 | Snap disasm to pc | Ctrl/⌘+D | Defenses menu |
-| Ctrl/⌘+R | Restart | Ctrl/⌘+B | Interrupt |
-| Ctrl/⌘+G | Go to address | Ctrl/⌘+F | Find in memory |
-| Ctrl/⌘+P | Command palette | | |
+| --- | --- | --- | --- |
+| F7 / F8 / F6 | Step in / over / out | ⌘T | Toggle API Trace |
+| F9 | Continue | ⌘Y | Cycle trace scope |
+| F2 | Toggle breakpoint | ⌘K | Clear trace |
+| F5 | Return disassembly to the PC | ⌘D | Open Defenses |
+| F3 | Open target | ⌘B | Interrupt |
+| ⌘R | Restart | ⌘G | Go to address or symbol |
+| ⌘F | Find in memory | ⌘P | Open Actions |
 
-Right-click any pane for its context menu (follow, edit value/bytes, set PC,
-run-to-here, add comment, pin to a watch, edit breakpoint commands/condition,
-etc.). The **Defenses** button exposes every anti-anti-debug bypass as a live
-checkbox; fork/exec interception pops a decision dialog per call.
+## How it runs
 
-Open Target lets you choose arguments, the first stop (before initializers or at main), and an optional ptrace/exec interception profile. Go To and Memory accept symbols, `$register` values, and numeric offsets such as `$sp + 0x20`; navigation never evaluates a function call. Memory scans have a Cancel control in the status bar.
-
-Trace keeps a bounded live window with text/category filters and caller navigation. Export JSONL reports the complete on-disk log path. API entry events include timestamp, PID/TID, caller and argument registers; entry events do not include the eventual return value.
-
-Click **Details** on a network row (or double-click it) to inspect captured headers, body text, form fields, JSON, multipart parts and raw base64 bytes. Search also matches captured request contents. Foundation request creation/resume and supported TLS/socket writes retain structured `http_requests` and `payload` fields in JSONL; the headless `trace_hits` command returns the same fields. Bodies/write buffers are capped at 256 KiB and headers at 64 KiB; the viewer labels missing or truncated content. A complete capture describes the observed API input, not confirmed delivery. Request creation and resume may produce separate snapshots, and Foundation headers can differ from transport-generated headers.
-
-The HTTP bridge uses a fresh credential per session, plus Host/Origin and JSON request checks. The launcher passes the credential to the native window automatically. Shutdown saves state on the debugger worker and tears down its target; the backend also watches for its native parent exiting.
-
-## Architecture
-
-```
-GUI/
-  run.sh             launcher: native window if pywebview present, else browser
-  gui.py             native window (Python 3.13 + pywebview); spawns the backend
-  serve.py           backend entry (Python 3.9 + lldb); prints its port, blocks
-  main.py            browser fallback (chromeless Chromium / Safari)
-  build_app.sh       assembles macdbg.app
-  server/
-    engine.py        Engine: Debugger+Tracer, worker thread serialising all LLDB
-                     access, ported stop-orchestration, snapshot builder,
-                     command dispatch, SSE event emit
-    snapshot.py      core render data (DisasmRow/RegRow/bytes) -> JSON
-    syntax.py        arm64 mnemonic/operand tokeniser (Tk-free)
-    httpd.py         stdlib HTTP: GET / , GET /events (SSE), POST /cmd
-  web/
-    index.html       self-contained x64dbg-style frontend
-```
-
-LLDB stop/output events arrive on the EventPump thread and are serialised onto a
-single engine worker thread, which decides what each stop means (user-step
-completion, fork-shield, anti-debug auto-continue, tracer auto-continue, or a
-real stop) and pushes a JSON snapshot to the browser over SSE. Commands flow the
-other way as `POST /cmd`.
-
-Runs unsigned locally — launch + attach work because LLDB spawns Apple-signed
-`debugserver`.
+`GUI/serve.py` starts the backend with system Python and Xcode's LLDB bindings. One debugger worker handles commands and stop events. The frontend in `GUI/web/` sends commands over localhost HTTP and receives snapshots over Server-Sent Events. The HTTP bridge requires a per-session credential. `GUI/gui.py` hosts the frontend in a native window, and `GUI/main.py` opens it in a browser.

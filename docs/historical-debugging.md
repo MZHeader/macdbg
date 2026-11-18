@@ -48,7 +48,7 @@ Executable syscall monitoring rescans changed non-system executable regions at s
 
 Related processes lists live descendants. Debug in new window gives a child an independent debugger, retaining the parent session. It is a late attach, not atomic follow-fork: child execution before attach may be missed, and platform attach restrictions still apply. Closing an attached session detaches; closing a launched session kills its target.
 
-Offline connectivity is configured with literal domain rules, destination port, HTTP status/body and optional reachability overrides. Matching `getaddrinfo` calls resolve to synthetic loopback addresses; matching IPv4 `connect` calls go to a real local responder. Unmatched calls retain their normal behavior. This is not a network sandbox. Custom DNS, proxy stacks, direct syscalls, HTTPS certificate validation and pinned TLS require other handling. At most 64 KiB of scratch argument buffers remain until process exit so disabling a rule cannot free arguments still in use by a stopped thread. Every substitution is logged.
+Offline connectivity maps exact hostnames to a local HTTP or HTTPS responder. It uses `getaddrinfo` and IPv4 `connect` hooks. Unmatched traffic follows the normal network stack. For HTTPS, provide a certificate for the original hostname and a private key. The target must trust the certificate. See the [testing guide](testing.md#connectivity-simulation-and-capture-boundaries) for supported network paths.
 
 ```sh
 ./agent.sh cmd inspect offline_network --json '{"enabled":true,"rules":[{"host":"connectivity.example.test","port":80,"status":204,"body":""}],"reachability":true}'
