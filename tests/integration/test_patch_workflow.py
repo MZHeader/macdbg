@@ -43,6 +43,19 @@ class PatchWorkflowIntegrationTests(unittest.TestCase):
         self.assertEqual(result['exit']['code'],0,result)
         self.assertIn(' 1 42 ',result['console'])
 
+    def test_adjacent_edits_round_trip_across_manifest_entry_limit(self):
+        address = self.ws.address('ui_patch_range')
+        for offset, size in ((0, 4096), (4096, 1)):
+            self.ws.command('edit_memory', {'address': hex(address + offset), 'hex': '5a' * size})
+        exported = self.ws.command('patch_export', {'manifest_only': True})
+        entries = json.loads(Path(exported['path']).read_text())['patches']
+        self.assertEqual([len(bytes.fromhex(e['new'])) for e in entries], [4096, 1])
+        self.ws.command('undo', {})
+        self.ws.command('undo', {})
+        imported = self.ws.command('patch_import', {'path': exported['path'], 'apply': True})
+        self.assertTrue(imported['applied'])
+        self.assertEqual(self.session.dbg.read_memory(address, 4097), b'Z' * 4097)
+
     def test_branch_preview_and_stale_preview_refusal(self):
         target=self.ws.address('ui_destination')
         source=self.ws.address('ui_branch')

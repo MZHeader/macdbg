@@ -11,6 +11,9 @@ import lldb
 from .macho import MachO
 
 SCHEMA = 'macdbg.patch-set.v1'
+MAX_PATCH_BYTES = 4096
+MAX_MANIFEST_ENTRIES = 4096
+MAX_MANIFEST_BYTES = 1024 * 1024
 
 
 def normalized(patches):
@@ -58,7 +61,10 @@ class PatchExporter:
                 raise ValueError('Original bytes differ at {:#x}; runtime relocations or stale patches cannot be exported'.format(address))
             if self.dbg.read_memory(address, len(new)) != new:
                 raise ValueError('Live patch changed at {:#x}; refresh the patch set'.format(address))
-            entries.append({'offset': offset, 'address': hex(address), 'original': original.hex(), 'new': new.hex()})
+            for start in range(0, len(new), MAX_PATCH_BYTES):
+                end = start + MAX_PATCH_BYTES
+                entries.append({'offset': offset + start, 'address': hex(address + start),
+                                'original': original[start:end].hex(), 'new': new[start:end].hex()})
         if not entries: raise ValueError('No file-backed changes to export')
         return {'schema': SCHEMA, 'source': path, 'sha256': digest, 'patches': entries,
                 'signed_source': image.signed, 'note': 'Changing bytes invalidates the original signature. Ad-hoc signing is optional and does not restore vendor entitlements or trust.'}
@@ -74,7 +80,10 @@ class PatchExporter:
         try:
             with os.fdopen(descriptor, 'w+b') as stream:
                 if manifest_only:
-                    stream.write((json.dumps(manifest, indent=2) + '\n').encode())
+                    content = (json.dumps(manifest, indent=2) + '\n').encode()
+                    if len(manifest['patches']) > MAX_MANIFEST_ENTRIES or len(content) > MAX_MANIFEST_BYTES:
+                        raise ValueError('Manifest exceeds the import limit of 4096 entries or 1 MiB')
+                    stream.write(content)
                 else:
                     with open(manifest['source'], 'rb') as source: shutil.copyfileobj(source, stream)
                     stream.seek(0)
@@ -98,19 +107,19 @@ class PatchExporter:
             raise
 
     def import_manifest(self, path, apply=False):
-        if os.path.getsize(path) > 1024 * 1024: raise ValueError('Manifest exceeds 1 MiB')
+        if os.path.getsize(path) > MAX_MANIFEST_BYTES: raise ValueError('Manifest exceeds 1 MiB')
         with open(path) as stream: manifest = json.load(stream)
         source, data, image, digest = self.source()
         if manifest.get('schema') != SCHEMA or manifest.get('sha256') != digest:
             raise ValueError('Manifest does not match the original binary hash')
-        if not isinstance(manifest.get('patches'), list) or not 1 <= len(manifest['patches']) <= 4096:
+        if not isinstance(manifest.get('patches'), list) or not 1 <= len(manifest['patches']) <= MAX_MANIFEST_ENTRIES:
             raise ValueError('Invalid patch set')
         module = next((m for m in self.dbg.target.module_iter() if os.path.realpath(str(m.GetFileSpec())) == source), None)
         if module is None: raise ValueError('Original module is not loaded')
         checked, occupied = [], set()
         for patch in manifest['patches']:
             offset, original, new = int(patch['offset']), bytes.fromhex(patch['original']), bytes.fromhex(patch['new'])
-            if not 1 <= len(new) <= 4096 or len(original) != len(new) or offset < 0:
+            if not 1 <= len(new) <= MAX_PATCH_BYTES or len(original) != len(new) or offset < 0:
                 raise ValueError('Invalid patch length or offset')
             if occupied.intersection(range(offset, offset + len(new))): raise ValueError('Overlapping manifest patches')
             occupied.update(range(offset, offset + len(new)))

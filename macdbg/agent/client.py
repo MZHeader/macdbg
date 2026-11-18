@@ -34,12 +34,6 @@ def send_command(socket_path: str, cmd: str, args: Optional[dict] = None,
             f.flush()
             line = f.readline()
         except OSError as e:
-            # Covers socket.timeout/TimeoutError too (both are OSError
-            # subclasses) -- a daemon that's alive but wedged on something
-            # else and never reads/answers this request must fail the same
-            # clean way as a dead socket, not raise an uncaught exception
-            # that skips the caller's SIGKILL-and-cleanup fallback (this bit
-            # cmd_stop specifically: it only caught ClientError).
             raise ClientError("connection to {} timed out or failed: {}".format(socket_path, e)) from e
         if not line:
             raise ClientError("daemon closed the connection without a response")

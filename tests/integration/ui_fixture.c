@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+char ui_patch_range[4097] = {1};
 char ui_buffer[64] = "editable local text";
 volatile uint64_t ui_watched;
 extern uint64_t ui_load(uint64_t *);

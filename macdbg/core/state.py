@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import logging
 import os
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -49,6 +52,29 @@ class Watch:
     label: str = ""
 
 
+class StateConflict(RuntimeError):
+    pass
+
+
+def _merge_changes(baseline, local, current):
+    """Apply this session's edits to the current on-disk values."""
+    missing = object()
+    merged = current.copy()
+    for key in baseline.keys() | local.keys():
+        before = baseline.get(key, missing)
+        after = local.get(key, missing)
+        if before == after:
+            continue
+        existing = current.get(key, missing)
+        if existing != before and existing != after:
+            raise StateConflict(f"Concurrent change to {key}")
+        if after is missing:
+            merged.pop(key, None)
+        else:
+            merged[key] = after
+    return merged
+
+
 @dataclass
 class BinaryState:
     sha256: str
@@ -61,6 +87,11 @@ class BinaryState:
     timing_rules: List[dict] = field(default_factory=list)
     identity_profile: dict = field(default_factory=dict)
 
+    _baseline: dict = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        self._baseline = deepcopy(self._payload())
+
     def dir(self) -> str:
         return sample_dir(self.binary_path, self.sha256)
 
@@ -70,49 +101,82 @@ class BinaryState:
     def dumps_dir(self) -> str:
         return os.path.join(self.dir(), "dumps")
 
+    def _payload(self):
+        return {
+            "sha256": self.sha256,
+            "binary_path": self.binary_path,
+            "timing_rules": self.timing_rules,
+            "identity_profile": self.identity_profile,
+            "comments": {"{:#x}".format(k): v for k, v in self.comments.items()},
+            "bookmarks": {"{:#x}".format(k): v for k, v in self.bookmarks.items()},
+            "breakpoints": [
+                {
+                    "addr": "{:#x}".format(bp.addr),
+                    "symbol": bp.symbol,
+                    "condition": bp.condition,
+                    "commands": list(bp.commands),
+                    "enabled": bp.enabled,
+                    "hardware": bp.hardware,
+                    "specification": bp.specification,
+                }
+                for bp in self.breakpoints
+            ],
+            "patches": [
+                {"addr": "{:#x}".format(p.addr),
+                 "orig": p.orig.hex(),
+                 "new": p.new.hex()}
+                for p in self.patches
+            ],
+            "watches": [
+                {"slot": w.slot,
+                 "addr": "{:#x}".format(w.addr),
+                 "length": w.length,
+                 "label": w.label}
+                for w in self.watches
+            ],
+        }
+
     def save(self) -> Optional[str]:
+        path = self.file_path()
+        local = self._payload()
         try:
             os.makedirs(self.dir(), exist_ok=True)
-            payload = {
-                "sha256": self.sha256,
-                "binary_path": self.binary_path,
-                "timing_rules": self.timing_rules,
-                "identity_profile": self.identity_profile,
-                "comments": {"{:#x}".format(k): v for k, v in self.comments.items()},
-                "bookmarks": {"{:#x}".format(k): v for k, v in self.bookmarks.items()},
-                "breakpoints": [
-                    {
-                        "addr": "{:#x}".format(bp.addr),
-                        "symbol": bp.symbol,
-                        "condition": bp.condition,
-                        "commands": list(bp.commands),
-                        "enabled": bp.enabled,
-                        "hardware": bp.hardware,
-                        "specification": bp.specification,
-                    }
-                    for bp in self.breakpoints
-                ],
-                "patches": [
-                    {"addr": "{:#x}".format(p.addr),
-                     "orig": p.orig.hex(),
-                     "new": p.new.hex()}
-                    for p in self.patches
-                ],
-                "watches": [
-                    {"slot": w.slot,
-                     "addr": "{:#x}".format(w.addr),
-                     "length": w.length,
-                     "label": w.label}
-                    for w in self.watches
-                ],
-            }
-            tmp = self.file_path() + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(payload, f, indent=2)
-            os.replace(tmp, self.file_path())
-            return self.file_path()
-        except OSError as e:
-            return None if e else self.file_path()
+            with open(path + ".lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    with open(path) as stream:
+                        current = json.load(stream)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    current = {}
+                # Older state files can omit fields added in later releases.
+                current = {**self._baseline, **current}
+                baseline = self._baseline.copy()
+                updates = local.copy()
+                try:
+                    for name in ("comments", "bookmarks"):
+                        current[name] = _merge_changes(baseline.pop(name) or {}, updates.pop(name), current[name] or {})
+                    merged = _merge_changes(baseline, updates, current)
+                except StateConflict as conflict:
+                    # Shutdown can autosave without a UI. Preserve both versions
+                    # even when the caller can only report the conflict later.
+                    contents = json.dumps(local, indent=2)
+                    digest = hashlib.sha256(contents.encode()).hexdigest()[:16]
+                    recovery = os.path.join(self.dir(), f"state-conflict-{digest}.json")
+                    self._replace(recovery, contents)
+                    logging.getLogger(__name__).warning("%s. Session state saved to %s", conflict, recovery)
+                    raise StateConflict(f"{conflict}. Session state saved to {recovery}") from conflict
+                self._replace(path, json.dumps(merged, indent=2))
+                # Compare subsequent edits with what this session actually saw.
+                self._baseline = deepcopy(local)
+                return path
+        except OSError:
+            return None
+
+    @staticmethod
+    def _replace(path, contents):
+        with open(path + ".tmp", "w") as stream:
+            stream.write(contents)
+        os.replace(path + ".tmp", path)
 
 
 def sha256_of(path: str) -> str:
@@ -207,4 +271,5 @@ def load_for(binary_path: str) -> BinaryState:
             ))
         except (KeyError, ValueError):
             continue
+    state._baseline.update({k: deepcopy(d[k]) for k in state._baseline if k in d})
     return state

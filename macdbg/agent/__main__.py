@@ -12,9 +12,10 @@ Run via ./agent.sh (sets PYTHONPATH the same way macdbg.sh does), e.g.:
 """
 
 import argparse
+import fcntl
 import json
 import os
-import signal
+import socket
 import subprocess
 import sys
 import time
@@ -87,12 +88,20 @@ def _terminate_and_reap(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
+def _session_socket_in_use(sdir: str) -> bool:
+    path = os.path.join(sdir, "ctl.sock")
+    if not os.path.lexists(path):
         return False
-    return True
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(1)
+        try:
+            probe.connect(path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            return False
+        except OSError:
+            # A busy or inaccessible listener is unsafe to replace.
+            return True
+        return True
 
 
 def cmd_start(ns) -> int:
@@ -112,44 +121,14 @@ def cmd_start(ns) -> int:
         print(json.dumps({"ok": False, "error": name_err}))
         return 1
     sdir = _session_dir(name)
-    if os.path.exists(os.path.join(sdir, "meta.json")):
-        meta = _read_meta(name)
-        if meta and _pid_alive(meta["pid"]):
-            print(json.dumps({"ok": False, "error": "session {!r} already running (pid {})".format(
-                name, meta["pid"])}))
-            return 1
     os.makedirs(sdir, exist_ok=True)
-
-    # Narrow (not eliminate) the race where two `start`s for the same new
-    # session name run concurrently: the meta.json-exists check above and
-    # the daemon actually writing meta.json are far apart in time, so both
-    # racers can pass the check and each spawn a daemon, with `stop` later
-    # only able to reap whichever one's pid meta.json happened to end up
-    # recording -- the rest leak. A lock file claimed with O_EXCL closes
-    # most of that window.
-    lock_path = os.path.join(sdir, ".start.lock")
-    try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        meta = _read_meta(name)
-        if meta and _pid_alive(meta["pid"]):
-            print(json.dumps({"ok": False, "error": "session {!r} already running (pid {})".format(
-                name, meta["pid"])}))
+    with open(os.path.join(sdir, ".lifecycle.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if _session_socket_in_use(sdir):
+            print(json.dumps({"ok": False, "error": f"Session {name!r} already running or control socket unavailable"}))
             return 1
-        print(json.dumps({"ok": False, "error":
-                           "another 'start' for session {!r} appears to be in progress "
-                           "(stale lock -- retry, or remove {} if you're sure it isn't)".format(
-                               name, lock_path)}))
-        return 1
-    os.write(lock_fd, str(os.getpid()).encode())
-    os.close(lock_fd)
-    try:
+        _cleanup_session_files(sdir)
         return _cmd_start_locked(ns, name, sdir)
-    finally:
-        try:
-            os.remove(lock_path)
-        except OSError:
-            pass
 
 
 def _cmd_start_locked(ns, name: str, sdir: str) -> int:
@@ -169,12 +148,12 @@ def _cmd_start_locked(ns, name: str, sdir: str) -> int:
                                 start_new_session=True)
     finally:
         log.close()
-    meta_path = os.path.join(sdir, "meta.json")
     deadline = time.time() + ns.boot_timeout
     meta_published = False
     try:
         while time.time() < deadline:
-            if os.path.exists(meta_path):
+            meta = _read_meta(name)
+            if meta and meta["pid"] == proc.pid:
                 meta_published = True
                 break
             if proc.poll() is not None:
@@ -193,10 +172,6 @@ def _cmd_start_locked(ns, name: str, sdir: str) -> int:
             _cleanup_session_files(sdir)
 
     from .client import send_command, ClientError
-    meta = _read_meta(name)
-    if meta is None:
-        print(json.dumps({"ok": False, "error": "daemon wrote an unreadable meta.json"}))
-        return 1
     resp = send_command(meta["socket"], "boot")
     boot = resp.get("boot") or {}
     boot_ok = bool(boot.get("ok", True))
@@ -290,31 +265,37 @@ def cmd_stop(ns) -> int:
         print(json.dumps({"ok": False, "error": name_err}))
         return 1
     sdir = _session_dir(ns.session)
-    meta = _read_meta(ns.session)
-    if not meta:
-        # Nothing usable to talk to (never existed, or meta.json is
-        # corrupt/incomplete) -- still sweep any stale files rather than
-        # leaving them for `list` to report forever.
+    if os.path.isdir(sdir):
+        with open(os.path.join(sdir, ".lifecycle.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return _stop_locked(ns.session, sdir)
+    print(json.dumps({"ok": True, "note": "no such session (already gone)"}))
+    return 0
+
+
+def _stop_locked(name: str, sdir: str) -> int:
+    from .client import send_command, ClientError
+
+    # The socket belongs to this session. A PID left on disk can be reused.
+    socket_path = os.path.join(sdir, "ctl.sock")
+    try:
+        response = send_command(socket_path, "quit", recv_timeout=2)
+    except ClientError as error:
+        if not isinstance(error.__cause__, (FileNotFoundError, ConnectionRefusedError)):
+            print(json.dumps({"ok": False, "error": str(error)}))
+            return 1
         _cleanup_session_files(sdir)
-        print(json.dumps({"ok": True, "note": "no such session (already gone)"}))
-        return 0
-    if _pid_alive(meta["pid"]):
-        from .client import send_command, ClientError
-        try:
-            send_command(meta["socket"], "quit", recv_timeout=2)
-        except ClientError:
-            pass
-        deadline = time.time() + 5
-        while time.time() < deadline and _pid_alive(meta["pid"]):
+    else:
+        if not response.get("ok"):
+            print(json.dumps(response))
+            return 1
+        deadline = time.monotonic() + 5
+        while os.path.exists(os.path.join(sdir, "meta.json")) or os.path.exists(socket_path):
+            if time.monotonic() >= deadline:
+                print(json.dumps({"ok": False, "error": "Daemon acknowledged shutdown but has not finished"}))
+                return 1
             time.sleep(0.1)
-        if _pid_alive(meta["pid"]):
-            os.kill(meta["pid"], signal.SIGKILL)
-    # Whether the pid was alive (and just reaped) or already dead (a crashed
-    # daemon), don't leave stale meta.json/ctl.sock behind -- otherwise a
-    # dead session lingers in `list` forever and this "successful" stop
-    # didn't actually clean anything up.
-    _cleanup_session_files(sdir)
-    print(json.dumps({"ok": True, "session": ns.session}))
+    print(json.dumps({"ok": True, "session": name}))
     return 0
 
 
@@ -326,7 +307,7 @@ def cmd_list(ns) -> int:
             if not meta:
                 continue
             out.append({"session": name, "pid": meta["pid"],
-                        "alive": _pid_alive(meta["pid"]),
+                        "alive": _session_socket_in_use(_session_dir(name)),
                         "program": meta.get("program"), "attach_pid": meta.get("attach_pid")})
     print(json.dumps(out))
     return 0
