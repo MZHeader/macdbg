@@ -2,6 +2,8 @@
 
 macdbg is an LLDB debugger for ARM64 macOS binaries. It has an x64dbg-style GUI and a headless interface for scripts.
 
+<img src="docs/img/gui-main.png" alt="Main view" width="860">
+
 ## Quick start
 
 On Apple Silicon, install the Xcode Command Line Tools with `xcode-select --install`, then clone and open the app.
@@ -38,3 +40,19 @@ See the [command reference](.skills/macdbg-agent/references/commands.md) for the
 - [GUI setup, offline installation and shortcuts](GUI/README-GUI.md)
 - [Instruction recording, patches and environment controls](docs/historical-debugging.md)
 - [Tests and trace coverage](docs/testing.md)
+
+## Screenshots
+
+<img src="docs/img/gui-trace.png" alt="Trace tab" width="780">
+
+<img src="docs/img/gui-breakpoint-commands.png" alt="Breakpoint commands" width="440">
+
+<img src="docs/img/gui-edit-register.png" alt="Edit register" width="440">
+
+<img src="docs/img/gui-edit-memory.png" alt="Edit memory" width="440">
+
+<img src="docs/img/gui-command-palette.png" alt="Command palette" width="480">
+
+<img src="docs/img/gui-fork.png" alt="Fork decision prompt" width="520">
+
+<img src="docs/img/gui-exec.png" alt="Exec sandbox prompt" width="440">
